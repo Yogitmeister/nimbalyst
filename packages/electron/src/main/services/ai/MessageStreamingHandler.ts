@@ -557,6 +557,10 @@ export class MessageStreamingHandler {
         // Effort level: explicit session value, else the app-wide default the
         // selector displays (Opus 4.6 adaptive reasoning).
         ...(reinitEffortLevel && { effortLevel: reinitEffortLevel }),
+        // Pass OpenCode agent from session metadata
+        ...(session.provider === 'opencode' && (session.metadata as any)?.opencodeAgent && {
+          agent: (session.metadata as any).opencodeAgent,
+        }),
       };
 
       // Add baseUrl for LMStudio

@@ -86,6 +86,11 @@ interface AIInputProps {
   onEffortLevelChange?: (level: EffortLevel) => void;
   showEffortLevel?: boolean;
 
+  // OpenCode agent (role) selection
+  opencodeAgent?: string | null;
+  onAgentChange?: (agent: string) => void;
+  availableAgents?: string[];
+
   // Token usage display support (for Claude Code)
   tokenUsage?: {
     inputTokens: number;
@@ -164,6 +169,9 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     effortLevel,
     onEffortLevelChange,
     showEffortLevel,
+    opencodeAgent,
+    onAgentChange,
+    availableAgents,
     tokenUsage,
     provider,
     onQueue,
@@ -1298,6 +1306,19 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
                 level={effortLevel}
                 onLevelChange={onEffortLevelChange}
               />
+            )}
+            {currentProvider === 'opencode' && availableAgents && availableAgents.length > 0 && onAgentChange && (
+              <select
+                className="opencode-agent-picker border border-[var(--nim-border)] rounded bg-[var(--nim-bg)] text-[var(--nim-text)] text-xs px-2 py-1 focus:outline-none focus:border-[var(--nim-primary)]"
+                value={opencodeAgent ?? ''}
+                onChange={(e) => onAgentChange(e.target.value)}
+                title="OpenCode agent role"
+              >
+                <option value="">default agent</option>
+                {availableAgents.map((a) => (
+                  <option key={a} value={a}>{a}</option>
+                ))}
+              </select>
             )}
             {workspacePath && (
               <HelpTooltip testId="action-prompts-dropdown">
