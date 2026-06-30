@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - OpenCode agent (role) picker in the AI input toolbar: when an OpenCode session is active, a dropdown lists available agents (e.g. custom roles defined in `~/.config/opencode/agent/`) and the selected agent is passed to the OpenCode server at session creation. Stored in session metadata; follows the same pattern as the effort-level selector.
+- Claude Agent sessions now expose an Extended: On / Extended: Off selector next to the effort selector for supported Opus/Sonnet variants. The default is Extended: Off to avoid unexpected latency and token consumption.
 
 ### Changed
 <!-- Changes to existing functionality go here -->

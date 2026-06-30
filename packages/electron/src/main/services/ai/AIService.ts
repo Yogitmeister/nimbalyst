@@ -21,7 +21,7 @@ import {
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { parseContextUsageMessage } from '@nimbalyst/runtime/ai/server/utils/contextUsage';
 import { isBedrockToolSearchError } from '@nimbalyst/runtime/ai/server/utils/errorDetection';
-import { parseEffortLevel } from '@nimbalyst/runtime/ai/server/effortLevels';
+import { parseEffortLevel, parseThinkingMode } from '@nimbalyst/runtime/ai/server/effortLevels';
 import type { SessionStore } from '@nimbalyst/runtime';
 import {
   ModelIdentifier,
@@ -508,6 +508,7 @@ export class AIService {
       ...((session.metadata as any)?.effortLevel && {
         effortLevel: parseEffortLevel((session.metadata as any).effortLevel),
       }),
+      thinkingMode: parseThinkingMode((session.metadata as any)?.thinkingMode),
     };
 
     const fullModel = session.model || session.providerConfig?.model;
@@ -1738,6 +1739,7 @@ export class AIService {
         if ((session.metadata as any)?.effortLevel) {
           initConfig.effortLevel = parseEffortLevel((session.metadata as any).effortLevel);
         }
+        initConfig.thinkingMode = parseThinkingMode((session.metadata as any)?.thinkingMode);
       }
 
       // Pass effort level for OpenAI Codex

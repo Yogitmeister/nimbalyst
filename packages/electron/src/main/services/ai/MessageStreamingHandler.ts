@@ -33,7 +33,7 @@ import {
 } from '@nimbalyst/runtime/ai/server/types';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { isBedrockToolSearchError } from '@nimbalyst/runtime/ai/server/utils/errorDetection';
-import { parseEffortLevel } from '@nimbalyst/runtime/ai/server/effortLevels';
+import { parseEffortLevel, parseThinkingMode } from '@nimbalyst/runtime/ai/server/effortLevels';
 import type { RawDocumentContext, DocumentContextService } from '@nimbalyst/runtime';
 import { AISessionsRepository } from '@nimbalyst/runtime';
 import { toolRegistry } from './tools';
@@ -479,6 +479,9 @@ export class MessageStreamingHandler {
         ...((session.metadata as any)?.effortLevel && {
           effortLevel: parseEffortLevel((session.metadata as any).effortLevel),
         }),
+        ...(isProviderClaudeCode ? {
+          thinkingMode: parseThinkingMode((session.metadata as any)?.thinkingMode),
+        } : {}),
         // Pass OpenCode agent from session metadata
         ...(session.provider === 'opencode' && (session.metadata as any)?.opencodeAgent && {
           agent: (session.metadata as any).opencodeAgent,
@@ -1071,6 +1074,9 @@ export class MessageStreamingHandler {
           ...((session.metadata as any)?.effortLevel && {
             effortLevel: parseEffortLevel((session.metadata as any).effortLevel),
           }),
+          ...(isClaudeCode ? {
+            thinkingMode: parseThinkingMode((session.metadata as any)?.thinkingMode),
+          } : {}),
         });
       }
 

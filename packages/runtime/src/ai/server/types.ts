@@ -3,7 +3,7 @@
  */
 
 import type { ToolDefinition } from '../tools';
-import type { EffortLevel } from './effortLevels';
+import type { EffortLevel, ThinkingMode } from './effortLevels';
 import type { ToolResult } from './protocols/ProtocolInterface';
 import { ModelIdentifier } from './ModelIdentifier';
 import { CLAUDE_CODE_PINNED_SDK_MODELS } from '../modelConstants';
@@ -350,6 +350,7 @@ export interface ProviderConfig {
   baseUrl?: string;
   allowedTools?: string[];  // List of allowed tool names, ['*'] for all tools
   effortLevel?: EffortLevel;  // Effort level for Opus 4.6 adaptive reasoning (low/medium/high/max)
+  thinkingMode?: ThinkingMode;  // Extended thinking mode for Claude Agent (enabled/disabled)
   responseFormat?: ProviderResponseFormat;  // Response format constraint (extension chat completions)
   skipLogging?: boolean;  // Skip message logging to DB (extension stateless completions)
   agent?: string;  // OpenCode agent (role) to activate for this session
