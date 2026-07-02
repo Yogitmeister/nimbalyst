@@ -1278,9 +1278,10 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
   } | null = null;
 
   // Helper to announce device to the index server
-  function announceDevice(): void {
+  function announceDevice(override?: Partial<DeviceInfo>): void {
     // Get current device info (prefer callback for dynamic presence, fallback to static)
-    const deviceInfo = config.getDeviceInfo?.() ?? config.deviceInfo;
+    const baseDeviceInfo = config.getDeviceInfo?.() ?? config.deviceInfo;
+    const deviceInfo = baseDeviceInfo ? { ...baseDeviceInfo, ...override } : undefined;
     // Check both our flag AND the actual WebSocket readyState to avoid "Sent before connected" errors
     if (deviceInfo && indexWs && indexConnected && indexWs.readyState === WebSocket.OPEN) {
       const announceMsg: ClientMessage = {
@@ -3863,7 +3864,15 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     },
 
     /** Request the sync server to send a push notification to mobile devices */
-    async requestMobilePush(sessionId: string, title: string, body: string): Promise<void> {
+    async requestMobilePush(
+      sessionId: string,
+      title: string,
+      body: string,
+      options?: {
+        bypassActiveDeviceRouting?: boolean;
+        forceDesktopAwayForPush?: boolean;
+      }
+    ): Promise<void> {
       // Ensure we're connected before sending the request
       if (!indexWs || !indexConnected) {
         console.log('[CollabV3] Not connected to index, attempting to reconnect before requesting mobile push...');
@@ -3888,16 +3897,28 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       }
 
       const deviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId;
+      if (options?.forceDesktopAwayForPush && deviceId) {
+        announceDevice({
+          deviceId,
+          isFocused: false,
+          status: 'away',
+          lastActiveAt: Date.now() - 10 * 60 * 1000,
+        });
+      }
+
       const msg: ClientMessage = {
         type: 'requestMobilePush',
         sessionId: sessionId,
         title,
         body,
-        requestingDeviceId: deviceId,
+        ...(options?.bypassActiveDeviceRouting ? {} : { requestingDeviceId: deviceId }),
       };
       // console.log('[CollabV3] Requesting mobile push for session:', sessionId, 'deviceId:', deviceId, 'readyState:', indexWs.readyState);
       try {
         indexWs.send(JSON.stringify(msg));
+        if (options?.forceDesktopAwayForPush && deviceId) {
+          setTimeout(() => announceDevice(), 1500);
+        }
         // console.log('[CollabV3] Mobile push message sent successfully');
       } catch (error) {
         console.error('[CollabV3] Failed to send mobile push message:', error);

@@ -16,6 +16,8 @@ import { getDatabase } from '../database/initialize';
 import { gitRefWatcher } from '../file/GitRefWatcher';
 import { AIService } from './ai/AIService';
 import { setMetaAgentToolFns } from '../mcp/metaAgentServer';
+import { notificationService } from './NotificationService';
+import { getSyncProvider, isDesktopTrulyAway } from './SyncManager';
 import { computeNotificationSignature } from './metaAgentNotificationSignature';
 import { extractMessageText, extractUserPrompts } from './metaAgentMessageText';
 
@@ -112,6 +114,22 @@ interface SpawnSessionArgs {
   isolated?: boolean;
 }
 
+interface SendPromptOptions {
+  interruptCurrentTurn?: boolean;
+  force?: boolean;
+  interruptWaitingForInput?: boolean;
+}
+
+interface NotifyUserArgs {
+  title?: string;
+  body?: string;
+  sessionId?: string;
+  bypassFocusCheck?: boolean;
+  silent?: boolean;
+  urgency?: 'normal' | 'critical' | 'low';
+  mobilePush?: 'never' | 'when_desktop_away' | 'always';
+}
+
 export class MetaAgentService {
   private static instance: MetaAgentService | null = null;
   private starting: Promise<void> | null = null;
@@ -181,8 +199,12 @@ export class MetaAgentService {
           this.getSessionStatusJson(targetSessionId, workspaceId),
         getSessionResult: (_metaSessionId, workspaceId, targetSessionId) =>
           this.getSessionResultJson(targetSessionId, workspaceId),
-        sendPrompt: (_metaSessionId, workspaceId, targetSessionId, prompt) =>
-          this.sendPromptToSession(targetSessionId, workspaceId, prompt),
+        listQueuedPrompts: (_metaSessionId, workspaceId, targetSessionId, options) =>
+          this.listQueuedPromptsJson(targetSessionId, workspaceId, options),
+        sendPrompt: (_metaSessionId, workspaceId, targetSessionId, prompt, options) =>
+          this.sendPromptToSession(targetSessionId, workspaceId, prompt, options),
+        notifyUser: (callerSessionId, workspaceId, args) =>
+          this.notifyUserJson(callerSessionId, workspaceId, args),
         respondToPrompt: (_metaSessionId, workspaceId, args) =>
           this.respondToPrompt(workspaceId, args),
         listSpawnedSessions: (metaSessionId, workspaceId) =>
@@ -830,7 +852,51 @@ export class MetaAgentService {
     return JSON.stringify(data, null, 2);
   }
 
-  private async sendPromptToSession(sessionId: string, workspaceId: string, prompt: string): Promise<string> {
+  private async listQueuedPromptsJson(
+    sessionId: string,
+    workspaceId: string,
+    options: { includeCompleted?: boolean; includePromptText?: boolean } = {}
+  ): Promise<string> {
+    if (!sessionId) {
+      throw new Error('sessionId is required');
+    }
+
+    const session = await AISessionsRepository.get(sessionId);
+    if (!session || session.workspacePath !== workspaceId) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    const { getQueuedPromptsStore } = await import('./RepositoryManager');
+    const queueStore = getQueuedPromptsStore();
+    const prompts = await queueStore.listForSession(sessionId, {
+      includeCompleted: options.includeCompleted === true,
+    });
+
+    return JSON.stringify({
+      sessionId,
+      count: prompts.length,
+      includeCompleted: options.includeCompleted === true,
+      prompts: prompts.map((prompt) => ({
+        id: prompt.id,
+        status: prompt.status,
+        createdAt: prompt.createdAt,
+        claimedAt: prompt.claimedAt ?? null,
+        completedAt: prompt.completedAt ?? null,
+        errorMessage: prompt.errorMessage ?? null,
+        promptPreview: prompt.prompt.length > 300
+          ? `${prompt.prompt.slice(0, 300)}...`
+          : prompt.prompt,
+        ...(options.includePromptText === true ? { prompt: prompt.prompt } : {}),
+      })),
+    }, null, 2);
+  }
+
+  private async sendPromptToSession(
+    sessionId: string,
+    workspaceId: string,
+    prompt: string,
+    options: SendPromptOptions = {}
+  ): Promise<string> {
     if (!this.aiService) {
       throw new Error('AI service not initialized');
     }
@@ -844,6 +910,8 @@ export class MetaAgentService {
     }
 
     const normalizedPrompt = prompt.trim();
+    const interruptCurrentTurnRequested = options.interruptCurrentTurn === true || options.force === true;
+    const interruptWaitingForInput = options.interruptWaitingForInput === true;
     const shouldBypassExecution = this.shouldBypassChildAgentExecutionForTests();
     const statusRow = await this.getSessionStatusRow(sessionId, workspaceId);
     const statusBeforeQueue = (statusRow?.status || 'idle') as SessionStatusValue;
@@ -855,6 +923,9 @@ export class MetaAgentService {
         queuedPromptId: null,
         prompt: normalizedPrompt,
         statusBeforeQueue,
+        interruptCurrentTurnRequested,
+        interruptWaitingForInput,
+        interruptAttempted: false,
         processingTriggered: false,
         bypassedExecutionForTest: true,
       }, null, 2);
@@ -862,21 +933,60 @@ export class MetaAgentService {
 
     const queued = await this.aiService.queuePromptForSession(sessionId, normalizedPrompt);
     const status = (statusRow?.status || 'idle') as SessionStatusValue;
-    const processingTriggered = status === 'idle' || status === 'interrupted' || status === 'error';
+    const waitingForInputBlocked = status === 'waiting_for_input' && !interruptWaitingForInput;
+    const interruptEligible = status === 'running' || (status === 'waiting_for_input' && interruptWaitingForInput);
+    const interruptAttempted = interruptCurrentTurnRequested && interruptEligible;
+    const interruptSkippedReason = interruptCurrentTurnRequested && waitingForInputBlocked
+      ? 'waiting_for_input'
+      : null;
+    let interruptResult: Awaited<ReturnType<AIService['interruptCurrentTurnForSession']>> | null = null;
 
-    if (processingTriggered) {
-      await this.aiService.triggerQueuedPromptProcessingForSession(
-        sessionId,
-        session.worktreePath || session.workspacePath || workspaceId
-      );
+    if (interruptAttempted) {
+      try {
+        interruptResult = await this.aiService.interruptCurrentTurnForSession(sessionId);
+      } catch (error) {
+        interruptResult = {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
     }
 
+    const processingTriggered =
+      status === 'idle' ||
+      status === 'interrupted' ||
+      status === 'error' ||
+      (interruptCurrentTurnRequested && !waitingForInputBlocked);
+    let processingTriggerAccepted: boolean | null = null;
+    let processingTriggerError: string | null = null;
+
+    if (processingTriggered) {
+      try {
+        processingTriggerAccepted = await this.aiService.triggerQueuedPromptProcessingForSession(
+          sessionId,
+          session.worktreePath || session.workspacePath || workspaceId
+        );
+      } catch (error) {
+        processingTriggerAccepted = false;
+        processingTriggerError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    const statusAfterQueue = (await this.getSessionStatusRow(sessionId, workspaceId))?.status || status;
     return JSON.stringify({
       sessionId,
       queuedPromptId: queued.id,
       prompt: queued.prompt,
       statusBeforeQueue: status,
+      statusAfterQueue,
+      interruptCurrentTurnRequested,
+      interruptWaitingForInput,
+      interruptAttempted,
+      interruptSkippedReason,
+      interruptResult,
       processingTriggered,
+      processingTriggerAccepted,
+      ...(processingTriggerError ? { processingTriggerError } : {}),
     }, null, 2);
   }
 
@@ -912,6 +1022,87 @@ export class MetaAgentService {
       promptId: args.promptId,
       promptType: args.promptType,
       success: true,
+    }, null, 2);
+  }
+
+  private async notifyUserJson(
+    callerSessionId: string,
+    workspaceId: string,
+    args: NotifyUserArgs
+  ): Promise<string> {
+    const title = args.title?.trim();
+    const body = args.body?.trim();
+    if (!title) {
+      throw new Error('title is required');
+    }
+    if (!body) {
+      throw new Error('body is required');
+    }
+
+    const targetSessionId = args.sessionId?.trim() || callerSessionId;
+    const session = await AISessionsRepository.get(targetSessionId);
+    if (!session || session.workspacePath !== workspaceId) {
+      throw new Error(`Session ${targetSessionId} not found`);
+    }
+
+    const boundedTitle = title.length > 120 ? `${title.slice(0, 117)}...` : title;
+    const boundedBody = body.length > 1000 ? `${body.slice(0, 997)}...` : body;
+    const result = await notificationService.showNotificationWithResult({
+      title: boundedTitle,
+      body: boundedBody,
+      sessionId: targetSessionId,
+      workspacePath: session.workspacePath,
+      provider: 'agent',
+      bypassFocusCheck: args.bypassFocusCheck === true,
+      silent: args.silent === true,
+      urgency: args.urgency || 'normal',
+    });
+
+    const mobilePushMode = args.mobilePush || 'never';
+    const desktopTrulyAway = isDesktopTrulyAway();
+    const bypassActiveDeviceRouting = mobilePushMode === 'always';
+    const forceDesktopAwayForPush = mobilePushMode === 'always';
+    let mobilePushAttempted = false;
+    let mobilePushSkippedReason: string | null = null;
+    let mobilePushError: string | null = null;
+
+    if (mobilePushMode !== 'never') {
+      const syncProvider = getSyncProvider();
+      if (!syncProvider?.requestMobilePush) {
+        mobilePushSkippedReason = 'sync_provider_unavailable';
+      } else if (mobilePushMode === 'when_desktop_away' && !desktopTrulyAway) {
+        mobilePushSkippedReason = 'desktop_not_truly_away';
+      } else {
+        mobilePushAttempted = true;
+        try {
+          await syncProvider.requestMobilePush(targetSessionId, boundedTitle, boundedBody, {
+            bypassActiveDeviceRouting,
+            forceDesktopAwayForPush,
+          });
+        } catch (error) {
+          mobilePushError = error instanceof Error ? error.message : String(error);
+          mobilePushSkippedReason = 'error';
+        }
+      }
+    }
+
+    return JSON.stringify({
+      tool: 'notify_user',
+      deliveryChannel: 'os_notification',
+      mobilePushAttempted,
+      mobilePush: {
+        mode: mobilePushMode,
+        requested: mobilePushMode !== 'never',
+        attempted: mobilePushAttempted,
+        skippedReason: mobilePushSkippedReason,
+        desktopTrulyAway,
+        bypassActiveDeviceRouting,
+        forceDesktopAwayForPush,
+        ...(mobilePushError ? { error: mobilePushError } : {}),
+      },
+      sessionId: targetSessionId,
+      bypassFocusCheck: args.bypassFocusCheck === true,
+      result,
     }, null, 2);
   }
 
@@ -1035,16 +1226,56 @@ export class MetaAgentService {
       }
 
       const notification = this.buildNotificationMessage(eventType, result);
-      await this.aiService.queuePromptForSession(session.createdBySessionId, notification);
+      const shouldForceDeliverNotification = eventType !== 'session:error';
+      if (!shouldForceDeliverNotification) {
+        // Do not auto-re-drive the parent when THIS child settle was an error.
+        // The [Child Session Update] notification is still queued for visibility,
+        // but re-triggering the parent's queue on every error settle spins the
+        // meta-agent wakeup loop with no backoff.
+        await this.aiService.queuePromptForSession(session.createdBySessionId, notification);
+        return;
+      }
 
-      // Do not auto-re-drive the parent when THIS child settle was an error.
-      // The [Child Session Update] notification above is still queued for
-      // visibility, but re-triggering the parent's queue on every error settle
-      // spins the meta-agent wakeup loop with no backoff (an antigravity 429
-      // child settles instantly into 'error' every cycle). Native children
-      // settle 'session:completed', so this gate is a no-op for them.
-      if (eventType !== 'session:error' && (metaStatus === 'idle' || metaStatus === 'interrupted' || metaStatus === 'error')) {
-        await this.aiService.triggerQueuedPromptProcessingForSession(metaSession.id, metaSession.workspacePath);
+      const deliveryResult = await this.sendPromptToSession(
+        session.createdBySessionId,
+        metaSession.workspacePath,
+        notification,
+        {
+          force: shouldForceDeliverNotification,
+          interruptCurrentTurn: shouldForceDeliverNotification,
+          interruptWaitingForInput: false,
+        }
+      );
+
+      if (shouldForceDeliverNotification) {
+        try {
+          const parsed = JSON.parse(deliveryResult) as {
+            processingTriggered?: boolean;
+            processingTriggerAccepted?: boolean | null;
+            interruptAttempted?: boolean;
+            interruptResult?: { success?: boolean; error?: string } | null;
+            interruptSkippedReason?: string | null;
+          };
+          if (
+            parsed.processingTriggered !== true ||
+            parsed.processingTriggerAccepted !== true ||
+            parsed.interruptResult?.success === false
+          ) {
+            console.warn('[MetaAgentService] child notification force delivery was not accepted:', {
+              childSessionId: sessionId,
+              parentSessionId: session.createdBySessionId,
+              eventType,
+              processingTriggered: parsed.processingTriggered,
+              processingTriggerAccepted: parsed.processingTriggerAccepted,
+              interruptAttempted: parsed.interruptAttempted,
+              interruptSkippedReason: parsed.interruptSkippedReason,
+              interruptError: parsed.interruptResult?.error,
+              parentStatusBeforeDelivery: metaStatus,
+            });
+          }
+        } catch (parseError) {
+          console.warn('[MetaAgentService] failed to parse child notification delivery result:', parseError);
+        }
       }
     } catch (error) {
       console.error(`[MetaAgentService] handleChildSessionEvent failed for session ${sessionId} (${eventType}):`, error);
