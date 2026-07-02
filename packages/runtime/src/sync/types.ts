@@ -279,7 +279,15 @@ export interface SyncProvider {
    * Used when agent completes execution and user should be notified on mobile.
    * The server will check device presence before sending (suppresses if mobile is active).
    */
-  requestMobilePush?(sessionId: string, title: string, body: string): Promise<void>;
+  requestMobilePush?(
+    sessionId: string,
+    title: string,
+    body: string,
+    options?: {
+      bypassActiveDeviceRouting?: boolean;
+      forceDesktopAwayForPush?: boolean;
+    }
+  ): Promise<void>;
 
   /** Get list of currently connected devices */
   getConnectedDevices?(): DeviceInfo[];

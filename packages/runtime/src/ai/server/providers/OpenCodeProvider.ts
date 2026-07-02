@@ -309,6 +309,7 @@ export class OpenCodeProvider extends BaseAgentProvider {
       const sessionOptions = {
         workspacePath,
         model: this.config?.model || 'default',
+        ...(this.config?.agent ? { agent: this.config.agent } : {}),
         mcpServers,
         env,
         raw: {
