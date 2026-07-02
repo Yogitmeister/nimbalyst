@@ -462,6 +462,11 @@ export class AIService {
    */
   private migrateClaudeCodeModelList(): void {
     this.migrateClaudeCodeVariantInsertion(
+      'migrations.claudeCodeFableAdded',
+      'claude-code:fable',
+      null,
+    );
+    this.migrateClaudeCodeVariantInsertion(
       'migrations.claudeCodeOpus46Added',
       'claude-code:opus-4-6',
       'claude-code:opus',
@@ -476,14 +481,14 @@ export class AIService {
   private migrateClaudeCodeVariantInsertion(
     migrationKey: string,
     variantId: string,
-    insertAfterId: string,
+    insertAfterId: string | null,
   ): void {
     if (this.settingsStore!.get(migrationKey)) return;
     const providerSettings = this.settingsStore!.get('providerSettings', {}) as any;
     const claudeCode = providerSettings?.['claude-code'];
     if (claudeCode && Array.isArray(claudeCode.models) && !claudeCode.models.includes(variantId)) {
-      const anchorIndex = claudeCode.models.indexOf(insertAfterId);
-      const insertAt = anchorIndex >= 0 ? anchorIndex + 1 : claudeCode.models.length;
+      const anchorIndex = insertAfterId ? claudeCode.models.indexOf(insertAfterId) : -1;
+      const insertAt = insertAfterId ? (anchorIndex >= 0 ? anchorIndex + 1 : claudeCode.models.length) : 0;
       claudeCode.models = [
         ...claudeCode.models.slice(0, insertAt),
         variantId,
@@ -518,7 +523,7 @@ export class AIService {
                 enabled: true,
                 testStatus: "idle",
                 installStatus: "not-installed",
-                models: ["claude-code:opus", "claude-code:opus-4-7", "claude-code:opus-4-6", "claude-code:sonnet", "claude-code:haiku"]
+                models: ["claude-code:fable", "claude-code:opus", "claude-code:opus-4-7", "claude-code:opus-4-6", "claude-code:sonnet", "claude-code:haiku"]
               },
               openai: {
                 enabled: false,
