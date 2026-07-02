@@ -24,6 +24,14 @@ describe('resolveClaudeCodeModelVariant', () => {
       expect(resolveClaudeCodeModelVariant('claude-code:fable-5', DEFAULT_MODEL)).toBe('claude-fable-5');
     });
 
+    it('preserves already-resolved Sonnet 5 SDK model ID', () => {
+      expect(resolveClaudeCodeModelVariant('claude-sonnet-5', DEFAULT_MODEL)).toBe('claude-sonnet-5');
+    });
+
+    it('preserves already-resolved Fable 5 SDK model ID', () => {
+      expect(resolveClaudeCodeModelVariant('claude-fable-5', DEFAULT_MODEL)).toBe('claude-fable-5');
+    });
+
     it('fable-1m resolves to the pinned id with the [1m] suffix (same shape as pinned opus 1M variants)', () => {
       expect(resolveClaudeCodeModelVariant('claude-code:fable-1m', DEFAULT_MODEL)).toBe('claude-fable-5[1m]');
     });
@@ -110,6 +118,11 @@ describe('resolveClaudeCodeModelVariant', () => {
       // whatever "latest opus" happens to be, so users can stay on 4.6
       // after the canonical `opus` alias is bumped.
       const result = resolveClaudeCodeModelVariant('claude-code:opus-4-6', DEFAULT_MODEL);
+      expect(result).toBe('claude-opus-4-6');
+    });
+
+    it('preserves already-resolved Opus 4.6 SDK model ID', () => {
+      const result = resolveClaudeCodeModelVariant('claude-opus-4-6', DEFAULT_MODEL);
       expect(result).toBe('claude-opus-4-6');
     });
 

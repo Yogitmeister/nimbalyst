@@ -242,6 +242,15 @@ export const CLAUDE_CODE_VARIANTS = ['fable', 'opus', 'opus-4-7', 'opus-4-6', 's
 export function resolveClaudeCodeModelVariant(configuredModel: string | undefined, defaultModel: string): string {
   type ClaudeCodeVariant = typeof CLAUDE_CODE_VARIANTS[number];
   const configured = configuredModel || defaultModel;
+  const knownSdkModels = new Set<string>([
+    ...(Object.values(CLAUDE_CODE_PINNED_SDK_MODELS).filter(Boolean) as string[]),
+    'claude-fable-5',
+    'claude-opus-4-8',
+    'claude-opus-4-7',
+    'claude-opus-4-6',
+    'claude-sonnet-5',
+    'claude-sonnet-4-6',
+  ]);
 
   const toSdkBase = (variant: string): string => CLAUDE_CODE_PINNED_SDK_MODELS[variant as ClaudeCodeVariant] ?? variant;
 
@@ -260,13 +269,20 @@ export function resolveClaudeCodeModelVariant(configuredModel: string | undefine
   // Fallback for non-standard formats
   const raw = parsed ? parsed.model : configured;
   const normalized = raw?.toLowerCase();
-  const isExtended = normalized?.endsWith('-1m');
-  const withoutContext = normalized?.replace(/-1m$/, '');
+  const hasBracketContext = normalized?.endsWith('[1m]');
+  const withoutBracketContext = normalized?.replace(/\[1m\]$/, '');
+  const hasDashContext = withoutBracketContext?.endsWith('-1m');
+  const isExtended = Boolean(hasBracketContext || hasDashContext);
+  const withoutContext = withoutBracketContext?.replace(/-1m$/, '');
 
   const normalizedVariant = withoutContext ? normalizeClaudeCodeVariant(withoutContext) : null;
   if (normalizedVariant) {
     const sdkBase = toSdkBase(normalizedVariant);
     return isExtended ? `${sdkBase}[1m]` : sdkBase;
+  }
+
+  if (withoutContext && knownSdkModels.has(withoutContext)) {
+    return isExtended ? `${withoutContext}[1m]` : withoutContext;
   }
 
   const supported = CLAUDE_CODE_ACCEPTED_VARIANT_INPUTS.join(', ');
@@ -406,6 +422,8 @@ export interface ProviderConfig {
   effortLevel?: EffortLevel;  // Effort level for Opus 4.6 adaptive reasoning (low/medium/high/max)
   responseFormat?: ProviderResponseFormat;  // Response format constraint (extension chat completions)
   skipLogging?: boolean;  // Skip message logging to DB (extension stateless completions)
+  agent?: string;  // OpenCode agent (role) to activate for this session
+  customBackend?: string;  // Claude Code custom backend id for this session
 }
 
 /**

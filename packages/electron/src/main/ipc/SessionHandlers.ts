@@ -418,6 +418,15 @@ export async function registerSessionHandlers() {
                     console.log(`[SessionHandlers] Model changed to ${updates.model}, invalidating all providers for session ${sessionId}`);
                     ProviderFactory.destroyProvider(sessionId);
                 }
+
+                if (providerType === 'opencode') {
+                    (updates as any).providerSessionId = null;
+                }
+            }
+
+            if ((updates as any).metadata?.claudeBackend !== undefined) {
+                ProviderFactory.destroyProvider(sessionId, 'claude-code');
+                (updates as any).providerSessionId = null;
             }
 
             await AISessionsRepository.updateMetadata(sessionId, updates);

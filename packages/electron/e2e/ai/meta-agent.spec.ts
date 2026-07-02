@@ -344,6 +344,9 @@ test('creates a meta-agent session that appears in the session list as a group',
 test('surfaces delegated child sessions through the meta-agent MCP tools', async () => {
   const toolNames = await listMcpTools(metaAgentClient);
   expect(toolNames.length).toBeGreaterThan(0);
+  expect(toolNames).toContain('send_prompt_now');
+  expect(toolNames).toContain('list_queued_prompts');
+  expect(toolNames).toContain('notify_user');
 
   const created = await createChildSessionWithMetaAgent('Investigate parser edge cases');
   await insertUserPrompt(page, created.sessionId, 'Investigate parser edge cases');
@@ -650,6 +653,68 @@ test('send_prompt queues a follow-up message to a child session', async () => {
     userPrompts: string[];
   }>(metaAgentClient, 'get_session_result', { sessionId: childSessionId });
   expect(result.userPrompts).toContain('Now do the follow-up work');
+});
+
+test('send_prompt_now exposes force-delivery metadata and records the prompt', async () => {
+  const childSessionId = await createLinkedTestSession({
+    title: 'Urgent delegated follow-up task',
+    status: 'running',
+  });
+
+  const sendResult = await callMetaAgentTool<{
+    sessionId: string;
+    prompt: string;
+    interruptCurrentTurnRequested: boolean;
+    interruptAttempted: boolean;
+    processingTriggered: boolean;
+    bypassedExecutionForTest?: boolean;
+  }>(metaAgentClient, 'send_prompt_now', {
+    sessionId: childSessionId,
+    prompt: 'Interrupt with this follow-up',
+  });
+  expect(sendResult.sessionId).toBe(childSessionId);
+  expect(sendResult.prompt).toBe('Interrupt with this follow-up');
+  expect(sendResult.interruptCurrentTurnRequested).toBe(true);
+  expect(sendResult.interruptAttempted).toBe(false);
+  expect(sendResult.processingTriggered).toBe(false);
+  expect(sendResult.bypassedExecutionForTest).toBe(true);
+
+  const result = await callMetaAgentTool<{
+    sessionId: string;
+    userPrompts: string[];
+  }>(metaAgentClient, 'get_session_result', { sessionId: childSessionId });
+  expect(result.userPrompts).toContain('Interrupt with this follow-up');
+});
+
+test('list_queued_prompts exposes bounded queue state for a child session', async () => {
+  const childSessionId = await createLinkedTestSession({
+    title: 'Queued prompt audit task',
+    status: 'running',
+  });
+
+  await callMetaAgentTool(metaAgentClient, 'send_prompt', {
+    sessionId: childSessionId,
+    prompt: 'This prompt should remain queued for inspection',
+  });
+
+  const queue = await callMetaAgentTool<{
+    sessionId: string;
+    count: number;
+    prompts: Array<{
+      id: string;
+      status: string;
+      promptPreview: string;
+      prompt?: string;
+    }>;
+  }>(metaAgentClient, 'list_queued_prompts', {
+    sessionId: childSessionId,
+  });
+
+  expect(queue.sessionId).toBe(childSessionId);
+  expect(queue.count).toBeGreaterThanOrEqual(1);
+  expect(queue.prompts[0].status).toBe('pending');
+  expect(queue.prompts[0].promptPreview).toContain('remain queued');
+  expect(queue.prompts[0].prompt).toBeUndefined();
 });
 
 test('send_prompt rejects empty or missing prompt', async () => {
