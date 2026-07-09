@@ -451,9 +451,18 @@ export async function buildSdkOptions(
 
   const customBackend = resolveClaudeCodeBackend(config.customBackend);
   if (customBackend) {
-    applyClaudeCodeBackendEnv(env, customBackend);
-    if (teammateManager.packagedBuildOptions?.env) {
-      applyClaudeCodeBackendEnv(teammateManager.packagedBuildOptions.env, customBackend);
+    // Applying a backend deletes ANTHROPIC_API_KEY; without the gateway token
+    // present that would spawn a session that sends unauthenticated requests.
+    // Keep the default Claude backend instead and say so loudly.
+    if (!process.env[customBackend.authTokenEnv]) {
+      console.warn(
+        `[ClaudeCodeProvider] Custom backend '${customBackend.id}' requires env ${customBackend.authTokenEnv}, which is not set — keeping the default Claude backend for this session.`
+      );
+    } else {
+      applyClaudeCodeBackendEnv(env, customBackend);
+      if (teammateManager.packagedBuildOptions?.env) {
+        applyClaudeCodeBackendEnv(teammateManager.packagedBuildOptions.env, customBackend);
+      }
     }
   }
 
