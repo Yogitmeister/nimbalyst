@@ -89,6 +89,7 @@ interface AIInputProps {
   effortLevel?: EffortLevel;
   onEffortLevelChange?: (level: EffortLevel) => void;
   showEffortLevel?: boolean;
+  supportedEffortLevels?: { key: EffortLevel; label: string }[];
 
   // OpenCode agent (role) selection
   opencodeAgent?: string | null;
@@ -178,6 +179,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     effortLevel,
     onEffortLevelChange,
     showEffortLevel,
+    supportedEffortLevels,
     opencodeAgent,
     onAgentChange,
     availableAgents,
@@ -1379,6 +1381,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
               <EffortLevelSelector
                 level={effortLevel}
                 onLevelChange={onEffortLevelChange}
+                supportedLevels={supportedEffortLevels}
               />
             )}
             {currentProvider === 'opencode' && availableAgents && availableAgents.length > 0 && onAgentChange && (

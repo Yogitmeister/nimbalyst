@@ -347,7 +347,9 @@ export async function buildSdkOptions(
     // override via their own env var if they want the original sdk-ts label.
     ...(process.env.CLAUDE_CODE_ENTRYPOINT == null && { CLAUDE_CODE_ENTRYPOINT: 'cli' }),
     ...(config.effortLevel && config.effortLevel !== DEFAULT_EFFORT_LEVEL && {
-      CLAUDE_CODE_EFFORT_LEVEL: config.effortLevel
+      // 'ultra' is a Codex-5.6-only tier; the Claude CLI slider tops out at
+      // 'max', so clamp rather than hand it an unknown level.
+      CLAUDE_CODE_EFFORT_LEVEL: config.effortLevel === 'ultra' ? 'max' : config.effortLevel
     }),
     // The bundled claude binary runs a per-tool idle-timeout watchdog (default
     // 300s) over MCP servers whose transport is http/sse/ws. ALL Nimbalyst
