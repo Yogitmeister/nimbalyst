@@ -98,6 +98,10 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   // and reference_provider_api_current_specs.md in the workspace repo. contextWindow/
   // maxTokens kept at the existing file's uniform 400000/128000 convention (live discovery
   // overrides these via metadataById in getPreferredModels() when available).
+  // GA-day catalog re-fetch 2026-07-10 evening (chatgpt.com/backend-api/codex/models):
+  // gpt-5.3-codex-spark appeared (prio 26, supported_in_api:false — subscription-only;
+  // dispatch probe-verified live) and gpt-5.2 left the catalog. Spark keeps its real 128K
+  // window instead of the uniform 400000 placeholder — its catalog ctx is a hard cap.
   private static readonly FALLBACK_MODELS: ReadonlyArray<{
     id: string;
     name: string;
@@ -110,6 +114,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     { id: 'gpt-5.5', name: 'GPT-5.5', contextWindow: 400000, maxTokens: 128000 },
     { id: 'gpt-5.4', name: 'GPT-5.4', contextWindow: 400000, maxTokens: 128000 },
     { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', contextWindow: 400000, maxTokens: 128000 },
+    { id: 'gpt-5.3-codex-spark', name: 'GPT-5.3 Codex Spark', contextWindow: 128000, maxTokens: 128000 },
   ];
   private static readonly MODEL_FALLBACK_PRIORITY: ReadonlyArray<string> = [
     'gpt-5.6-sol',
@@ -118,6 +123,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     'gpt-5.5',
     'gpt-5.4',
     'gpt-5.4-mini',
+    'gpt-5.3-codex-spark',
   ];
   private static readonly FALLBACK_MODELS_SET = new Set(
     OpenAICodexProvider.FALLBACK_MODELS.map((model) => model.id)

@@ -44,6 +44,7 @@ describe('ultra effort level (Codex 5.6)', () => {
     expect(clampEffortForModel('openai-codex:gpt-5.6-luna', 'ultra')).toBe('max');
     expect(clampEffortForModel('openai-codex:gpt-5.5', 'max')).toBe('xhigh');
     expect(clampEffortForModel('gpt-5.4', 'ultra')).toBe('xhigh');
+    expect(clampEffortForModel('openai-codex:gpt-5.3-codex-spark', 'ultra')).toBe('xhigh');
     expect(clampEffortForModel('openai-codex-acp:gpt-5.6-sol', 'max')).toBe('max');
   });
 
@@ -63,6 +64,8 @@ describe('ultra effort level (Codex 5.6)', () => {
     expect(supportedEffortLevelsForModel('openai-codex:gpt-5.6-luna').map(l => l.key))
       .toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
     expect(supportedEffortLevelsForModel('openai-codex:gpt-5.4').map(l => l.key))
+      .toEqual(['low', 'medium', 'high', 'xhigh']);
+    expect(supportedEffortLevelsForModel('openai-codex:gpt-5.3-codex-spark').map(l => l.key))
       .toEqual(['low', 'medium', 'high', 'xhigh']);
     expect(supportedEffortLevelsForModel('claude-code:fable').map(l => l.key))
       .toEqual(['low', 'medium', 'high', 'xhigh', 'max']);

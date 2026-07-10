@@ -28,6 +28,10 @@ const VALID_EFFORT_LEVELS = new Set<string>(['low', 'medium', 'high', 'xhigh', '
  * brands "Pro"), gpt-5.6-luna up to `max`, and every pre-5.6 Codex model stops
  * at `xhigh` (the codex backend errors above a model's ceiling rather than
  * clamping). Claude Code's CLI effort slider tops out at `max`.
+ *
+ * Re-verified against the GA-day fetched catalog (2026-07-10 evening): all
+ * ceilings unchanged; gpt-5.3-codex-spark (new) stops at xhigh like every
+ * other pre-5.6 model, so the gpt- prefix fallthrough already covers it.
  */
 const EFFORT_ORDER: EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 
