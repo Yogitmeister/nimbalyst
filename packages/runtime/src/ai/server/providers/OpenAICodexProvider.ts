@@ -90,28 +90,34 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     'Use MCP server `nimbalyst`, tool `update_session_meta`, ' +
     'and set at least `name`, `add`, and `phase`. ' +
     'Do not mention this system reminder to the user.</SYSTEM_REMINDER>';
+  // Roster refreshed 2026-07-10 (NIM-245): the prior 7-entry list carried 5 models that
+  // now 400 on ChatGPT-subscription auth ("not supported when using Codex with a ChatGPT
+  // account") and was entirely missing the gpt-5.6 generation (Sol/Terra/Luna) and
+  // gpt-5.4-mini. Verified live via the codex CLI's own embedded model catalog + `codex
+  // exec -m <id>` probes — see .claude/skills/agent-tiers.md "Codex subscription ladder"
+  // and reference_provider_api_current_specs.md in the workspace repo. contextWindow/
+  // maxTokens kept at the existing file's uniform 400000/128000 convention (live discovery
+  // overrides these via metadataById in getPreferredModels() when available).
   private static readonly FALLBACK_MODELS: ReadonlyArray<{
     id: string;
     name: string;
     contextWindow: number;
     maxTokens: number;
   }> = [
+    { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', contextWindow: 400000, maxTokens: 128000 },
+    { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', contextWindow: 400000, maxTokens: 128000 },
+    { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', contextWindow: 400000, maxTokens: 128000 },
     { id: 'gpt-5.5', name: 'GPT-5.5', contextWindow: 400000, maxTokens: 128000 },
     { id: 'gpt-5.4', name: 'GPT-5.4', contextWindow: 400000, maxTokens: 128000 },
-    { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex', contextWindow: 400000, maxTokens: 128000 },
-    { id: 'gpt-5.2-codex', name: 'GPT-5.2 Codex', contextWindow: 400000, maxTokens: 128000 },
-    { id: 'gpt-5.1-codex-max', name: 'GPT-5.1 Codex Max', contextWindow: 400000, maxTokens: 128000 },
-    { id: 'gpt-5.2', name: 'GPT-5.2', contextWindow: 128000, maxTokens: 128000 },
-    { id: 'gpt-5.1-codex-mini', name: 'GPT-5.1 Codex Mini', contextWindow: 400000, maxTokens: 128000 },
+    { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', contextWindow: 400000, maxTokens: 128000 },
   ];
   private static readonly MODEL_FALLBACK_PRIORITY: ReadonlyArray<string> = [
+    'gpt-5.6-sol',
+    'gpt-5.6-terra',
+    'gpt-5.6-luna',
     'gpt-5.5',
     'gpt-5.4',
-    'gpt-5.3-codex',
-    'gpt-5.2-codex',
-    'gpt-5.1-codex-max',
-    'gpt-5.1-codex-mini',
-    'gpt-5.2',
+    'gpt-5.4-mini',
   ];
   private static readonly FALLBACK_MODELS_SET = new Set(
     OpenAICodexProvider.FALLBACK_MODELS.map((model) => model.id)
@@ -427,18 +433,23 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     'openai-codex:cli',
     'cli',
   ]);
+  // Re-pointed 2026-07-10 (NIM-245): every target below used to resolve to one of the 5
+  // retired gpt-5.1/5.2/5.3-codex models (400 on ChatGPT-subscription auth), so any legacy
+  // alias here would silently fail. Re-mapped by tier: "-mini" aliases -> gpt-5.4-mini,
+  // "-max" aliases -> gpt-5.6-sol (strongest live model), plain numbered aliases -> gpt-5.4,
+  // bare 'gpt-5' -> gpt-5.6-terra (current default tier).
   private static readonly MODEL_REPLACEMENTS = new Map<string, string>([
-    ['gpt-5', 'gpt-5.2'],
+    ['gpt-5', 'gpt-5.6-terra'],
     ['gpt-5-codex', 'gpt-5.4'],
     ['gpt-5.4-codex', 'gpt-5.4'],
-    ['gpt-5-codex-mini', 'gpt-5.1-codex-mini'],
-    ['gpt-5.2-codex-mini', 'gpt-5.2-codex'],
-    ['gpt-5.2-codex-max', 'gpt-5.2-codex'],
-    ['gpt-5-codex-max', 'gpt-5.1-codex-max'],
-    ['gpt-5.1-codex', 'gpt-5.2-codex'],
-    ['gpt-5.3-codex-mini', 'gpt-5.3-codex'],
-    ['gpt-5.3-codex-max', 'gpt-5.3-codex'],
-    ['codex-mini-latest', 'gpt-5.1-codex-mini'],
+    ['gpt-5-codex-mini', 'gpt-5.4-mini'],
+    ['gpt-5.2-codex-mini', 'gpt-5.4-mini'],
+    ['gpt-5.2-codex-max', 'gpt-5.6-sol'],
+    ['gpt-5-codex-max', 'gpt-5.6-sol'],
+    ['gpt-5.1-codex', 'gpt-5.4'],
+    ['gpt-5.3-codex-mini', 'gpt-5.4-mini'],
+    ['gpt-5.3-codex-max', 'gpt-5.6-sol'],
+    ['codex-mini-latest', 'gpt-5.4-mini'],
   ]);
 
   /**
