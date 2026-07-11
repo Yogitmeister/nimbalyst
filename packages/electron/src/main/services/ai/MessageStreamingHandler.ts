@@ -450,6 +450,34 @@ export class MessageStreamingHandler {
     let provider = ProviderFactory.getProvider(session.provider as AIProviderType, session.id);
     perfLog.getProviderTime = Date.now() - providerStartTime;
 
+    let freshClaudeBackend: string | undefined;
+    if (isProviderClaudeCode) {
+      const sessionMetadata: any = session.metadata ?? {};
+      try {
+        const freshRow: any = await AISessionsRepository.get(session.id);
+        const freshMetadata: any = freshRow?.metadata ?? {};
+        freshClaudeBackend =
+          freshMetadata.claudeBackend ??
+          freshMetadata.metadata?.claudeBackend ??
+          sessionMetadata.claudeBackend ??
+          sessionMetadata.metadata?.claudeBackend ??
+          undefined;
+      } catch {
+        freshClaudeBackend = sessionMetadata.claudeBackend ?? sessionMetadata.metadata?.claudeBackend ?? undefined;
+      }
+    }
+
+    if (provider && isProviderClaudeCode) {
+      const activeBackend = (provider as any)?.config?.customBackend ?? undefined;
+      if (freshClaudeBackend !== activeBackend) {
+        logger.main.info(
+          `[AIService] Claude Code backend changed for session ${session.id}: active=${activeBackend ?? '(none)'} desired=${freshClaudeBackend ?? '(none)'}; rebuilding provider`
+        );
+        ProviderFactory.destroyProvider(session.id, 'claude-code');
+        provider = null as any;
+      }
+    }
+
     // If provider doesn't exist, create and initialize it
     if (!provider) {
       if (isProviderClaudeCode) {
@@ -557,6 +585,13 @@ export class MessageStreamingHandler {
         // Effort level: explicit session value, else the app-wide default the
         // selector displays (Opus 4.6 adaptive reasoning).
         ...(reinitEffortLevel && { effortLevel: reinitEffortLevel }),
+        // Pass OpenCode agent from session metadata
+        ...(session.provider === 'opencode' && (session.metadata as any)?.opencodeAgent && {
+          agent: (session.metadata as any).opencodeAgent,
+        }),
+        ...(isProviderClaudeCode && freshClaudeBackend && {
+          customBackend: freshClaudeBackend,
+        }),
       };
 
       // Add baseUrl for LMStudio

@@ -12,6 +12,7 @@ import { app } from 'electron';
 import { ClaudeCodeDeps } from './dependencyInjection';
 import { resolveClaudeAgentCliPath } from './cliPathResolver';
 import { DEFAULT_EFFORT_LEVEL } from '../../effortLevels';
+import { applyClaudeCodeBackendEnv, resolveClaudeCodeBackend } from './customBackends';
 
 type SessionMode = 'planning' | 'agent' | 'auto' | undefined;
 
@@ -38,7 +39,7 @@ export interface BuildSdkOptionsDeps {
     resolveTeamContext: (sessionId?: string) => Promise<string | undefined>;
   };
   sessions: { getSessionId: (sessionId: string) => string | null | undefined };
-  config: { model?: string; apiKey?: string; effortLevel?: string };
+  config: { model?: string; apiKey?: string; effortLevel?: string; customBackend?: string };
   abortController: AbortController;
 }
 
@@ -214,6 +215,8 @@ export async function buildSdkOptions(
     resolvedBinaryPath = undefined;
   }
   const effectivePath = customPath || resolvedBinaryPath;
+  const resolvedModel = resolveModelVariant();
+  console.log(`[CLAUDE-CODE] Model resolved: configured=${config.model ?? '(default)'} resolved=${resolvedModel}`);
   // console.log(`[CLAUDE-CODE] Binary path: custom=${customPath || '(none)'} resolved=${resolvedBinaryPath ?? '(none)'} effective=${effectivePath ?? '(none)'}`);
 
   const options: any = {
@@ -229,7 +232,7 @@ export async function buildSdkOptions(
     mcpServers: await mcpConfigService.getMcpServersConfig({ sessionId, workspacePath: mcpConfigWorkspacePath || workspacePath }),
     cwd: workspacePath,
     abortController,
-    model: resolveModelVariant(),
+    model: resolvedModel,
     // IMPORTANT: Do NOT add manual tool restrictions or prompt injections for plan mode here.
     // The SDK's `permissionMode: 'plan'` natively enforces planning restrictions (scopes
     // Write to the plan file only). Manual filtering was removed in favour of this approach.
@@ -443,6 +446,14 @@ export async function buildSdkOptions(
     env.ANTHROPIC_API_KEY = config.apiKey;
     if (teammateManager.packagedBuildOptions?.env) {
       teammateManager.packagedBuildOptions.env.ANTHROPIC_API_KEY = config.apiKey;
+    }
+  }
+
+  const customBackend = resolveClaudeCodeBackend(config.customBackend);
+  if (customBackend) {
+    applyClaudeCodeBackendEnv(env, customBackend);
+    if (teammateManager.packagedBuildOptions?.env) {
+      applyClaudeCodeBackendEnv(teammateManager.packagedBuildOptions.env, customBackend);
     }
   }
 

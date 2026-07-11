@@ -49,6 +49,49 @@ type RespondToPromptArgs = {
   response: Record<string, unknown>;
 };
 
+type SendPromptArgs = {
+  sessionId: string;
+  prompt: string;
+  /**
+   * Interrupt the target session's active turn before triggering queued prompt
+   * processing. This is the same intent as the queued-prompt "Interrupt and
+   * send now" action.
+   */
+  interruptCurrentTurn?: boolean;
+  /** Backward-compatible alias for clients that use concise force semantics. */
+  force?: boolean;
+  /**
+   * If true, allow force-delivery to interrupt a session that is currently
+   * waiting for an interactive prompt. Defaults to false; respond_to_prompt is
+   * usually the correct tool for that state.
+   */
+  interruptWaitingForInput?: boolean;
+};
+
+type ListQueuedPromptsArgs = {
+  sessionId: string;
+  /**
+   * Include completed and failed queue rows in addition to pending/executing
+   * rows. Defaults to false so the default view answers "what is still stuck?"
+   */
+  includeCompleted?: boolean;
+  /**
+   * Include full prompt text. Defaults to false; the response always includes a
+   * bounded preview so callers can identify rows without dumping huge prompts.
+   */
+  includePromptText?: boolean;
+};
+
+type NotifyUserArgs = {
+  title: string;
+  body: string;
+  sessionId?: string;
+  bypassFocusCheck?: boolean;
+  silent?: boolean;
+  urgency?: "normal" | "critical" | "low";
+  mobilePush?: "never" | "when_desktop_away" | "always";
+};
+
 interface MetaAgentToolFns {
   listWorktrees: (
     metaSessionId: string,
@@ -74,11 +117,23 @@ interface MetaAgentToolFns {
     workspaceId: string,
     targetSessionId: string
   ) => Promise<string>;
+  listQueuedPrompts: (
+    metaSessionId: string,
+    workspaceId: string,
+    targetSessionId: string,
+    options?: Pick<ListQueuedPromptsArgs, "includeCompleted" | "includePromptText">
+  ) => Promise<string>;
   sendPrompt: (
     metaSessionId: string,
     workspaceId: string,
     targetSessionId: string,
-    prompt: string
+    prompt: string,
+    options?: Pick<SendPromptArgs, "interruptCurrentTurn" | "force" | "interruptWaitingForInput">
+  ) => Promise<string>;
+  notifyUser: (
+    metaSessionId: string,
+    workspaceId: string,
+    args: NotifyUserArgs
   ) => Promise<string>;
   respondToPrompt: (
     metaSessionId: string,
@@ -251,9 +306,34 @@ export const META_AGENT_TOOL_DEFS: Array<{
     },
   },
   {
+    name: "list_queued_prompts",
+    description:
+      "Inspect queued prompts for a session. By default returns only pending/executing rows with bounded prompt previews; set includeCompleted to audit recently consumed rows.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: {
+          type: "string",
+          description: "The target session ID.",
+        },
+        includeCompleted: {
+          type: "boolean",
+          description:
+            "Optional. If true, include completed and failed queue rows. Defaults to false.",
+        },
+        includePromptText: {
+          type: "boolean",
+          description:
+            "Optional. If true, include full prompt text. Defaults to false; promptPreview is always included.",
+        },
+      },
+      required: ["sessionId"],
+    },
+  },
+  {
     name: "send_prompt",
     description:
-      "Queue a follow-up prompt for a child session. If the session is idle, prompt processing starts immediately.",
+      "Queue a follow-up prompt for a child session. If the session is idle, prompt processing starts immediately. Set interruptCurrentTurn only when you must interrupt an active child turn; for clearer force-delivery semantics, prefer send_prompt_now.",
     inputSchema: {
       type: "object",
       properties: {
@@ -265,8 +345,91 @@ export const META_AGENT_TOOL_DEFS: Array<{
           type: "string",
           description: "The follow-up prompt to send.",
         },
+        interruptCurrentTurn: {
+          type: "boolean",
+          description:
+            "Optional. If true, interrupt an active target session before triggering queued prompt processing. Defaults to false.",
+        },
+        force: {
+          type: "boolean",
+          description:
+            "Optional alias for interruptCurrentTurn for clients that use concise force semantics.",
+        },
+        interruptWaitingForInput: {
+          type: "boolean",
+          description:
+            "Optional. If true, allow interrupting a session that is waiting for an interactive prompt. Defaults to false; respond_to_prompt is usually the correct tool for that state.",
+        },
       },
       required: ["sessionId", "prompt"],
+    },
+  },
+  {
+    name: "send_prompt_now",
+    description:
+      "Queue a follow-up prompt for a child session, interrupt the child session's active turn when needed, and trigger queue processing immediately. This is the MCP equivalent of the queued-prompt lightning action.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: {
+          type: "string",
+          description: "The target child session ID.",
+        },
+        prompt: {
+          type: "string",
+          description: "The urgent follow-up prompt to deliver.",
+        },
+        interruptWaitingForInput: {
+          type: "boolean",
+          description:
+            "Optional. If true, allow interrupting a session that is waiting for an interactive prompt. Defaults to false; respond_to_prompt is usually the correct tool for that state.",
+        },
+      },
+      required: ["sessionId", "prompt"],
+    },
+  },
+  {
+    name: "notify_user",
+    description:
+      "Show a local OS/system notification to get the human's attention. Use this for explicitly authorized asynchronous attention signals when chat may be missed. This is separate from voice mode; it respects the user's OS notification setting and returns JSON explaining whether the notification was shown or skipped.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: {
+          type: "string",
+          description: "Required short notification title.",
+        },
+        body: {
+          type: "string",
+          description: "Required notification body. Keep it concise and action-oriented.",
+        },
+        sessionId: {
+          type: "string",
+          description:
+            "Optional session to open when the user clicks the notification. Defaults to the calling session.",
+        },
+        bypassFocusCheck: {
+          type: "boolean",
+          description:
+            "Optional. If true, bypass in-app focus/session-visible suppression while still respecting the OS notification setting. Use only when the user asked agents to get their attention.",
+        },
+        silent: {
+          type: "boolean",
+          description: "Optional. If true, request a silent OS notification.",
+        },
+        urgency: {
+          type: "string",
+          enum: ["normal", "critical", "low"],
+          description: "Optional OS urgency hint. Defaults to normal.",
+        },
+        mobilePush: {
+          type: "string",
+          enum: ["never", "when_desktop_away", "always"],
+          description:
+            "Optional. never by default. when_desktop_away sends a mobile push only if the desktop is truly away. always forces a mobile push request.",
+        },
+      },
+      required: ["title", "body"],
     },
   },
   {
@@ -335,7 +498,10 @@ const EXTENSION_META_AGENT_ALLOWED_TOOLS = new Set<string>([
   "create_session",
   "get_session_status",
   "get_session_result",
+  "list_queued_prompts",
   "send_prompt",
+  "send_prompt_now",
+  "notify_user",
   "respond_to_prompt",
   "list_spawned_sessions",
 ]);
@@ -398,13 +564,41 @@ export async function dispatchMetaAgentTool(
         effectiveWorkspaceId,
         (args?.sessionId as string) ?? ""
       );
+    case "list_queued_prompts":
+      return toolFns.listQueuedPrompts(
+        aiSessionId,
+        effectiveWorkspaceId,
+        (args?.sessionId as string) ?? "",
+        {
+          includeCompleted: args?.includeCompleted === true,
+          includePromptText: args?.includePromptText === true,
+        }
+      );
     case "send_prompt":
       return toolFns.sendPrompt(
         aiSessionId,
         effectiveWorkspaceId,
         (args?.sessionId as string) ?? "",
-        (args?.prompt as string) ?? ""
+        (args?.prompt as string) ?? "",
+        {
+          interruptCurrentTurn: args?.interruptCurrentTurn === true,
+          force: args?.force === true,
+          interruptWaitingForInput: args?.interruptWaitingForInput === true,
+        }
       );
+    case "send_prompt_now":
+      return toolFns.sendPrompt(
+        aiSessionId,
+        effectiveWorkspaceId,
+        (args?.sessionId as string) ?? "",
+        (args?.prompt as string) ?? "",
+        {
+          interruptCurrentTurn: true,
+          interruptWaitingForInput: args?.interruptWaitingForInput === true,
+        }
+      );
+    case "notify_user":
+      return toolFns.notifyUser(aiSessionId, effectiveWorkspaceId, (args ?? {}) as NotifyUserArgs);
     case "respond_to_prompt":
       return toolFns.respondToPrompt(aiSessionId, effectiveWorkspaceId, (args ?? {}) as RespondToPromptArgs);
     case "list_spawned_sessions":

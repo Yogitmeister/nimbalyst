@@ -59,6 +59,8 @@ import {
   sessionWorktreePathAtom,
   sessionDocumentContextAtom,
   sessionEffortLevelRawAtom,
+  sessionOpenCodeAgentAtom,
+  sessionClaudeBackendAtom,
   sessionLoadingAtom,
   sessionModeAtom,
   sessionModelAtom,
@@ -463,6 +465,9 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const sessionWorktreePath = useAtomValue(sessionWorktreePathAtom(sessionId));
   const sessionDocumentContext = useAtomValue(sessionDocumentContextAtom(sessionId));
   const rawEffortLevel = useAtomValue(sessionEffortLevelRawAtom(sessionId));
+  const rawOpenCodeAgent = useAtomValue(sessionOpenCodeAgentAtom(sessionId));
+  const rawClaudeBackend = useAtomValue(sessionClaudeBackendAtom(sessionId));
+  const [availableAgents, setAvailableAgents] = useState<string[]>([]);
   const loadSessionData = useSetAtom(loadSessionDataAtom);
   const reloadSessionData = useSetAtom(reloadSessionDataAtom);
   const updateSessionStore = useSetAtom(updateSessionStoreAtom);
@@ -1547,6 +1552,25 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     });
   }, [sessionId, updateSessionStore, setAgentModeSettings, effortLevel, posthog]);
 
+  const handleAgentChange = useCallback(async (agentName: string) => {
+    await updateSessionMetadataField(sessionId, 'opencodeAgent', agentName || null, null, updateSessionStore);
+  }, [sessionId, updateSessionStore]);
+
+  const handleClaudeBackendChange = useCallback(async (backendId: string) => {
+    await updateSessionMetadataField(sessionId, 'claudeBackend', backendId || null, null, updateSessionStore);
+  }, [sessionId, updateSessionStore]);
+
+  useEffect(() => {
+    if (provider !== 'opencode' || !window.electronAPI) return;
+    window.electronAPI.invoke('opencode-config:list-agents')
+      .then((result: { success: boolean; agents?: string[] }) => {
+        if (result.success && result.agents) {
+          setAvailableAgents(result.agents);
+        }
+      })
+      .catch(() => { /* agent list unavailable */ });
+  }, [provider]);
+
   const handleCommandSelect = useCallback((command: string) => {
     setDraftInput(command);
     inputRef.current?.focus();
@@ -2597,6 +2621,22 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         effortLevel={effortLevel}
         onEffortLevelChange={handleEffortLevelChange}
         showEffortLevel={isClaudeCliTerminalSession(provider) && cliSessionCommitted ? false : showEffortLevel}
+        opencodeAgent={rawOpenCodeAgent}
+        onAgentChange={handleAgentChange}
+        availableAgents={availableAgents}
+        claudeBackend={rawClaudeBackend}
+        onClaudeBackendChange={handleClaudeBackendChange}
+        availableClaudeBackends={[
+          { id: 'deepseek-reasoner', name: 'DeepSeek V4 Reasoner' },
+          { id: 'deepseek-chat', name: 'DeepSeek V4 Fast' },
+          { id: 'kimi-k2.6', name: 'Kimi K2.6' },
+          { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code' },
+          { id: 'qwen3-max-thinking', name: 'Qwen3 Max Thinking' },
+          { id: 'qwen3.7-plus', name: 'Qwen 3.7 Plus' },
+          { id: 'kimi-k2-thinking', name: 'Kimi K2 Thinking' },
+          { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
+          { id: 'a54', name: 'GPT-5.4' },
+        ]}
         tokenUsage={tokenUsage}
         provider={provider}
         onQueue={handleQueue}

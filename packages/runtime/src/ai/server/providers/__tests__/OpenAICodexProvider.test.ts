@@ -1146,6 +1146,8 @@ describe('OpenAICodexProvider', () => {
         // update_session_meta onto the eager core `nimbalyst`.
         'mcp__nimbalyst-host__create_session',
         'mcp__nimbalyst-host__get_session_result',
+        'mcp__nimbalyst-host__send_prompt_now',
+        'mcp__nimbalyst-host__notify_user',
         'mcp__nimbalyst__update_session_meta',
         'mcp__nimbalyst-host__get_workstream_overview',
         'TaskCreate',
