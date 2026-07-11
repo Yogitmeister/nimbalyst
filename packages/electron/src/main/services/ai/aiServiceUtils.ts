@@ -246,7 +246,11 @@ export function extractModelForProvider(
   fullModel: string,
   provider: AIProviderType
 ): string | null {
-  if (provider === 'openai-codex') {
+  if (provider === 'openai-codex' || provider === 'openai-codex-acp') {
+    // ACP sessions accept the same model IDs as the SDK transport (see
+    // OpenAICodexACPProvider's FALLBACK_MODELS comment), so legacy-alias
+    // normalization must apply here too -- otherwise an ACP session with a
+    // stale alias (e.g. a retired gpt-5.2-codex-* id) never gets repointed.
     const parsed = ModelIdentifier.tryParse(fullModel);
     const rawModel = parsed ? parsed.model : fullModel;
     const normalized = OpenAICodexProvider.normalizeModelSelection(rawModel);

@@ -51,6 +51,8 @@ export class OpenAICodexACPProvider extends BaseAgentProvider {
   static readonly DEFAULT_MODEL = DEFAULT_MODELS['openai-codex-acp'];
   // Reuse the same fallback model catalog as the SDK provider; the underlying
   // Codex CLI accepts the same model IDs regardless of transport.
+  // Refreshed 2026-07-10 (NIM-245) in lockstep with OpenAICodexProvider.FALLBACK_MODELS —
+  // see that file for the full rationale.
   private static readonly FALLBACK_MODELS: ReadonlyArray<{
     id: string;
     name: string;
@@ -62,11 +64,7 @@ export class OpenAICodexACPProvider extends BaseAgentProvider {
     { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', contextWindow: 372000, maxTokens: 128000 },
     { id: 'gpt-5.5', name: 'GPT-5.5', contextWindow: 400000, maxTokens: 128000 },
     { id: 'gpt-5.4', name: 'GPT-5.4', contextWindow: 400000, maxTokens: 128000 },
-    { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex', contextWindow: 400000, maxTokens: 128000 },
-    { id: 'gpt-5.2-codex', name: 'GPT-5.2 Codex', contextWindow: 400000, maxTokens: 128000 },
-    { id: 'gpt-5.1-codex-max', name: 'GPT-5.1 Codex Max', contextWindow: 400000, maxTokens: 128000 },
-    { id: 'gpt-5.2', name: 'GPT-5.2', contextWindow: 128000, maxTokens: 128000 },
-    { id: 'gpt-5.1-codex-mini', name: 'GPT-5.1 Codex Mini', contextWindow: 400000, maxTokens: 128000 },
+    { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', contextWindow: 400000, maxTokens: 128000 },
   ];
 
   private readonly protocol: CodexACPProtocol;

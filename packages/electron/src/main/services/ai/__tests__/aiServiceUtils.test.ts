@@ -265,6 +265,14 @@ describe('aiServiceUtils', () => {
       expect(extractModelForProvider('openai-codex:default', 'openai-codex')).toBe('gpt-5.6-sol');
     });
 
+    it('applies the same legacy-alias normalization for the ACP transport (openai-codex-acp), not just the SDK provider', () => {
+      // Regression check: the ACP transport used to skip normalizeModelSelection()
+      // entirely (it only ran for provider === 'openai-codex'), so a legacy alias
+      // on an ACP session would never get repointed to a live model.
+      expect(extractModelForProvider('openai-codex-acp:openai-codex-cli', 'openai-codex-acp')).toBe('gpt-5.6-sol');
+      expect(extractModelForProvider('openai-codex-acp:gpt-5', 'openai-codex-acp')).toBe('gpt-5');
+    });
+
     it('returns the full model unchanged for claude-code', () => {
       expect(extractModelForProvider('claude-code:opus-1m', 'claude-code')).toBe('claude-code:opus-1m');
     });
