@@ -92,6 +92,13 @@ type NotifyUserArgs = {
   mobilePush?: "never" | "when_desktop_away" | "always";
 };
 
+type CompactSessionArgs = {
+  /** Optional target session. Defaults to the calling session (self-compaction). */
+  sessionId?: string;
+  /** Optional focus text, equivalent to typing "/compact focus on <focus>". */
+  focus?: string;
+};
+
 interface MetaAgentToolFns {
   listWorktrees: (
     metaSessionId: string,
@@ -134,6 +141,11 @@ interface MetaAgentToolFns {
     metaSessionId: string,
     workspaceId: string,
     args: NotifyUserArgs
+  ) => Promise<string>;
+  compactSession: (
+    metaSessionId: string,
+    workspaceId: string,
+    args: CompactSessionArgs
   ) => Promise<string>;
   respondToPrompt: (
     metaSessionId: string,
@@ -389,6 +401,24 @@ export const META_AGENT_TOOL_DEFS: Array<{
     },
   },
   {
+    name: "compact_session",
+    description:
+      "Reliably compact a session's conversation history to free context, optionally focused on what to keep. This invokes the compaction path directly (not via a queued chat message) and reports whether compaction actually ran, unlike sending a literal \"/compact\" prompt through send_prompt/send_prompt_now which is not guaranteed to be recognized as a command. Prefer this tool whenever an agent needs to self-compact or compact another session it owns.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: {
+          type: "string",
+          description: "Optional target session to compact. Defaults to the calling session (self-compaction).",
+        },
+        focus: {
+          type: "string",
+          description: "Optional focus text describing what task state to keep, equivalent to typing \"/compact focus on <focus>\".",
+        },
+      },
+    },
+  },
+  {
     name: "notify_user",
     description:
       "Show a local OS/system notification to get the human's attention. Use this for explicitly authorized asynchronous attention signals when chat may be missed. This is separate from voice mode; it respects the user's OS notification setting and returns JSON explaining whether the notification was shown or skipped.",
@@ -502,6 +532,7 @@ const EXTENSION_META_AGENT_ALLOWED_TOOLS = new Set<string>([
   "send_prompt",
   "send_prompt_now",
   "notify_user",
+  "compact_session",
   "respond_to_prompt",
   "list_spawned_sessions",
 ]);
@@ -599,6 +630,8 @@ export async function dispatchMetaAgentTool(
       );
     case "notify_user":
       return toolFns.notifyUser(aiSessionId, effectiveWorkspaceId, (args ?? {}) as NotifyUserArgs);
+    case "compact_session":
+      return toolFns.compactSession(aiSessionId, effectiveWorkspaceId, (args ?? {}) as CompactSessionArgs);
     case "respond_to_prompt":
       return toolFns.respondToPrompt(aiSessionId, effectiveWorkspaceId, (args ?? {}) as RespondToPromptArgs);
     case "list_spawned_sessions":

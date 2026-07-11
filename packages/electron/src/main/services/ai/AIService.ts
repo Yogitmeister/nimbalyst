@@ -906,6 +906,48 @@ export class AIService {
     );
   }
 
+  /**
+   * Send a message to a session and await the turn's full response content,
+   * bypassing the queued-prompt chain entirely (no queue row, no fire-and-
+   * forget dispatch). Callers that need the response synchronously -- e.g.
+   * the compact_session MCP tool checking whether compaction actually ran --
+   * get a direct answer instead of the queue-status JSON that
+   * sendPromptToSession returns. Reuses the same mocked-IPC-event technique
+   * as the queued-prompt dispatcher (dispatchClaimedQueuedPrompt) so this
+   * calls the identical sendMessageHandler (= streamingHandler.handle) that
+   * both normal chat input and queued prompts already use.
+   */
+  public async sendMessageDirect(
+    sessionId: string,
+    workspacePath: string,
+    message: string,
+    documentContext?: DocumentContext,
+  ): Promise<{ content: string; contextCompacted?: boolean }> {
+    if (!this.sendMessageHandler) {
+      throw new Error('AI service not initialized');
+    }
+    // Reuse the same per-session in-flight guard the queued-prompt chain uses
+    // (tryDispatchNextQueuedPrompt's processingSet) so a direct send can't
+    // interleave PTY/SDK writes with a turn already running for this session.
+    if (this.sessionsProcessingQueue.has(sessionId)) {
+      throw new Error(`Session ${sessionId} is already processing a turn`);
+    }
+    const targetWindow = findWindowByWorkspace(workspacePath);
+    if (!targetWindow || targetWindow.isDestroyed()) {
+      throw new Error(`No open window for workspace ${workspacePath}`);
+    }
+    const mockEvent = {
+      sender: targetWindow.webContents,
+      senderFrame: targetWindow.webContents.mainFrame,
+    } as Electron.IpcMainInvokeEvent;
+    this.sessionsProcessingQueue.add(sessionId);
+    try {
+      return await this.sendMessageHandler(mockEvent, message, documentContext, sessionId, workspacePath);
+    } finally {
+      this.sessionsProcessingQueue.delete(sessionId);
+    }
+  }
+
   private async initializeMobileSyncHandler() {
     // Listen for index changes from mobile sync and insert queuedPrompts into the database.
     // The renderer's processQueuedPrompts function handles execution from the database queue.

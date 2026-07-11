@@ -116,7 +116,7 @@ export type SendMessageHandler = (
   documentContext?: DocumentContext,
   sessionId?: string,
   workspacePath?: string,
-) => Promise<{ content: string }>;
+) => Promise<{ content: string; contextCompacted?: boolean }>;
 
 /**
  * Structural view of the AIService members this handler needs. Keeping it
@@ -1197,6 +1197,7 @@ export class MessageStreamingHandler {
 
     try {
       let fullResponse = '';
+      let turnContextCompacted = false;  // Structured signal for sendMessageDirect callers (e.g. compact_session) -- set from the SDK's own contextCompacted flag, never inferred from response text.
       let lastTextSection = '';  // Track text after the last tool call (for notifications)
       let prevTextSection = '';  // Previous non-empty text section (fallback if last section is empty)
       const toolCalls: any[] = [];
@@ -1252,6 +1253,16 @@ export class MessageStreamingHandler {
           maxTokens: (session.providerConfig as any)?.maxTokens,
           temperature: (session.providerConfig as any)?.temperature,
           ...(turnEffortLevel && { effortLevel: turnEffortLevel }),
+          // Carry the same per-turn OpenCode agent / Claude Code backend
+          // overrides the provider-creation path applies (see above), so a
+          // mid-session agent/backend change also takes effect on the next
+          // turn of an already-running provider, not just on (re)creation.
+          ...(session.provider === 'opencode' && (session.metadata as any)?.opencodeAgent && {
+            agent: (session.metadata as any).opencodeAgent,
+          }),
+          ...(isProviderClaudeCode && freshClaudeBackend && {
+            customBackend: freshClaudeBackend,
+          }),
         };
         const fullTurnModel = session.model || session.providerConfig?.model;
         if (fullTurnModel) {
@@ -2211,6 +2222,9 @@ export class MessageStreamingHandler {
             const contextWindowFromChunk: number | undefined = chunk.contextWindow;
             // Whether context was compacted this turn (clear stale currentContext)
             const contextCompacted: boolean = chunk.contextCompacted === true;
+            if (contextCompacted) {
+              turnContextCompacted = true;
+            }
 
             // if (tokenUsage) {
             // }
@@ -2734,7 +2748,7 @@ export class MessageStreamingHandler {
         // logger.main.info(`[AIService] Cleared prompt tracking for ${queuedPromptId}`);
       }
 
-      return { content: fullResponse };
+      return { content: fullResponse, contextCompacted: turnContextCompacted };
     } catch (error) {
       const errorTime = Date.now() - startTime;
       const isClaudeCode = session?.provider === 'claude-code';
