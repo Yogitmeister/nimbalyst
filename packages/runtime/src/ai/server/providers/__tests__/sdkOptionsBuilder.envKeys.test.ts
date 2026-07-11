@@ -197,6 +197,49 @@ describe('buildSdkOptions env-key hardening', () => {
     expect(options.env.DISABLE_AUTOUPDATER).toBe('0');
   });
 
+  describe('custom Claude Code backend auth guard (Yogi)', () => {
+    let originalOpenRouter: string | undefined;
+
+    beforeEach(() => {
+      originalOpenRouter = process.env.OPENROUTER_API_KEY;
+    });
+
+    afterEach(() => {
+      if (originalOpenRouter === undefined) {
+        delete process.env.OPENROUTER_API_KEY;
+      } else {
+        process.env.OPENROUTER_API_KEY = originalOpenRouter;
+      }
+    });
+
+    it('skips a selected backend whose auth env var is absent, keeping default auth', async () => {
+      delete process.env.OPENROUTER_API_KEY;
+
+      const { options } = await buildSdkOptions(
+        makeDeps({ config: { customBackend: 'a54' } }),
+        makeParams()
+      );
+
+      // Backend must not be applied: no rerouted base URL and no empty-auth env.
+      expect(options.env.ANTHROPIC_BASE_URL).toBeUndefined();
+      expect(options.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+      expect(options.env.CLAUDE_CODE_SUBAGENT_MODEL).toBeUndefined();
+    });
+
+    it('applies a selected backend when its auth env var is present', async () => {
+      process.env.OPENROUTER_API_KEY = 'sk-or-test-token';
+
+      const { options } = await buildSdkOptions(
+        makeDeps({ config: { customBackend: 'a54' } }),
+        makeParams()
+      );
+
+      expect(options.env.ANTHROPIC_BASE_URL).toBe('https://openrouter.ai/api');
+      expect(options.env.ANTHROPIC_AUTH_TOKEN).toBe('sk-or-test-token');
+      expect(options.env.ANTHROPIC_API_KEY).toBeUndefined();
+    });
+  });
+
   it('lets a user-configured ENABLE_TOOL_SEARCH override the default', async () => {
     // NIM-1475: the hardcoded default used to be spread after settingsEnv,
     // silently clobbering the ENABLE_TOOL_SEARCH=false remediation our own
