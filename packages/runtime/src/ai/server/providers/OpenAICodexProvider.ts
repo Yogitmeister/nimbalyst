@@ -102,6 +102,9 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     { id: 'gpt-5.5', name: 'GPT-5.5', contextWindow: 400000, maxTokens: 128000 },
     { id: 'gpt-5.4', name: 'GPT-5.4', contextWindow: 400000, maxTokens: 128000 },
     { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', contextWindow: 400000, maxTokens: 128000 },
+    // Subscription-only tier; catalog ctx is a hard 128K cap, not the uniform
+    // 400000 placeholder used above.
+    { id: 'gpt-5.3-codex-spark', name: 'GPT-5.3 Codex Spark', contextWindow: 128000, maxTokens: 128000 },
   ];
   private static readonly MODEL_FALLBACK_PRIORITY: ReadonlyArray<string> = [
     'gpt-5.6-sol',
@@ -110,6 +113,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     'gpt-5.5',
     'gpt-5.4',
     'gpt-5.4-mini',
+    'gpt-5.3-codex-spark',
   ];
   private static readonly FALLBACK_MODELS_SET = new Set(
     OpenAICodexProvider.FALLBACK_MODELS.map((model) => model.id)

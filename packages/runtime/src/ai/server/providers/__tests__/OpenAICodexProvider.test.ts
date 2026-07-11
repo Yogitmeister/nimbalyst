@@ -113,6 +113,11 @@ describe('OpenAICodexProvider', () => {
         id: 'openai-codex:gpt-5.4-mini',
         provider: 'openai-codex',
       }),
+      expect.objectContaining({
+        id: 'openai-codex:gpt-5.3-codex-spark',
+        provider: 'openai-codex',
+        contextWindow: 128000,
+      }),
     ]));
   });
 
@@ -124,6 +129,7 @@ describe('OpenAICodexProvider', () => {
       'gpt-5.5',
       'gpt-5.4',
       'gpt-5.4-mini',
+      'gpt-5.3-codex-spark',
     ];
     const codexModels = await OpenAICodexProvider.getModels(undefined, {
       loadSdkModule: async () => {
@@ -213,7 +219,7 @@ describe('OpenAICodexProvider', () => {
         provider: 'openai-codex',
       }),
     ]));
-    expect(models).toHaveLength(6);
+    expect(models).toHaveLength(7);
   });
 
   it('preserves CLI auth when initialized without an API key', async () => {
