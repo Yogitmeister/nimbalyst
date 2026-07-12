@@ -14,6 +14,13 @@ export interface ClaudeCodeBackend {
   authTokenEnv: string;
   upstreamModel: string;
   capabilities?: string;
+  /**
+   * The backend's own documented effort vocabulary, ascending. Absent means
+   * the full Claude ladder is accepted. Wire note: the CLI emits
+   * `output_config.effort` unconditionally; this list governs what selections
+   * we let users/agents make, not what the transport can carry.
+   */
+  effortValues?: readonly string[];
 }
 
 export const CLAUDE_CODE_BACKENDS: readonly ClaudeCodeBackend[] = [
@@ -24,6 +31,9 @@ export const CLAUDE_CODE_BACKENDS: readonly ClaudeCodeBackend[] = [
     authTokenEnv: 'DEEPSEEK_API_KEY',
     upstreamModel: 'deepseek-v4-pro',
     capabilities: 'effort,max_effort,thinking',
+    // DeepSeek's documented effort axis while thinking is enabled (their
+    // Anthropic-format guide): high | max only.
+    effortValues: ['high', 'max'],
   },
   {
     id: 'deepseek-v4-flash',
@@ -32,6 +42,7 @@ export const CLAUDE_CODE_BACKENDS: readonly ClaudeCodeBackend[] = [
     authTokenEnv: 'DEEPSEEK_API_KEY',
     upstreamModel: 'deepseek-v4-flash',
     capabilities: 'effort,max_effort,thinking',
+    effortValues: ['high', 'max'],
   },
   {
     id: 'kimi-k2.6',
