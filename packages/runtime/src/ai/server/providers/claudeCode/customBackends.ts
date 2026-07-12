@@ -18,20 +18,20 @@ export interface ClaudeCodeBackend {
 
 export const CLAUDE_CODE_BACKENDS: readonly ClaudeCodeBackend[] = [
   {
-    id: 'deepseek-reasoner',
-    name: 'DeepSeek V4 Reasoner',
+    id: 'deepseek-v4-pro',
+    name: 'DeepSeek V4 Pro',
     baseUrl: 'https://api.deepseek.com/anthropic',
     authTokenEnv: 'DEEPSEEK_API_KEY',
-    upstreamModel: 'deepseek-reasoner',
+    upstreamModel: 'deepseek-v4-pro',
     capabilities: 'effort,max_effort,thinking',
   },
   {
-    id: 'deepseek-chat',
-    name: 'DeepSeek V4 Fast',
+    id: 'deepseek-v4-flash',
+    name: 'DeepSeek V4 Flash',
     baseUrl: 'https://api.deepseek.com/anthropic',
     authTokenEnv: 'DEEPSEEK_API_KEY',
-    upstreamModel: 'deepseek-chat',
-    capabilities: 'effort',
+    upstreamModel: 'deepseek-v4-flash',
+    capabilities: 'effort,max_effort,thinking',
   },
   {
     id: 'kimi-k2.6',
@@ -91,9 +91,21 @@ export const CLAUDE_CODE_BACKENDS: readonly ClaudeCodeBackend[] = [
   },
 ] as const;
 
+/**
+ * DeepSeek discontinued `deepseek-chat`/`deepseek-reasoner` on 2026-07-24;
+ * both were aliases of V4 Flash's non-thinking/thinking modes, so sessions
+ * that persisted a legacy id keep working on the equivalent (and equally
+ * priced) V4 Flash entry rather than being silently upgraded to Pro.
+ */
+const LEGACY_BACKEND_ALIASES: Record<string, string> = {
+  'deepseek-reasoner': 'deepseek-v4-flash',
+  'deepseek-chat': 'deepseek-v4-flash',
+};
+
 export function resolveClaudeCodeBackend(backendId: string | undefined | null): ClaudeCodeBackend | undefined {
   if (!backendId) return undefined;
-  return CLAUDE_CODE_BACKENDS.find((backend) => backend.id === backendId);
+  const id = LEGACY_BACKEND_ALIASES[backendId] ?? backendId;
+  return CLAUDE_CODE_BACKENDS.find((backend) => backend.id === id);
 }
 
 export function applyClaudeCodeBackendEnv(env: Record<string, any>, backend: ClaudeCodeBackend): void {

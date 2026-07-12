@@ -2628,8 +2628,8 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         claudeBackend={rawClaudeBackend}
         onClaudeBackendChange={handleClaudeBackendChange}
         availableClaudeBackends={[
-          { id: 'deepseek-reasoner', name: 'DeepSeek V4 Reasoner' },
-          { id: 'deepseek-chat', name: 'DeepSeek V4 Fast' },
+          { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
+          { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
           { id: 'kimi-k2.6', name: 'Kimi K2.6' },
           { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code' },
           { id: 'qwen3-max-thinking', name: 'Qwen3 Max Thinking' },
