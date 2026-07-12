@@ -11,7 +11,7 @@ import path from 'path';
 import { app } from 'electron';
 import { ClaudeCodeDeps } from './dependencyInjection';
 import { resolveClaudeAgentCliPath } from './cliPathResolver';
-import { DEFAULT_EFFORT_LEVEL } from '../../effortLevels';
+import { DEFAULT_EFFORT_LEVEL, clampEffortForModel, parseEffortLevel } from '../../effortLevels';
 
 type SessionMode = 'planning' | 'agent' | 'auto' | undefined;
 
@@ -344,7 +344,10 @@ export async function buildSdkOptions(
     // override via their own env var if they want the original sdk-ts label.
     ...(process.env.CLAUDE_CODE_ENTRYPOINT == null && { CLAUDE_CODE_ENTRYPOINT: 'cli' }),
     ...(config.effortLevel && config.effortLevel !== DEFAULT_EFFORT_LEVEL && {
-      CLAUDE_CODE_EFFORT_LEVEL: config.effortLevel
+      // 'ultra' is a Codex-only tier (see effortLevels.ts); clamp through the
+      // shared per-model ceiling so the Claude CLI never receives a level its
+      // /model slider doesn't recognize.
+      CLAUDE_CODE_EFFORT_LEVEL: clampEffortForModel(config.model, parseEffortLevel(config.effortLevel))
     }),
     // The bundled claude binary runs a per-tool idle-timeout watchdog (default
     // 300s) over MCP servers whose transport is http/sse/ws. ALL Nimbalyst

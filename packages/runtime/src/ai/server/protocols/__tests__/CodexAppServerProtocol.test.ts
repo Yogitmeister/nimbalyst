@@ -647,6 +647,79 @@ describe('CodexAppServerProtocol', () => {
     protocol.cleanupSession(session);
   });
 
+  it('does not downgrade max to xhigh for gpt-5.6-sol, which genuinely supports max', async () => {
+    // Regression: the old `effortLevel === 'max' ? 'xhigh' : effortLevel`
+    // logic blanket-downgraded every model's 'max' request to 'xhigh', even
+    // though gpt-5.6-sol/terra genuinely support max (and the Codex-only
+    // 'ultra' "Pro" tier above it). This silently capped 5.6 models below
+    // what the user selected.
+    const protocol = new CodexAppServerProtocol();
+    const sessionPromise = protocol.createSession({
+      workspacePath: '/tmp/ws',
+      model: 'gpt-5.6-sol',
+      raw: { effortLevel: 'max' },
+    });
+    const initReq = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: initReq.id, result: { codexHome: '/fake', platformFamily: 'unix', platformOs: 'macos', userAgent: 'fake/0' } });
+    const startReq = await nextWrittenMatching(child, 'thread/start');
+    const params = startReq.params as { config: { model_reasoning_effort?: string } };
+    expect(params.config.model_reasoning_effort).toBe('max');
+    child.emitLine({ id: startReq.id, result: { thread: { id: 't-max' } } });
+    const session = await sessionPromise;
+    protocol.cleanupSession(session);
+  });
+
+  it('dispatches the new Codex-only ultra/Pro tier for gpt-5.6-terra', async () => {
+    const protocol = new CodexAppServerProtocol();
+    const sessionPromise = protocol.createSession({
+      workspacePath: '/tmp/ws',
+      model: 'gpt-5.6-terra',
+      raw: { effortLevel: 'ultra' },
+    });
+    const initReq = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: initReq.id, result: { codexHome: '/fake', platformFamily: 'unix', platformOs: 'macos', userAgent: 'fake/0' } });
+    const startReq = await nextWrittenMatching(child, 'thread/start');
+    const params = startReq.params as { config: { model_reasoning_effort?: string } };
+    expect(params.config.model_reasoning_effort).toBe('ultra');
+    child.emitLine({ id: startReq.id, result: { thread: { id: 't-ultra' } } });
+    const session = await sessionPromise;
+    protocol.cleanupSession(session);
+  });
+
+  it('clamps effort to the model ceiling for pre-5.6 Codex models (max -> xhigh)', async () => {
+    const protocol = new CodexAppServerProtocol();
+    const sessionPromise = protocol.createSession({
+      workspacePath: '/tmp/ws',
+      model: 'gpt-5.4',
+      raw: { effortLevel: 'max' },
+    });
+    const initReq = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: initReq.id, result: { codexHome: '/fake', platformFamily: 'unix', platformOs: 'macos', userAgent: 'fake/0' } });
+    const startReq = await nextWrittenMatching(child, 'thread/start');
+    const params = startReq.params as { config: { model_reasoning_effort?: string } };
+    expect(params.config.model_reasoning_effort).toBe('xhigh');
+    child.emitLine({ id: startReq.id, result: { thread: { id: 't-legacy' } } });
+    const session = await sessionPromise;
+    protocol.cleanupSession(session);
+  });
+
+  it('clamps the Codex-only ultra/Pro tier to max for gpt-5.6-luna', async () => {
+    const protocol = new CodexAppServerProtocol();
+    const sessionPromise = protocol.createSession({
+      workspacePath: '/tmp/ws',
+      model: 'gpt-5.6-luna',
+      raw: { effortLevel: 'ultra' },
+    });
+    const initReq = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: initReq.id, result: { codexHome: '/fake', platformFamily: 'unix', platformOs: 'macos', userAgent: 'fake/0' } });
+    const startReq = await nextWrittenMatching(child, 'thread/start');
+    const params = startReq.params as { config: { model_reasoning_effort?: string } };
+    expect(params.config.model_reasoning_effort).toBe('max');
+    child.emitLine({ id: startReq.id, result: { thread: { id: 't-luna' } } });
+    const session = await sessionPromise;
+    protocol.cleanupSession(session);
+  });
+
   it('routes file-change approval RPCs through the host binding', async () => {
     const approveFileChange = vi.fn().mockResolvedValue({ decision: 'denied' });
     const protocol = new CodexAppServerProtocol({ host: { approveFileChange } });

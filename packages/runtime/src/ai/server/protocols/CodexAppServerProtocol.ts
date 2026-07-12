@@ -29,6 +29,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import path from 'node:path';
 import { buildDocumentAttachmentPromptText } from '../providers/codex/documentAttachmentPrompt';
+import { clampEffortForModel, parseEffortLevel } from '../effortLevels';
 import { describeCodexConfigError } from './codexConfigError';
 import { reverseCodexPatch, type CodexPatchKind } from '../providers/codex/patchReverse';
 import {
@@ -488,7 +489,10 @@ export class CodexAppServerProtocol implements AgentProtocol {
       options.permissionMode === 'bypass-all' ? 'danger-full-access' : 'workspace-write';
 
     const effortLevel = options.raw?.effortLevel as string | undefined;
-    const reasoningEffortRaw = effortLevel === 'max' ? 'xhigh' : (effortLevel ?? 'high');
+    // Clamp to the selected model's own ceiling instead of a blanket
+    // max->xhigh downgrade: gpt-5.6-sol/terra genuinely support max/ultra,
+    // while pre-5.6 Codex models reject anything above xhigh.
+    const reasoningEffortRaw = clampEffortForModel(options.model, parseEffortLevel(effortLevel ?? 'high'));
 
     const systemPrompt = (options.raw?.systemPrompt as string | undefined) ?? options.systemPrompt;
     const additionalDirectories = Array.isArray(options.raw?.additionalDirectories)

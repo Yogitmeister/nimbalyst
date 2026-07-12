@@ -286,4 +286,115 @@ describe('CodexSDKProtocol', () => {
       await fs.unlink(tmpFile).catch(() => {});
     }
   });
+
+  describe('effort-level dispatch (#B3 parent review point 2)', () => {
+    // The renderer's effort picker is model-based, not transport-aware, so
+    // this legacy transport must never silently mis-encode or downgrade a
+    // level the app-server transport would accept. The installed
+    // @openai/codex-sdk's own .d.ts declares ModelReasoningEffort as
+    // 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' with no 'max'/'ultra'
+    // member, but that type is stale: dist/index.js forwards
+    // options.modelReasoningEffort verbatim as
+    // `--config model_reasoning_effort="<value>"` with no enum validation
+    // (verified by reading node_modules/@openai/codex-sdk/dist/index.js
+    // directly, not just the .d.ts), and Nimbalyst's own CodexSdkModuleLike
+    // types startThread/resumeThread options as Record<string, unknown>.
+    // The transport therefore genuinely supports max/ultra on 5.6
+    // Sol/Terra/Luna, matching the app-server transport exactly.
+
+    function makeProtocolWithRecordingStartThread() {
+      const startThread = vi.fn((_options?: Record<string, unknown>) => ({
+        id: 'thread-effort',
+        runStreamed: vi.fn(),
+      }));
+      const resumeThread = vi.fn((_id: string, _options?: Record<string, unknown>) => ({
+        id: 'thread-effort',
+        runStreamed: vi.fn(),
+      }));
+      const protocol = new CodexSDKProtocol(
+        'test-key',
+        async () =>
+          ({
+            Codex: class {
+              startThread = startThread;
+              resumeThread = resumeThread;
+            },
+          }) as any
+      );
+      return { protocol, startThread, resumeThread };
+    }
+
+    it('does not downgrade max to xhigh for gpt-5.6-sol, which genuinely supports max', async () => {
+      const { protocol, startThread } = makeProtocolWithRecordingStartThread();
+      await protocol.createSession({
+        workspacePath: '/tmp/ws',
+        model: 'gpt-5.6-sol',
+        raw: { effortLevel: 'max' },
+      } as any);
+      const passedOptions = startThread.mock.calls[0]![0] as Record<string, unknown>;
+      expect(passedOptions.modelReasoningEffort).toBe('max');
+    });
+
+    it('dispatches the Codex-only ultra/Pro tier unchanged for gpt-5.6-terra', async () => {
+      const { protocol, startThread } = makeProtocolWithRecordingStartThread();
+      await protocol.createSession({
+        workspacePath: '/tmp/ws',
+        model: 'gpt-5.6-terra',
+        raw: { effortLevel: 'ultra' },
+      } as any);
+      const passedOptions = startThread.mock.calls[0]![0] as Record<string, unknown>;
+      expect(passedOptions.modelReasoningEffort).toBe('ultra');
+    });
+
+    it('clamps the Codex-only ultra/Pro tier to max for gpt-5.6-luna', async () => {
+      const { protocol, startThread } = makeProtocolWithRecordingStartThread();
+      await protocol.createSession({
+        workspacePath: '/tmp/ws',
+        model: 'gpt-5.6-luna',
+        raw: { effortLevel: 'ultra' },
+      } as any);
+      const passedOptions = startThread.mock.calls[0]![0] as Record<string, unknown>;
+      expect(passedOptions.modelReasoningEffort).toBe('max');
+    });
+
+    it('clamps max and ultra to xhigh for pre-5.6 Codex models', async () => {
+      const max = makeProtocolWithRecordingStartThread();
+      await max.protocol.createSession({
+        workspacePath: '/tmp/ws',
+        model: 'gpt-5.4',
+        raw: { effortLevel: 'max' },
+      } as any);
+      expect((max.startThread.mock.calls[0]![0] as Record<string, unknown>).modelReasoningEffort).toBe('xhigh');
+
+      const ultra = makeProtocolWithRecordingStartThread();
+      await ultra.protocol.createSession({
+        workspacePath: '/tmp/ws',
+        model: 'gpt-5.4',
+        raw: { effortLevel: 'ultra' },
+      } as any);
+      expect((ultra.startThread.mock.calls[0]![0] as Record<string, unknown>).modelReasoningEffort).toBe('xhigh');
+    });
+
+    it('passes through a level within the ceiling unchanged (never upgrades)', async () => {
+      const { protocol, startThread } = makeProtocolWithRecordingStartThread();
+      await protocol.createSession({
+        workspacePath: '/tmp/ws',
+        model: 'gpt-5.6-sol',
+        raw: { effortLevel: 'high' },
+      } as any);
+      const passedOptions = startThread.mock.calls[0]![0] as Record<string, unknown>;
+      expect(passedOptions.modelReasoningEffort).toBe('high');
+    });
+
+    it('applies the same clamp on thread resume', async () => {
+      const { protocol, resumeThread } = makeProtocolWithRecordingStartThread();
+      await protocol.resumeSession('existing-thread', {
+        workspacePath: '/tmp/ws',
+        model: 'gpt-5.6-sol',
+        raw: { effortLevel: 'ultra' },
+      } as any);
+      const passedOptions = resumeThread.mock.calls[0]![1] as Record<string, unknown>;
+      expect(passedOptions.modelReasoningEffort).toBe('ultra');
+    });
+  });
 });

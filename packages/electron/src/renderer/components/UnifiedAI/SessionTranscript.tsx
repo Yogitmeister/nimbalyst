@@ -104,7 +104,14 @@ import {
 import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom } from '../../store/atoms/agentMode';
 import { usePostHog } from 'posthog-js/react';
 import { setAgentModeSettingsAtom, showPromptAdditionsAtom, hasExternalEditorAtom, externalEditorNameAtom, openInExternalEditorAtom, defaultAgentModelAtom, defaultEffortLevelAtom, chatShowToolCallsAtom } from '../../store/atoms/appSettings';
-import { supportsEffortLevel, parseEffortLevel, type EffortLevel } from '../../utils/modelUtils';
+import {
+  supportsEffortLevel,
+  parseEffortLevel,
+  supportedEffortLevelsForModel,
+  effectiveEffortLevel,
+  buildModelChangeMetadataUpdate,
+  type EffortLevel,
+} from '../../utils/modelUtils';
 import { buildPlanImplementationPrompt, resolvePlanFilePath } from '../../utils/pathUtils';
 import { resolveTranscriptClickPath } from '../../utils/resolveTranscriptClickPath';
 import { autoCommitEnabledAtom, setAutoCommitEnabledAtom } from '../../store/atoms/autoCommitAtoms';
@@ -528,9 +535,18 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
 
   // Effort level: read from session metadata, fall back to global default
   const showEffortLevel = useMemo(() => supportsEffortLevel(currentModel), [currentModel]);
-  const effortLevel = useMemo(() => {
-    return rawEffortLevel != null ? parseEffortLevel(rawEffortLevel) : defaultEffortLevel;
-  }, [rawEffortLevel, defaultEffortLevel]);
+  // Clamped for the current model so the toolbar never claims a stronger
+  // level than what dispatch will actually send -- covers both a stale
+  // per-session value surviving a model downgrade and a persisted app-wide
+  // default viewed on a model that doesn't support it (#B3 parent review).
+  const effortLevel = useMemo(
+    () => effectiveEffortLevel(currentModel, rawEffortLevel, defaultEffortLevel),
+    [currentModel, rawEffortLevel, defaultEffortLevel]
+  );
+  const supportedEffortLevels = useMemo(
+    () => supportedEffortLevelsForModel(currentModel),
+    [currentModel]
+  );
 
   // Memoize the teammate list passed to AgentTranscriptPanel so its memo
   // comparison doesn't see a new array reference on every keystroke. Without
@@ -1529,13 +1545,45 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       if (isClaudeCliTerminalSession(provider) && cliSessionCommitted) {
         await window.electronAPI.terminal.setClaudeCliModel(sessionId, modelId);
       }
-      await window.electronAPI.invoke('sessions:update-metadata', sessionId, { model: modelId });
+      // An explicit per-session effort level (e.g. Pro, picked on Sol/Terra)
+      // can outlive the model it was set for. If the new model's ceiling is
+      // lower, fold the clamped effort into this SAME sessions:update-metadata
+      // call rather than a separate follow-up write (#B3 parent review:
+      // model/effort persistence atomicity). A split model-then-effort
+      // sequence can leave the database on the new model with stale `ultra`
+      // if the second call fails or races -- updateSessionMetadataField
+      // swallows persistence errors, so that failure would be silent.
+      // Sessions with no explicit override (following the app-wide default)
+      // get a bare `{ model }` update: `effectiveEffortLevel` already makes
+      // their *displayed* effort correct for every render, and pinning a
+      // per-session value here would silently detach them from future
+      // default changes.
+      const metadataUpdate = buildModelChangeMetadataUpdate(modelId, rawEffortLevel);
+      await window.electronAPI.invoke('sessions:update-metadata', sessionId, metadataUpdate);
+
+      // Merge the corrected effort into the local store only after the IPC
+      // call above has actually persisted it, so the renderer never shows a
+      // "corrected" value that didn't make it to the database.
+      if (metadataUpdate.metadata) {
+        const currentSessionData = store.get(sessionStoreAtom(sessionId));
+        if (currentSessionData) {
+          updateSessionStore({
+            sessionId,
+            updates: {
+              metadata: {
+                ...(currentSessionData.metadata as Record<string, unknown> || {}),
+                ...metadataUpdate.metadata,
+              },
+            },
+          });
+        }
+      }
     } catch (error) {
       console.error('[SessionTranscript] Failed to update model:', error);
       setCurrentModel(previousModel);
       setAgentModeSettings({ defaultModel: previousModel });
     }
-  }, [currentModel, sessionId, setCurrentModel, setAgentModeSettings, provider, cliSessionCommitted]);
+  }, [currentModel, rawEffortLevel, sessionId, setCurrentModel, setAgentModeSettings, provider, cliSessionCommitted, updateSessionStore]);
 
   const handleEffortLevelChange = useCallback(async (level: EffortLevel) => {
     const previousLevel = effortLevel;
@@ -2597,6 +2645,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         effortLevel={effortLevel}
         onEffortLevelChange={handleEffortLevelChange}
         showEffortLevel={isClaudeCliTerminalSession(provider) && cliSessionCommitted ? false : showEffortLevel}
+        supportedEffortLevels={supportedEffortLevels}
         tokenUsage={tokenUsage}
         provider={provider}
         onQueue={handleQueue}

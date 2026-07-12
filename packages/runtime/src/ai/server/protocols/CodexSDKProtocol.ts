@@ -27,6 +27,7 @@
  */
 
 import { buildDocumentAttachmentPromptText } from '../providers/codex/documentAttachmentPrompt';
+import { clampEffortForModel, parseEffortLevel } from '../effortLevels';
 import { describeCodexConfigError } from './codexConfigError';
 import {
   AgentProtocol,
@@ -394,12 +395,20 @@ export class CodexSDKProtocol implements AgentProtocol {
       ? 'danger-full-access'
       : 'workspace-write';
 
-    // Map effort level to Codex SDK ModelReasoningEffort.
-    // Codex SDK supports: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
-    // Our EffortLevel uses: 'low' | 'medium' | 'high' | 'max'
-    // Map 'max' → 'xhigh', rest map directly.
+    // Map effort level to Codex SDK ModelReasoningEffort. The installed
+    // @openai/codex-sdk's own .d.ts declares 'minimal' | 'low' | 'medium' |
+    // 'high' | 'xhigh' with no 'max'/'ultra' member, but that type is stale:
+    // dist/index.js forwards options.modelReasoningEffort verbatim as
+    // `--config model_reasoning_effort="<value>"` with no enum validation,
+    // and Nimbalyst's own CodexSdkModuleLike types startThread/resumeThread
+    // options as Record<string, unknown>. The same installed Codex
+    // CLI/catalog is the authority that verified max/ultra for 5.6
+    // Sol/Terra/Luna, so resolve through the shared per-model source of
+    // truth and pass the result straight through -- no transport-specific
+    // downgrade, which would recreate the exact auditability mismatch this
+    // effort work exists to fix.
     const effortLevel = options.raw?.effortLevel as string | undefined;
-    const reasoningEffort = effortLevel === 'max' ? 'xhigh' : (effortLevel || 'high');
+    const reasoningEffort = clampEffortForModel(options.model, parseEffortLevel(effortLevel ?? 'high'));
 
     const baseOptions = {
       model: options.model || 'gpt-5',

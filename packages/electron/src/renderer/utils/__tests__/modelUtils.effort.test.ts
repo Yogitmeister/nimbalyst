@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { supportsEffortLevel } from '../modelUtils';
+import { supportsEffortLevel, supportedEffortLevelsForModel } from '../modelUtils';
 
 describe('supportsEffortLevel', () => {
   it.each([
@@ -30,5 +30,25 @@ describe('supportsEffortLevel', () => {
     'claude:claude-fable-5',
   ])('does not expose effort for unsupported models: %s', (modelId) => {
     expect(supportsEffortLevel(modelId)).toBe(false);
+  });
+});
+
+describe('supportedEffortLevelsForModel (re-exported from runtime effortLevels)', () => {
+  it.each([
+    'openai-codex:gpt-5.6-sol',
+    'openai-codex:gpt-5.6-terra',
+    'openai-codex-acp:gpt-5.6-sol',
+  ])('exposes Pro (ultra) for GPT-5.6 Sol/Terra: %s', (modelId) => {
+    expect(supportedEffortLevelsForModel(modelId).map(l => l.key)).toContain('ultra');
+  });
+
+  it.each([
+    'openai-codex:gpt-5.6-luna',
+    'openai-codex:gpt-5.4',
+    'claude-code:opus',
+    'claude-code:fable',
+    undefined,
+  ])('does not expose Pro (ultra) for non-Sol/Terra models: %s', (modelId) => {
+    expect(supportedEffortLevelsForModel(modelId).map(l => l.key)).not.toContain('ultra');
   });
 });

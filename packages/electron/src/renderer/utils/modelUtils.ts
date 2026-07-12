@@ -23,7 +23,16 @@ import {
 } from '@nimbalyst/runtime/ai/modelConstants';
 import { CLAUDE_CODE_VARIANTS, ModelIdentifier, isClaudeCodeFamily } from '@nimbalyst/runtime/ai/server/types';
 
-export { type EffortLevel, EFFORT_LEVELS, DEFAULT_EFFORT_LEVEL, parseEffortLevel } from '@nimbalyst/runtime/ai/server/effortLevels';
+export {
+  type EffortLevel,
+  EFFORT_LEVELS,
+  DEFAULT_EFFORT_LEVEL,
+  parseEffortLevel,
+  supportedEffortLevelsForModel,
+  effectiveEffortLevel,
+  effortLevelCorrectionForModelChange,
+  buildModelChangeMetadataUpdate,
+} from '@nimbalyst/runtime/ai/server/effortLevels';
 
 interface ModelInfo {
   providerId: string;
