@@ -294,6 +294,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   private recoveryTurnSequence = 0;
   private recoverySessionId: string | undefined;
   private destroying = false;
+  private explicitUserStopRequested = false;
 
   // Terminal task_notification chunks received while draining background tasks
   // after the lead turn ended. Consumed by finalizeBackgroundDrain to wake the
@@ -573,6 +574,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     attachments?: any[]
   ): AsyncIterableIterator<StreamChunk> {
     const startTime = Date.now();
+    this.explicitUserStopRequested = false;
     const recoveryTurnId = `${this.recoveryInstanceId}:turn-${++this.recoveryTurnSequence}`;
     const plannedRecoveryGenerations: string[] = [];
     if (sessionId) this.recoverySessionId = sessionId;
@@ -2071,20 +2073,34 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     }
   }
 
-  abort(): void {
-    console.log('[CLAUDE-CODE] Abort called, abortController:', this.abortController ? 'exists' : 'NULL');
-    if (!this.destroying && this.recoverySessionId) {
-      const recoverySessionId = this.recoverySessionId;
-      for (const task of this.activeTasks.values()) {
-        if (task.status === 'running') task.status = 'stopped';
-      }
-      this.emitTaskUpdate(recoverySessionId).catch(() => {});
-      this.backgroundAgentRecovery.suppressRunning(recoverySessionId, 'user-cancelled')
-        .then(() => this.emit('message:logged', { sessionId: recoverySessionId, direction: 'output' }))
-        .catch((error) => {
-          console.error('[CLAUDE-CODE] Failed to suppress background-agent recovery after user cancellation:', error);
-        });
+  private async persistExplicitUserStopBoundary(): Promise<void> {
+    if (this.destroying) return;
+    this.explicitUserStopRequested = true;
+
+    for (const task of this.activeTasks.values()) {
+      if (task.status === 'running') task.status = 'stopped';
     }
+
+    const recoverySessionId = this.recoverySessionId;
+    if (!recoverySessionId) return;
+
+    // Persist the provider's complete stopped task view first, then let the
+    // coordinator make the recovery ledger and currentTasks disposition the
+    // final authoritative write. Keeping suppression last prevents a later
+    // task snapshot from erasing the durable user-cancelled evidence.
+    await this.emitTaskUpdate(recoverySessionId);
+    await this.backgroundAgentRecovery.suppressRunning(
+      recoverySessionId,
+      'user-cancelled'
+    );
+    this.emit('message:logged', {
+      sessionId: recoverySessionId,
+      direction: 'output',
+    });
+  }
+
+  private abortProviderRuntime(): void {
+    console.log('[CLAUDE-CODE] Abort called, abortController:', this.abortController ? 'exists' : 'NULL');
     this.streamClosedRetryCount = 0;
     this.resetStreamClosedTurnState();
 
@@ -2122,6 +2138,16 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     this.stopMcpHealthChecks();
     this.mcpQuery = null;
     this.currentSessionId = undefined;
+  }
+
+  abort(): void {
+    // AIProvider.abort() is synchronous, so keep its historical best-effort
+    // persistence behavior. Explicit renderer stops go through
+    // interruptCurrentTurn(), which awaits this same boundary before returning.
+    void this.persistExplicitUserStopBoundary().catch((error) => {
+      console.error('[CLAUDE-CODE] Failed to suppress background-agent recovery after user cancellation:', error);
+    });
+    this.abortProviderRuntime();
   }
 
   /**
@@ -2333,27 +2359,35 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
    * and the AIService completion handler runs normally (including queue processing).
    * This is a graceful stop — unlike abort(), it doesn't kill the SDK subprocess.
    *
-   * If there is no active lead query, defer to the BaseAIProvider default
-   * (hard abort) so the caller still gets a sensible signal back.
+   * If there is no active lead query, persist the same user-stop boundary
+   * before applying the provider's hard-abort cleanup.
    */
   async interruptCurrentTurn(): Promise<{ method: 'interrupt' | 'abort' }> {
-    if (!this.leadQuery) {
+    const leadQuery = this.leadQuery;
+    if (leadQuery) {
+      // Mark the turn as explicitly interrupted immediately so a naturally
+      // closing stream cannot inject teammate follow-up while the durable stop
+      // boundary is being written.
+      this.wasInterrupted = true;
+    }
+
+    await this.persistExplicitUserStopBoundary();
+
+    if (!leadQuery) {
       console.log('[CLAUDE-CODE] interruptCurrentTurn: no active lead query, falling back to abort');
-      return super.interruptCurrentTurn();
+      this.abortProviderRuntime();
+      return { method: 'abort' };
     }
 
     console.log('[CLAUDE-CODE] interruptCurrentTurn: interrupting active lead query');
-    this.wasInterrupted = true;
 
-    // Resolve the interrupt promise so the Promise.race in the streaming loop
-    // settles immediately without waiting for the SDK subprocess.
     if (this.interruptResolve) {
       this.interruptResolve();
       this.interruptResolve = null;
     }
 
     try {
-      await this.leadQuery.interrupt();
+      await leadQuery.interrupt();
     } catch (err) {
       console.warn('[CLAUDE-CODE] interruptCurrentTurn: interrupt() failed (transport may be closed):', err);
     }
@@ -2857,6 +2891,10 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     recoveryTurnId: string,
     launch?: { runInBackground?: boolean; name?: string },
   ): Promise<void> {
+    // Once explicit stop intent is observed, do not let a late SDK chunk create
+    // fresh recoverable evidence behind the durable cancellation boundary.
+    if (this.explicitUserStopRequested) return;
+
     if (subtype === 'task_started') {
       this.activeTasks.set(chunk.task_id, {
         taskId: chunk.task_id,
