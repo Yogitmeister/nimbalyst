@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- Claude Fable sessions now use their real 1M context window in model catalogs and usage meters.
 - Running Claude background agents now resume from their surviving transcript after a provider restart.
 - Claude Agent worktree sessions no longer list project skills and commands twice.
 - Agent-created sessions can no longer attach to arbitrary worktrees and now inherit only the caller's verified checkout or create a fresh one.

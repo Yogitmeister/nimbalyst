@@ -13,21 +13,23 @@ import {
  * `ai:tokenUsageUpdated` mechanism the SDK path uses.
  */
 describe('contextWindowForCliModel', () => {
-  it('returns 200k for the standard variants', () => {
-    expect(contextWindowForCliModel('claude-code-cli:opus')).toBe(200_000);
-    expect(contextWindowForCliModel('claude-code-cli:sonnet')).toBe(200_000);
-    expect(contextWindowForCliModel(undefined)).toBe(200_000);
+  it('returns 1M for native-1M base variants in interactive CLI 2.1.202', () => {
+    expect(contextWindowForCliModel('claude-code-cli:fable')).toBe(1_000_000);
+    expect(contextWindowForCliModel('claude-code-cli:opus')).toBe(1_000_000);
+    expect(contextWindowForCliModel('claude-code-cli:sonnet')).toBe(1_000_000);
   });
   it('returns 1M for the -1m extended-context variants', () => {
     expect(contextWindowForCliModel('claude-code-cli:opus-1m')).toBe(1_000_000);
     expect(contextWindowForCliModel('claude-code-cli:sonnet-1M')).toBe(1_000_000);
   });
-  it('windows plain fable at 200k and fable-1m at 1M, matching the CLI’s [1m] gating', () => {
-    // Claude Code windows plain `fable` at 200k client-side (observed: auto-
-    // compact at ~177k on CLI 2.1.175) even though the API serves Fable at 1M.
-    // The 1M window requires the fable[1m] model value — our fable-1m variant.
-    expect(contextWindowForCliModel('claude-code-cli:fable')).toBe(200_000);
+  it('keeps base and explicit Fable at 1M while preserving the explicit row', () => {
+    expect(contextWindowForCliModel('claude-code-cli:fable')).toBe(1_000_000);
     expect(contextWindowForCliModel('claude-code-cli:fable-1m')).toBe(1_000_000);
+  });
+  it('keeps 200K variants and an unknown session fallback at 200K', () => {
+    expect(contextWindowForCliModel('claude-code-cli:sonnet-4-6')).toBe(200_000);
+    expect(contextWindowForCliModel('claude-code-cli:haiku')).toBe(200_000);
+    expect(contextWindowForCliModel(undefined)).toBe(200_000);
   });
 });
 
@@ -92,7 +94,7 @@ describe('logClaudeCliContextUsage', () => {
     expect(h.updateTokenUsage).toHaveBeenCalledTimes(1);
     const [sid, tokenUsage] = h.updateTokenUsage.mock.calls[0];
     expect(sid).toBe('s1');
-    expect(tokenUsage.currentContext).toEqual({ tokens: 3 + 83066 + 239, contextWindow: 200_000 });
+    expect(tokenUsage.currentContext).toEqual({ tokens: 3 + 83066 + 239, contextWindow: 1_000_000 });
     expect(tokenUsage.inputTokens).toBe(13); // cumulative 10 + 3 new input
     expect(tokenUsage.outputTokens).toBe(47); // cumulative 5 + 42 output
     expect(h.notifyTokenUsage).toHaveBeenCalledWith('s1', tokenUsage);

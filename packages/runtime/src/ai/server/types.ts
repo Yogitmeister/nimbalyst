@@ -8,8 +8,7 @@ import type { ToolResult } from './protocols/ProtocolInterface';
 import { ModelIdentifier } from './ModelIdentifier';
 import {
   CLAUDE_CODE_ACCEPTED_VARIANT_INPUTS,
-  CLAUDE_CODE_PINNED_SDK_MODELS,
-  normalizeClaudeCodeVariant,
+  getClaudeCodeModelCapability,
 } from '../modelConstants';
 import type { TranscriptViewMessage } from './transcript/TranscriptProjector';
 export type { ToolDefinition } from '../tools';
@@ -209,21 +208,18 @@ export function shouldBlockStartedSessionProviderSwitch(
 }
 
 /**
- * Claude Code uses simplified variant names (opus, sonnet, haiku) instead of full model IDs.
- * These are ONLY valid for the claude-code provider.
+ * The Claude Agent SDK and interactive CLI use a shared Nimbalyst variant
+ * namespace (opus, sonnet, haiku, and pinned generations) instead of exposing
+ * every full model ID in saved selections.
  *
  * `opus-4-7`, `opus-4-6`, and `sonnet-4-6` are pinned-version variants retained
  * after bumping the canonical `opus`/`sonnet` aliases (to 4.8 / 5), so users can
  * still choose previous generations. See CLAUDE_CODE_PINNED_SDK_MODELS in
  * modelConstants.ts.
  *
- * `fable` is the Fable 5 tier above Opus — the CLI accepts it as a first-class
- * alias (`--model fable`, `/model fable`). The CLI gates the 1M window behind
- * the `fable[1m]` form just like opus/sonnet (plain `fable` is windowed at
- * 200k client-side; verified on CLI 2.1.175), so `fable` IS in
- * CLAUDE_CODE_VARIANTS_WITH_1M and gets a `fable-1m` picker row. Note it
- * requires usage credits on subscription plans (the CLI surfaces that itself
- * when unavailable).
+ * `fable` is the Fable 5 tier above Opus. Agent SDK and interactive CLI model
+ * values and context windows are resolved independently by the capability map
+ * in modelConstants.ts; shared variant spelling must not imply shared gating.
  */
 export const CLAUDE_CODE_VARIANTS = ['fable', 'opus', 'opus-4-7', 'opus-4-6', 'sonnet', 'sonnet-4-6', 'haiku'] as const;
 
@@ -233,63 +229,47 @@ export const CLAUDE_CODE_VARIANTS = ['fable', 'opus', 'opus-4-7', 'opus-4-6', 's
  * Key behaviors:
  * - Canonical variants (opus, sonnet, haiku) are passed straight through — the
  *   SDK maps these to the current-generation model.
- * - Pinned variants (opus-4-6, ...) are substituted for their full Anthropic
- *   model ID from CLAUDE_CODE_PINNED_SDK_MODELS, so they always resolve to a
- *   specific version regardless of what "latest" becomes.
+ * - Pinned variants (opus-4-6, ...) use the Agent SDK route from the
+ *   path-aware capability map, so they remain independent of CLI routing.
  * - For -1m variants, appends `[1m]` so the SDK adds the 1M-context beta
  *   header; the SDK strips `[1m]` before sending the model ID to the API.
  */
 export function resolveClaudeCodeModelVariant(configuredModel: string | undefined, defaultModel: string): string {
-  type ClaudeCodeVariant = typeof CLAUDE_CODE_VARIANTS[number];
   const configured = configuredModel || defaultModel;
-  const knownSdkModels = new Set<string>([
-    ...(Object.values(CLAUDE_CODE_PINNED_SDK_MODELS).filter(Boolean) as string[]),
-    'claude-fable-5',
-    'claude-opus-4-8',
-    'claude-opus-4-7',
-    'claude-opus-4-6',
-    'claude-sonnet-5',
-    'claude-sonnet-4-6',
-  ]);
-
-  const toSdkBase = (variant: string): string => CLAUDE_CODE_PINNED_SDK_MODELS[variant as ClaudeCodeVariant] ?? variant;
 
   // Try parsing with ModelIdentifier
   const parsed = ModelIdentifier.tryParse(configured);
-  if (parsed && isClaudeCodeFamily(parsed.provider)) {
-    // baseVariant strips suffixes like -1m
-    const variant = parsed.baseVariant as ClaudeCodeVariant;
-    if ((CLAUDE_CODE_VARIANTS as readonly string[]).includes(variant)) {
-      const sdkBase = toSdkBase(variant);
-      // Append [1m] suffix for extended context so the SDK auto-detects the 1M beta
-      return parsed.isExtendedContext ? `${sdkBase}[1m]` : sdkBase;
-    }
-  }
-
-  // Fallback for non-standard formats
-  const raw = parsed ? parsed.model : configured;
-  const normalized = raw?.toLowerCase();
-  const hasBracketContext = normalized?.endsWith('[1m]');
-  const withoutBracketContext = normalized?.replace(/\[1m\]$/, '');
-  const hasDashContext = withoutBracketContext?.endsWith('-1m');
-  const isExtended = Boolean(hasBracketContext || hasDashContext);
-  const withoutContext = withoutBracketContext?.replace(/-1m$/, '');
-
-  const normalizedVariant = withoutContext ? normalizeClaudeCodeVariant(withoutContext) : null;
-  if (normalizedVariant) {
-    const sdkBase = toSdkBase(normalizedVariant);
-    return isExtended ? `${sdkBase}[1m]` : sdkBase;
-  }
-
-  if (withoutContext && knownSdkModels.has(withoutContext)) {
-    return isExtended ? `${withoutContext}[1m]` : withoutContext;
-  }
-
-  const supported = CLAUDE_CODE_ACCEPTED_VARIANT_INPUTS.join(', ');
   if (parsed && !isClaudeCodeFamily(parsed.provider)) {
     throw new Error(`Claude Agent requires a claude-code:* model identifier. Received: ${configured}`);
   }
+  if (parsed && isClaudeCodeFamily(parsed.provider)) {
+    const capability = getClaudeCodeModelCapability(
+      'agent-sdk',
+      parsed.baseVariant,
+      parsed.isExtendedContext,
+    );
+    if (capability) return capability.modelValue;
+  }
 
+  // Fallback for non-standard formats
+  const normalized = configured.trim().toLowerCase();
+  const hasBracketContext = normalized.endsWith('[1m]');
+  const withoutBracketContext = normalized.replace(/\[1m\]$/, '');
+  const hasDashContext = withoutBracketContext.endsWith('-1m');
+  const withoutContext = withoutBracketContext.replace(/-1m$/, '');
+  if (
+    withoutContext.startsWith('claude-')
+    && getClaudeCodeModelCapability('agent-sdk', normalized)
+  ) {
+    return hasBracketContext || hasDashContext
+      ? `${withoutContext}[1m]`
+      : withoutContext;
+  }
+
+  const capability = getClaudeCodeModelCapability('agent-sdk', configured);
+  if (capability) return capability.modelValue;
+
+  const supported = CLAUDE_CODE_ACCEPTED_VARIANT_INPUTS.join(', ');
   throw new Error(
     `Unsupported Claude Agent model "${configured}". Must be one of: ${supported} (optionally with -1m suffix)`
   );

@@ -39,6 +39,7 @@ import {
   CLAUDE_CODE_MODEL_LABELS,
   CLAUDE_CODE_VARIANTS_WITH_1M,
   DEFAULT_MODELS,
+  getClaudeCodeModelCapability,
 } from '../../modelConstants';
 import type { ProviderSessionData } from './ProviderSessionManager';
 
@@ -82,21 +83,25 @@ export class ClaudeCodeCliProvider extends BaseAgentProvider {
     const models: AIModel[] = [];
 
     for (const variant of CLAUDE_CODE_VARIANTS) {
+      const baseCapability = getClaudeCodeModelCapability('interactive-cli', variant, false);
+      if (!baseCapability) continue;
       models.push({
         id: ModelIdentifier.create('claude-code-cli', variant).combined,
         name: `Claude Code CLI · ${CLAUDE_CODE_MODEL_LABELS[variant]} ${CLAUDE_CODE_VARIANT_VERSIONS[variant]}`,
         provider: 'claude-code-cli' as const,
         maxTokens: 8192,
-        contextWindow: 200000,
+        contextWindow: baseCapability.contextWindow,
       });
 
       if ((CLAUDE_CODE_VARIANTS_WITH_1M as readonly string[]).includes(variant)) {
+        const extendedCapability = getClaudeCodeModelCapability('interactive-cli', variant, true);
+        if (!extendedCapability) continue;
         models.push({
           id: ModelIdentifier.create('claude-code-cli', `${variant}-1m`).combined,
           name: `Claude Code CLI · ${CLAUDE_CODE_MODEL_LABELS[variant]} ${CLAUDE_CODE_VARIANT_VERSIONS[variant]} (1M)`,
           provider: 'claude-code-cli' as const,
           maxTokens: 8192,
-          contextWindow: 1000000,
+          contextWindow: extendedCapability.contextWindow,
         });
       }
     }

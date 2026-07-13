@@ -727,10 +727,9 @@ export class AIService {
     if (fullModel) {
       config.model = fullModel;
     } else {
-      // Billing safety (#631 / NIM-848): a session with no resolved model must
-      // fall back to a STANDARD 200k model, never the 1M user-facing default
-      // (ModelRegistry.getDefaultModel('claude-code') is `opus-1m`). Sending the
-      // paid 1M beta for an empty/lost model silently bills the user.
+      // A session with no resolved model uses the unsuffixed safe fallback,
+      // never an invented explicit `[1m]` selection. Native-1M base models keep
+      // their real window; this is not a hidden 200K downgrade.
       config.model = CLAUDE_CODE_SAFE_FALLBACK_MODEL;
     }
 

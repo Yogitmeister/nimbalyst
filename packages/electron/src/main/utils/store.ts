@@ -213,8 +213,6 @@ interface AppStoreSchema {
   preferredTerminalShell?: PreferredTerminalShell;
   // Last known app version (for migrations)
   lastKnownVersion?: string;
-  // One-shot migration flag: plain fable default bumped to fable-1m (NIM-827)
-  fableDefaultMigratedTo1m?: boolean;
   // Gutter icon visibility/order preferences (GLOBAL). Moved off per-project
   // workspace state so the preference applies across all projects.
   hiddenGutterItems?: string[];
@@ -2519,23 +2517,6 @@ export function runMigrations(currentVersion: string): void {
   // Missing lastKnownVersion means user is upgrading from <= 0.52.10
   // (versions before we started tracking lastKnownVersion)
   const isUpgradingFromOldVersion = !lastKnownVersion;
-
-  // One-shot, version-independent migration (NIM-827): plain `fable` defaults
-  // become `fable-1m`. Claude Code windows plain `fable` at 200k and gates the
-  // 1M window behind `fable[1m]`; the original Fable picker row predated
-  // `fable-1m`, so users who picked it were silently on 200k and hit "Prompt
-  // is too long" as soon as a large skill loaded. Flag-guarded (not
-  // version-gated) so it also fires on dev builds where the version doesn't
-  // change; a user who later deliberately re-picks plain Fable stays on it.
-  if (!getAppStore().get('fableDefaultMigratedTo1m')) {
-    const currentDefault = getAppStore().get('defaultAIModel');
-    if (currentDefault === 'claude-code:fable' || currentDefault === 'claude-code-cli:fable') {
-      const migrated = `${currentDefault}-1m`;
-      logger.store.info(`[Migrations] Migrating default model from ${currentDefault} to ${migrated}`);
-      getAppStore().set('defaultAIModel', migrated);
-    }
-    getAppStore().set('fableDefaultMigratedTo1m', true);
-  }
 
   // One-shot, version-independent migration: gutter icon visibility moved from
   // per-project workspace state (hiddenGutterButtons) to a single global app

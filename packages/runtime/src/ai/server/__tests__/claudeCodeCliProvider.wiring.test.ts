@@ -47,7 +47,7 @@ describe('claude-code-cli provider wiring (Phase 0)', () => {
       expect(id.isExtendedContext).toBe(true);
     });
 
-    it('supports fable-1m — the only way to get the 1M window on Fable through the CLI', () => {
+    it('preserves the explicit fable-1m row independently from base Fable', () => {
       const id = ModelIdentifier.parse('claude-code-cli:fable-1m');
       expect(id.baseVariant).toBe('fable');
       expect(id.isExtendedContext).toBe(true);

@@ -4,7 +4,7 @@ import { CLAUDE_CODE_SAFE_FALLBACK_MODEL } from '../../../modelConstants';
 
 /**
  * GitHub #631 / NIM-848 — billing safety: the Claude Agent SDK provider must
- * never silently send the paid 1M-context beta when a session's model is
+ * never invent the explicit `[1m]` model modifier when a session's model is
  * lost/empty.
  *
  * The 1M beta is derived purely from the model string: a `-1m` variant becomes
@@ -12,11 +12,11 @@ import { CLAUDE_CODE_SAFE_FALLBACK_MODEL } from '../../../modelConstants';
  * fallback (when `config.model` was empty) was `claude-code:opus-1m`, so an
  * unresolved model invisibly billed 1M while the UI still showed a 200k model.
  *
- * 1M must be strictly opt-in: only an explicitly-selected `-1m` model yields
- * `[1m]`. Any empty/lost model resolves to a standard 200k model.
+ * The explicit modifier must be opt-in. An unsuffixed fallback may still be a
+ * native-1M model, so this test intentionally does not infer a 200K window.
  */
 describe('ClaudeCodeProvider silent fallback model (#631)', () => {
-  it('the safe fallback constant is a standard 200k model (no -1m)', () => {
+  it('the safe fallback constant has no explicit -1m modifier', () => {
     expect(CLAUDE_CODE_SAFE_FALLBACK_MODEL.endsWith('-1m')).toBe(false);
   });
 

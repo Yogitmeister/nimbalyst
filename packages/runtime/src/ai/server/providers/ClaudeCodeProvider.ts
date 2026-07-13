@@ -45,6 +45,7 @@ import {
   CLAUDE_CODE_MODEL_LABELS,
   CLAUDE_CODE_VARIANTS_WITH_1M,
   CLAUDE_CODE_SAFE_FALLBACK_MODEL,
+  getClaudeCodeModelCapability,
 } from '../../modelConstants';
 import { isBedrockToolSearchError } from '../utils/errorDetection';
 import { AgentMessagesRepository } from '../../../storage/repositories/AgentMessagesRepository';
@@ -560,9 +561,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   }
 
   private resolveModelVariant(): string {
-    // Billing safety (#631 / NIM-848): when no explicit model is set, fall back
-    // to a STANDARD 200k model, never the 1M user-facing default. The `[1m]`
-    // beta must only ever be emitted for an explicitly-selected `-1m` model.
+    // When no explicit model is set, use the unsuffixed safe fallback rather
+    // than inventing an explicit `[1m]` modifier. Native-1M base models keep
+    // their real capability; the fallback is not a hidden 200K downgrade.
     return resolveClaudeCodeModelVariant(this.config.model, CLAUDE_CODE_SAFE_FALLBACK_MODEL);
   }
 
@@ -3977,31 +3978,33 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
 
   /**
    * Get Claude Code models.
-   * Returns standard models plus Sonnet 1M variant (access controlled by Anthropic).
+   * Context metadata comes from the Agent SDK capability surface, not labels.
    */
   static async getModels(): Promise<AIModel[]> {
     const models: AIModel[] = [];
 
     // Add models in desired order
     for (const variant of CLAUDE_CODE_VARIANTS) {
-      // Add base model (standard 200K context)
+      const baseCapability = getClaudeCodeModelCapability('agent-sdk', variant, false);
+      if (!baseCapability) continue;
       models.push({
         id: ModelIdentifier.create('claude-code', variant).combined,
         name: `Claude Agent · ${CLAUDE_CODE_MODEL_LABELS[variant]} ${CLAUDE_CODE_VARIANT_VERSIONS[variant]}`,
         provider: 'claude-code' as const,
         maxTokens: 8192,
-        contextWindow: 200000
+        contextWindow: baseCapability.contextWindow,
       });
 
       // Add 1M context variant if the variant supports it.
-      // 1M context is GA at standard pricing (March 2026).
       if ((CLAUDE_CODE_VARIANTS_WITH_1M as readonly string[]).includes(variant)) {
+        const extendedCapability = getClaudeCodeModelCapability('agent-sdk', variant, true);
+        if (!extendedCapability) continue;
         models.push({
           id: ModelIdentifier.create('claude-code', `${variant}-1m`).combined,
           name: `Claude Agent · ${CLAUDE_CODE_MODEL_LABELS[variant]} ${CLAUDE_CODE_VARIANT_VERSIONS[variant]} (1M)`,
           provider: 'claude-code' as const,
           maxTokens: 8192,
-          contextWindow: 1000000
+          contextWindow: extendedCapability.contextWindow,
         });
       }
 

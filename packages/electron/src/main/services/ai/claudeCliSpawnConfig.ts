@@ -18,7 +18,7 @@
  */
 
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
-import { normalizeClaudeCodeVariant } from '@nimbalyst/runtime/ai/modelConstants';
+import { getClaudeCodeModelCapability } from '@nimbalyst/runtime/ai/modelConstants';
 
 /**
  * Resolve a Nimbalyst model id to the alias the genuine `claude` CLI accepts for
@@ -43,15 +43,13 @@ export function resolveClaudeCliModelArg(model: string | undefined): string | un
 
   // Combined "provider:variant" id → take the variant part; bare value → itself.
   const parsed = ModelIdentifier.tryParse(trimmed);
-  const isExtended = parsed ? parsed.isExtendedContext : /-1m$/i.test(trimmed);
-  const variantInput = parsed ? parsed.baseVariant : trimmed.toLowerCase().replace(/-1m$/, '');
+  const isExtended = parsed ? parsed.isExtendedContext : /(?:-1m|\[1m\])$/i.test(trimmed);
+  const variantInput = parsed
+    ? parsed.baseVariant
+    : trimmed.toLowerCase().replace(/(?:-1m|\[1m\])$/, '');
 
-  const variant = normalizeClaudeCodeVariant(variantInput);
-  if (variant) {
-    // Collapse pinned opus variants (opus-4-7 / opus-4-6) to the CLI's `opus` alias.
-    const alias = variant.startsWith('opus') ? 'opus' : variant;
-    return isExtended ? `${alias}[1m]` : alias;
-  }
+  const capability = getClaudeCodeModelCapability('interactive-cli', variantInput, isExtended);
+  if (capability) return capability.modelValue;
 
   // Unknown format: a bare full model name is fine to pass through; a non-claude
   // combined id (e.g. `openai:gpt-5`) must never reach `claude --model`.

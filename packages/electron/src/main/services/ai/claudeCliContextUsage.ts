@@ -21,26 +21,23 @@ import { BrowserWindow } from 'electron';
 import { AISessionsRepository } from '@nimbalyst/runtime';
 import { SessionManager } from '@nimbalyst/runtime/ai/server';
 import type { SessionData } from '@nimbalyst/runtime/ai/server/types';
+import { contextWindowForClaudeCodeModel } from '@nimbalyst/runtime/ai/modelConstants';
 import type { AssembledUsage } from './claudeCliObservation/claudeApiMessageAssembler';
 
 type TokenUsage = NonNullable<SessionData['tokenUsage']>;
 
 /**
- * 1M extended-context CLI variants are suffixed `-1m`; everything else is 200k.
- * This applies to Fable 5 too: although the Anthropic API serves Fable at 1M
- * natively, Claude Code windows plain `fable` at 200k client-side and gates
- * the 1M window behind the `fable[1m]` model value (verified on CLI 2.1.175 —
- * plain-fable sessions auto-compact at ~177k). Our `fable-1m` picker variant
- * maps to `fable[1m]`, so the generic `-1m` rule covers it.
+ * The separately installed CLI has its own capability surface. Its 2.1.202
+ * binary marks base Fable 5 (and the current Opus/Sonnet aliases) as native 1M,
+ * while pinned older variants and Haiku retain their own windows. Explicit
+ * `-1m` rows still map to the CLI's `[1m]` values.
  */
 const CLI_DEFAULT_CONTEXT_WINDOW = 200_000;
-const CLI_1M_CONTEXT_WINDOW = 1_000_000;
 
 /** Context window for a CLI model id (`claude-code-cli:opus` / `…-1m`). */
 export function contextWindowForCliModel(model: string | undefined): number {
-  return model && model.toLowerCase().includes('-1m')
-    ? CLI_1M_CONTEXT_WINDOW
-    : CLI_DEFAULT_CONTEXT_WINDOW;
+  return contextWindowForClaudeCodeModel('interactive-cli', model)
+    ?? CLI_DEFAULT_CONTEXT_WINDOW;
 }
 
 /** Tokens occupying the context window for this step (excludes generated output). */

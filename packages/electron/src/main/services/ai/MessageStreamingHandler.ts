@@ -34,6 +34,7 @@ import {
   type DocumentContext,
 } from '@nimbalyst/runtime/ai/server/types';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
+import { contextWindowForClaudeCodeModel } from '@nimbalyst/runtime/ai/modelConstants';
 import { isBedrockToolSearchError } from '@nimbalyst/runtime/ai/server/utils/errorDetection';
 import { resolveEffortLevel } from '@nimbalyst/runtime/ai/server/effortLevels';
 import {
@@ -855,8 +856,16 @@ export class MessageStreamingHandler {
     let selectedModelContextWindow: number | undefined;
     const sessionModelId = session.model || session.providerConfig?.model;
     if (sessionModelId) {
-      const models = await ModelRegistry.getModelsForProvider(session.provider as AIProviderType);
-      selectedModelContextWindow = models.find(m => m.id === sessionModelId)?.contextWindow;
+      if (session.provider === 'claude-code') {
+        // Resolve aliases/full ids through the same Agent SDK capability map as
+        // the catalog. Exact-id lookup alone misses saved aliases such as
+        // `claude-code:fable-5` and would retain a stale 200K denominator.
+        selectedModelContextWindow = contextWindowForClaudeCodeModel('agent-sdk', sessionModelId);
+      }
+      if (selectedModelContextWindow === undefined) {
+        const models = await ModelRegistry.getModelsForProvider(session.provider as AIProviderType);
+        selectedModelContextWindow = models.find(m => m.id === sessionModelId)?.contextWindow;
+      }
     }
 
     // Re-register tool handler with the CURRENT document context from this message

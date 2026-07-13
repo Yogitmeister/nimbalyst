@@ -26,7 +26,17 @@ Each `assistant` chunk from the Claude Agent SDK includes per-step `usage` data:
 
 The sum **`input_tokens + cache_read_input_tokens + cache_creation_input_tokens`** equals the actual number of tokens in the context window for that step. The `output_tokens` field is excluded because it represents generated tokens, not context fill.
 
-The SDK also provides `contextWindow` (e.g., 200,000) per model in `result.modelUsage`.
+The SDK also provides `contextWindow` per model in `result.modelUsage`, but a
+result may contain both the selected parent model and smaller subagent models.
+The display denominator therefore comes from the selected model's
+surface-qualified capability in `packages/runtime/src/ai/modelConstants.ts`,
+not from whichever `modelUsage` entry happens to be visited first.
+
+The capability key includes the provider surface (`agent-sdk` or
+`interactive-cli`), canonical variant, and base/explicit-1M mode. This prevents
+similarly named SDK and CLI rows from inheriting one another's routing or
+window. Native-1M base models such as Fable 5 keep a 1,000,000-token denominator
+without requiring an explicit `[1m]` suffix.
 
 ## Cumulative vs Per-Step Usage
 
@@ -94,11 +104,15 @@ compact_boundary
   → reset lastAssistantUsage
   → set receivedCompactBoundary
 
+selected session model
+  → resolve surface + canonical variant
+  → read contextWindow from capability map
+
 result chunk
   → compute lastMessageContextTokens
     from lastAssistantUsage
   → yield complete {                       → extract contextFillTokens
-      contextFillTokens,                   → extract contextWindow from modelUsage
+      contextFillTokens,                   → pair with selected-model contextWindow
       contextCompacted,                    → if compacted: clear currentContext
       modelUsage                           → else: set currentContext = {tokens, contextWindow}
     }                                      → persist to DB + send IPC to UI
@@ -108,7 +122,8 @@ result chunk
 
 | File | Role |
 |---|---|
+| `packages/runtime/src/ai/modelConstants.ts` | Surface/variant capability map and selected-model context window |
 | `packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts` | Streaming loop, `lastAssistantUsage` tracking, compaction reset |
-| `packages/electron/src/main/services/ai/AIService.ts` | Persists `tokenUsage.currentContext`, sends `ai:tokenUsageUpdated` IPC |
+| `packages/electron/src/main/services/ai/MessageStreamingHandler.ts` | Resolves the selected-model denominator, persists `tokenUsage.currentContext`, and sends `ai:tokenUsageUpdated` IPC |
 | `packages/runtime/src/ai/server/types.ts` | `contextFillTokens` and `contextCompacted` fields on `StreamChunk` |
 | `packages/runtime/src/ai/server/utils/contextUsage.ts` | Legacy `/context` output parser (no longer used for auto-fetch) |

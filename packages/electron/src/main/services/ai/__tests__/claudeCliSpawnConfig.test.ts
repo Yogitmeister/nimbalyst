@@ -425,9 +425,10 @@ describe('resolveClaudeCliModelArg', () => {
     expect(resolveClaudeCliModelArg('fable')).toBe('fable');
   });
 
-  it('translates fable-1m to the CLI `fable[1m]` form — plain fable is windowed at 200k', () => {
+  it('preserves the explicit fable-1m row as the CLI `fable[1m]` form', () => {
     expect(resolveClaudeCliModelArg('claude-code-cli:fable-1m')).toBe('fable[1m]');
     expect(resolveClaudeCliModelArg('fable-1m')).toBe('fable[1m]');
+    expect(resolveClaudeCliModelArg('fable[1m]')).toBe('fable[1m]');
   });
 
   it('passes a bare variant through (normalized), translating -1m to [1m]', () => {
@@ -437,6 +438,8 @@ describe('resolveClaudeCliModelArg', () => {
   });
 
   it('passes an unrecognized bare model name through unchanged (CLI accepts full model names)', () => {
+    expect(resolveClaudeCliModelArg('claude-fable-5')).toBe('claude-fable-5');
+    expect(resolveClaudeCliModelArg('claude-opus-4-8')).toBe('claude-opus-4-8');
     expect(resolveClaudeCliModelArg('claude-opus-4-1-20250805')).toBe('claude-opus-4-1-20250805');
   });
 

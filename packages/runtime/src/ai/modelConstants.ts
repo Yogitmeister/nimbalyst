@@ -233,10 +233,9 @@ export const OPENAI_MODELS: ModelDefinition[] = [
  * Two kinds of variants:
  * - Canonical variants (`opus`, `sonnet`, `haiku`) — the SDK resolves these
  *   to the latest underlying model. The version field is for display only.
- * - Pinned variants (`opus-4-6`, ...) — always resolve to a specific
- *   Anthropic model ID via `CLAUDE_CODE_PINNED_SDK_MODELS`. Used to keep
- *   the previous-generation Opus selectable after bumping the canonical
- *   `opus` to the next version.
+ * - Pinned variants (`opus-4-6`, ...) — resolve according to the provider
+ *   surface. The Agent SDK receives a full Anthropic model ID, while the
+ *   interactive CLI keeps its independently supported command value.
  */
 export type ClaudeCodeVariant = 'fable' | 'opus' | 'sonnet' | 'haiku' | 'opus-4-7' | 'opus-4-6' | 'sonnet-4-6';
 export type ClaudeCodeVariantInput = ClaudeCodeVariant | 'opus-4-8' | 'fable-5';
@@ -298,58 +297,162 @@ export const CLAUDE_CODE_MODEL_LABELS: Record<ClaudeCodeVariant, string> = {
   'sonnet-4-6': 'Sonnet',
 };
 
-/**
- * For pinned variants, the SDK needs the full Anthropic model ID instead of
- * the short alias — the short aliases always resolve to "latest". An empty
- * string (or missing entry) means "pass the variant name straight through".
- */
-export const CLAUDE_CODE_PINNED_SDK_MODELS: Partial<Record<ClaudeCodeVariant, string>> = {
-  // The Agent SDK's bundled CLI rejects the bare `fable` alias ("There's an
-  // issue with the selected model (fable)…", 2026-06-12) — version skew with
-  // the user's interactive CLI, which does accept it. Pin the full model id;
-  // the interactive-CLI path (`resolveClaudeCliModelArg`) does not read this
-  // map and keeps sending the working `fable` alias to the PTY.
-  fable: 'claude-fable-5',
-  'opus-4-7': 'claude-opus-4-7',
-  'opus-4-6': 'claude-opus-4-6',
-  // Pinned so the previous-generation Sonnet stays selectable after the
-  // canonical `sonnet` alias rolled forward to Sonnet 5.
-  'sonnet-4-6': 'claude-sonnet-4-6',
-};
+export type ClaudeCodeProviderSurface = 'agent-sdk' | 'interactive-cli';
+
+interface ClaudeCodeBaseCapability {
+  /** Value passed to the surface before an optional `[1m]` suffix. */
+  modelValue: string;
+  /** Effective window for the unsuffixed value on this surface. */
+  contextWindow: number;
+  /** Whether Nimbalyst keeps an explicit `-1m` picker row for this variant. */
+  supportsExplicit1M: boolean;
+}
+
+export interface ClaudeCodeModelCapability extends ClaudeCodeBaseCapability {
+  key: string;
+  surface: ClaudeCodeProviderSurface;
+  variant: ClaudeCodeVariant;
+  isExtendedContext: boolean;
+}
+
+const CONTEXT_200K = 200_000;
+const CONTEXT_1M = 1_000_000;
 
 /**
- * Variants that support a 1M-context extended picker row.
+ * Path- and variant-aware Claude Code capability source of truth.
  *
- * `fable` belongs here even though the Anthropic API serves Fable 5 at 1M
- * natively: Claude Code gates the 1M window behind the `[1m]` model-value
- * suffix for Fable too (verified against CLI 2.1.175 — plain `fable` sessions
- * auto-compact at ~177k/200k, and the binary carries a distinct `fable[1m]`
- * model value that a live probe accepted). Without this row there was no way
- * to run a 1M Fable session from Nimbalyst at all.
+ * Proven offline against the binaries shipped/installed on 2026-07-13:
+ * Agent SDK 0.3.204 bundles Claude Code 2.1.204, and the independently installed
+ * interactive CLI is 2.1.202. Both registries mark Fable 5, Opus 4.8/4.7, and
+ * Sonnet 5 as native 1M models; older pinned models and Haiku remain 200K.
+ * Surface identity still matters because the SDK and CLI accept different model
+ * values even when their effective windows match. The CLI's retained pinned-Opus
+ * rows route through its current `opus` alias, so their effective window follows
+ * that alias without changing the saved picker IDs.
  */
-export const CLAUDE_CODE_VARIANTS_WITH_1M: readonly ClaudeCodeVariant[] = [
-  'fable',
-  'opus',
-  'sonnet',
-  'opus-4-7',
-  'opus-4-6',
-  'sonnet-4-6',
-];
+export const CLAUDE_CODE_MODEL_CAPABILITIES: Readonly<
+  Record<ClaudeCodeProviderSurface, Readonly<Record<ClaudeCodeVariant, ClaudeCodeBaseCapability>>>
+> = {
+  'agent-sdk': {
+    fable: { modelValue: 'claude-fable-5', contextWindow: CONTEXT_1M, supportsExplicit1M: true },
+    opus: { modelValue: 'opus', contextWindow: CONTEXT_1M, supportsExplicit1M: true },
+    'opus-4-7': { modelValue: 'claude-opus-4-7', contextWindow: CONTEXT_1M, supportsExplicit1M: true },
+    'opus-4-6': { modelValue: 'claude-opus-4-6', contextWindow: CONTEXT_200K, supportsExplicit1M: true },
+    sonnet: { modelValue: 'sonnet', contextWindow: CONTEXT_1M, supportsExplicit1M: true },
+    'sonnet-4-6': { modelValue: 'claude-sonnet-4-6', contextWindow: CONTEXT_200K, supportsExplicit1M: true },
+    haiku: { modelValue: 'haiku', contextWindow: CONTEXT_200K, supportsExplicit1M: false },
+  },
+  'interactive-cli': {
+    fable: { modelValue: 'fable', contextWindow: CONTEXT_1M, supportsExplicit1M: true },
+    opus: { modelValue: 'opus', contextWindow: CONTEXT_1M, supportsExplicit1M: true },
+    // Preserve the CLI's established alias routing for saved pinned-Opus rows.
+    'opus-4-7': { modelValue: 'opus', contextWindow: CONTEXT_1M, supportsExplicit1M: true },
+    'opus-4-6': { modelValue: 'opus', contextWindow: CONTEXT_1M, supportsExplicit1M: true },
+    sonnet: { modelValue: 'sonnet', contextWindow: CONTEXT_1M, supportsExplicit1M: true },
+    'sonnet-4-6': { modelValue: 'sonnet-4-6', contextWindow: CONTEXT_200K, supportsExplicit1M: true },
+    haiku: { modelValue: 'haiku', contextWindow: CONTEXT_200K, supportsExplicit1M: false },
+  },
+};
+
+const CLAUDE_CODE_FULL_MODEL_VARIANTS: Readonly<Record<string, ClaudeCodeVariant>> = {
+  'claude-fable-5': 'fable',
+  'claude-opus-4-8': 'opus',
+  'claude-opus-4-7': 'opus-4-7',
+  'claude-opus-4-6': 'opus-4-6',
+  'claude-sonnet-5': 'sonnet',
+  'claude-sonnet-4-6': 'sonnet-4-6',
+  'claude-haiku-4-5': 'haiku',
+  'claude-haiku-4-5-20251001': 'haiku',
+};
+
+/** Resolve a model/alias to the capability belonging to one provider surface. */
+export function getClaudeCodeModelCapability(
+  surface: ClaudeCodeProviderSurface,
+  model: string,
+  explicitContext?: boolean,
+): ClaudeCodeModelCapability | null {
+  const trimmed = model.trim().toLowerCase();
+  if (!trimmed) return null;
+
+  const colonIndex = trimmed.indexOf(':');
+  let raw = trimmed;
+  if (colonIndex >= 0) {
+    const provider = trimmed.slice(0, colonIndex);
+    const expectedProvider = surface === 'agent-sdk' ? 'claude-code' : 'claude-code-cli';
+    if (provider !== expectedProvider) return null;
+    raw = trimmed.slice(colonIndex + 1);
+  }
+
+  const hasBracketContext = raw.endsWith('[1m]');
+  const withoutBracketContext = raw.replace(/\[1m\]$/, '');
+  const hasDashContext = withoutBracketContext.endsWith('-1m');
+  const withoutContext = withoutBracketContext.replace(/-1m$/, '');
+  const fullModelVariant = CLAUDE_CODE_FULL_MODEL_VARIANTS[withoutContext];
+  const variant = normalizeClaudeCodeVariant(withoutContext)
+    ?? fullModelVariant
+    ?? null;
+  if (!variant) return null;
+
+  const base = CLAUDE_CODE_MODEL_CAPABILITIES[surface][variant];
+  // Bare full model IDs remain full IDs on either surface. Their own model
+  // definition supplies the window instead of inheriting a similarly named
+  // picker route (important for pinned CLI models).
+  const fullModelDefinition = fullModelVariant
+    ? CLAUDE_MODELS.find((definition) => definition.id === withoutContext)
+    : undefined;
+  const baseModelValue = fullModelVariant ? withoutContext : base.modelValue;
+  const baseContextWindow = fullModelVariant
+    ? (fullModelDefinition?.contextWindow ?? CONTEXT_200K)
+    : base.contextWindow;
+  const isExtendedContext = explicitContext ?? (hasBracketContext || hasDashContext);
+  return {
+    ...base,
+    key: `${surface}:${variant}:${baseModelValue}:${isExtendedContext ? 'explicit-1m' : 'base'}`,
+    surface,
+    variant,
+    isExtendedContext,
+    modelValue: isExtendedContext ? `${baseModelValue}[1m]` : baseModelValue,
+    contextWindow: isExtendedContext ? CONTEXT_1M : baseContextWindow,
+  };
+}
+
+/** Context window for a model on one surface, including accepted aliases. */
+export function contextWindowForClaudeCodeModel(
+  surface: ClaudeCodeProviderSurface,
+  model: string | undefined,
+): number | undefined {
+  return model ? getClaudeCodeModelCapability(surface, model)?.contextWindow : undefined;
+}
+
+/** Compatibility export for code that needs the SDK's pinned base values. */
+export const CLAUDE_CODE_PINNED_SDK_MODELS: Partial<Record<ClaudeCodeVariant, string>> =
+  Object.fromEntries(
+    Object.entries(CLAUDE_CODE_MODEL_CAPABILITIES['agent-sdk'])
+      .filter(([variant, capability]) => capability.modelValue !== variant)
+      .map(([variant, capability]) => [variant, capability.modelValue]),
+  ) as Partial<Record<ClaudeCodeVariant, string>>;
+
+/** Variants that retain an explicit 1M-context picker row. */
+export const CLAUDE_CODE_VARIANTS_WITH_1M: readonly ClaudeCodeVariant[] =
+  (Object.entries(CLAUDE_CODE_MODEL_CAPABILITIES['agent-sdk']) as Array<[
+    ClaudeCodeVariant,
+    ClaudeCodeBaseCapability,
+  ]>)
+    .filter(([, capability]) => capability.supportsExplicit1M)
+    .map(([variant]) => variant);
 
 /**
  * Safe silent fallback for the Claude Agent providers (#631 / NIM-848).
  *
- * Billing safety: 1M context is a PAID add-on, derived purely from a `-1m`
- * model string (which becomes `model[1m]` and triggers the SDK's 1M beta).
- * Whenever a session's model is unexpectedly empty/lost, resolution must fall
- * back to a STANDARD 200k model — never a `-1m` variant — so we never silently
- * bill the user for 1M context they didn't choose. `claude-code:opus` (plain
- * Opus) windows at 200k client-side; no `[1m]` suffix is emitted.
+ * Whenever a session's model is unexpectedly empty/lost, resolution must avoid
+ * inventing an explicit `[1m]` modifier. The unsuffixed fallback may itself be
+ * a native-1M model; this invariant is about preserving the base route, not
+ * imposing an obsolete 200K cap or silently choosing a different variant.
  *
  * This is intentionally distinct from the user-facing default
  * (`DEFAULT_MODELS['claude-code']`, currently `opus-1m`): new installs may
- * still default to the 1M tier as a visible, deliberate choice, but the
- * INVISIBLE fallback must never be a paid model.
+ * still default to an explicit 1M row as a visible choice, while the invisible
+ * fallback remains the unsuffixed canonical model.
  */
 export const CLAUDE_CODE_SAFE_FALLBACK_MODEL = 'claude-code:opus' as const;
 
