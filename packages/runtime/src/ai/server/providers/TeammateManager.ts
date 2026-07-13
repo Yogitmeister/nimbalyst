@@ -1191,7 +1191,6 @@ export class TeammateManager {
 
       await AISessionsRepository.updateMetadata(sessionId, {
         metadata: {
-          ...currentMetadata,
           currentTeammates: updatedTeammates,
         }
       });
