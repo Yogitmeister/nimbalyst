@@ -3,6 +3,49 @@ import { createPGLiteQueuedPromptsStore } from '../PGLiteQueuedPromptsStore';
 
 type DbStub = { query: <T = any>(sql: string, params?: any[]) => Promise<{ rows: T[] }> };
 
+describe('PGLiteQueuedPromptsStore.transferPending', () => {
+  it('moves pending ownership exactly once and leaves non-pending source rows untouched', async () => {
+    const rows = [
+      {
+        id: 'pending-source',
+        session_id: 'retired-cli',
+        prompt: 'continue',
+        status: 'pending',
+        created_at: new Date('2026-07-13T00:00:00Z'),
+      },
+      {
+        id: 'executing-source',
+        session_id: 'retired-cli',
+        prompt: 'already delivered',
+        status: 'executing',
+        created_at: new Date('2026-07-13T00:00:01Z'),
+      },
+    ];
+    const query = vi.fn(async (sql: string, params?: any[]) => {
+      expect(sql).toContain('SET session_id = $2');
+      expect(sql).toContain("status = 'pending'");
+      expect(params).toEqual(['retired-cli', 'continuation-cli']);
+      const moved = rows.filter(
+        (row) => row.session_id === params?.[0] && row.status === 'pending',
+      );
+      moved.forEach((row) => { row.session_id = String(params?.[1]); });
+      return { rows: moved };
+    });
+    const store = createPGLiteQueuedPromptsStore({ query: query as any });
+
+    const first = await store.transferPending('retired-cli', 'continuation-cli');
+    const repeated = await store.transferPending('retired-cli', 'continuation-cli');
+
+    expect(first.map((row) => row.id)).toEqual(['pending-source']);
+    expect(first[0].sessionId).toBe('continuation-cli');
+    expect(repeated).toEqual([]);
+    expect(rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'pending-source', session_id: 'continuation-cli' }),
+      expect.objectContaining({ id: 'executing-source', session_id: 'retired-cli' }),
+    ]));
+  });
+});
+
 describe('PGLiteQueuedPromptsStore.rollbackExecuting', () => {
   it('resets executing rows for the given session back to pending', async () => {
     const query = vi.fn(async (sql: string, params?: any[]) => {

@@ -140,6 +140,24 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     [launchMode, claudeCliModel, terminalId, workspacePath]
   );
 
+  const followClaudeCliPromptTarget = useCallback((result: unknown): boolean => {
+    const resultSessionId = result && typeof result === 'object' && 'sessionId' in result
+      && typeof result.sessionId === 'string'
+      ? result.sessionId
+      : undefined;
+    if (
+      launchMode !== 'claude-cli'
+      || !resultSessionId
+      || resultSessionId === terminalId
+    ) {
+      return false;
+    }
+    window.dispatchEvent(new CustomEvent('open-ai-session', {
+      detail: { sessionId: resultSessionId, workspacePath },
+    }));
+    return true;
+  }, [launchMode, terminalId, workspacePath]);
+
   const terminalRef = useRef<HTMLDivElement>(null);
   const terminalInstanceRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -219,7 +237,8 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     }
 
     try {
-      await initBackend();
+      const result = await initBackend();
+      followClaudeCliPromptTarget(result);
     } catch (error) {
       console.error('[TerminalPanel] Failed to restart terminal:', error);
       setInitError(error instanceof Error ? error.message : 'Failed to restart terminal');
@@ -350,6 +369,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
             // user doesn't have to click Retry at all.
             initPromise.then((late) => {
               if (disposedRef.current) return;
+              if (followClaudeCliPromptTarget(late)) return;
               if (late.success || ('alreadyActive' in late && late.alreadyActive)) {
                 if (!lateInitRecoveredRef.current) {
                   lateInitRecoveredRef.current = true;
@@ -366,6 +386,10 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
             });
             console.error('[TerminalPanel] Failed to initialize PTY:', timedOutSentinel.error);
             setInitError(timedOutSentinel.error);
+            return false;
+          }
+
+          if (followClaudeCliPromptTarget(result)) {
             return false;
           }
 

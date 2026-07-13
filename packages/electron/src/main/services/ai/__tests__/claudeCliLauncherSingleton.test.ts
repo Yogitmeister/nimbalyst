@@ -37,6 +37,27 @@ describe('claudeCliLauncherSingleton', () => {
       getEnhancedPath: () => '/bin',
       getShellEnvironment: () => ({}),
     }));
+    vi.doMock('../../AgentWorkflowService', () => ({
+      getAgentWorkflowService: () => ({
+        getClaudeProviderPluginPaths: vi.fn(async () => []),
+      }),
+    }));
+    vi.doMock('../../AttachmentService', () => ({
+      workspacePathToDir: () => 'workspace',
+    }));
+    vi.doMock('../../PermissionService', () => ({
+      getPermissionService: () => ({ getPermissionMode: () => 'default' }),
+    }));
+    vi.doMock('../HooklessAgentFileWatcher', () => ({
+      HooklessAgentFileWatcher: class {
+        scheduleStop = vi.fn();
+        ensureForSession = vi.fn(async () => undefined);
+        stopForSession = vi.fn(async () => undefined);
+      },
+    }));
+    vi.doMock('../claudeCliSessionAutoNameSingleton', () => ({
+      maybeAutoNameClaudeCliSessionProduction: vi.fn(async () => undefined),
+    }));
     vi.doMock('../claudeExecutableResolver', () => ({
       resolveClaudeExecutablePath: () => '/usr/local/bin/claude',
       isClaudeExecutableInstalled: () => claudeInstalled,

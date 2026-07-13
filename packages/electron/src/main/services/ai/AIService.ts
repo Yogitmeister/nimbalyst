@@ -92,7 +92,7 @@ import { getMessageSyncHandler, getSyncProvider, isDesktopTrulyAway } from '../S
 import { applyRemoteReadReceipt } from '../../ipc/ReadReceiptHandlers';
 import { normalizeCodexProviderConfig, omitModelsField, stripTransientProviderFields } from '@nimbalyst/runtime/ai/server/utils/modelConfigUtils';
 import { isFileInWorkspaceOrWorktree, resolveProjectPath } from '../../utils/workspaceDetection';
-import { SessionFilesRepository } from '@nimbalyst/runtime';
+import { AISessionsRepository, SessionFilesRepository } from '@nimbalyst/runtime';
 import { buildToolPermissionResponseRecord } from './claudeCliToolPermission';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -126,6 +126,11 @@ import { getAgentWorkflowService } from '../AgentWorkflowService';
 import { tryClaimAndDispatchNextQueuedPrompt } from './queuedPromptDispatcher';
 import { dispatchQueuedPromptToClaudeCli } from './claudeCliQueueDispatch';
 import { ensureClaudeCliSession, claudeCliSessionSupportsPlugins } from './claudeCliLauncherSingleton';
+import {
+  resolveClaudeCliPromptTarget,
+  resolveClaudeCliQueuedPromptTarget,
+  type ClaudeCliPromptTarget,
+} from './claudeCliPromptTarget';
 import { supportsWorkspaceSlashWorkflowProvider } from '../../../shared/agentWorkflowProviders';
 
 const execFileAsync = promisify(execFile);
@@ -268,18 +273,58 @@ export class AIService {
     prompt: string,
     attachments?: any[],
     documentContext?: any
-  ): Promise<{ id: string; prompt: string; createdAt: number }> {
+  ): Promise<{
+    id: string;
+    prompt: string;
+    createdAt: number;
+    sessionId: string;
+    continuedFromSessionId?: string;
+  }> {
     const { getQueuedPromptsStore } = await import('../RepositoryManager');
     const queueStore = getQueuedPromptsStore();
+    const routing = await this.resolveQueuedPromptCreationTarget(sessionId);
     const promptId = `meta-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     const created = await queueStore.create({
       id: promptId,
-      sessionId,
+      sessionId: routing.sessionId,
       prompt,
       attachments,
       documentContext,
     });
-    return { id: created.id, prompt: created.prompt, createdAt: created.createdAt };
+    return {
+      id: created.id,
+      prompt: created.prompt,
+      createdAt: created.createdAt,
+      sessionId: routing.sessionId,
+      ...(routing.continuedFromSessionId
+        ? { continuedFromSessionId: routing.continuedFromSessionId }
+        : {}),
+    };
+  }
+
+  private async resolveQueuedPromptCreationTarget(sessionId: string): Promise<{
+    sessionId: string;
+    continuedFromSessionId: string | null;
+    session: { provider?: string; workspacePath?: string } | null;
+  }> {
+    const session = await AISessionsRepository.get(sessionId);
+    if (session?.provider !== 'claude-code-cli') {
+      return {
+        sessionId,
+        continuedFromSessionId: null,
+        session,
+      };
+    }
+    if (!session.workspacePath) {
+      throw new Error(`Session ${sessionId} has no workspace path`);
+    }
+
+    const cliTarget = await resolveClaudeCliPromptTarget(sessionId, session.workspacePath);
+    return {
+      sessionId: cliTarget.sessionId,
+      continuedFromSessionId: cliTarget.continuedFromSessionId,
+      session: cliTarget.session,
+    };
   }
 
   public async triggerQueuedPromptProcessingForSession(sessionId: string, workspacePath: string): Promise<boolean> {
@@ -766,19 +811,45 @@ export class AIService {
     // scheduled wakeups for CLI sessions). Route them onto the CLI's PTY
     // queue-drain rails instead: launch the genuine CLI if needed and let the
     // PID watcher's idle flush deliver the prompt.
-    let dispatchSession: { provider?: string; model?: string | null; worktreeId?: string | null } | null = null;
+    let dispatchSession: Awaited<ReturnType<typeof AISessionsRepository.get>> = null;
     try {
-      const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
       dispatchSession = await AISessionsRepository.get(sessionId);
     } catch (lookupError) {
       logger.main.warn(`[AIService] ${source}: provider lookup failed before queued dispatch:`, lookupError);
+      return false;
     }
-    if (dispatchSession?.provider === 'claude-code-cli') {
-      return this.dispatchQueuedPromptToClaudeCliSession(sessionId, workspacePath, dispatchSession, source);
+    if (!dispatchSession) {
+      logger.main.warn(`[AIService] ${source}: session ${sessionId} not found before queued dispatch`);
+      return false;
     }
 
     const { getQueuedPromptsStore } = await import('../RepositoryManager');
     const queueStore = getQueuedPromptsStore();
+
+    if (dispatchSession?.provider === 'claude-code-cli') {
+      const target = await resolveClaudeCliQueuedPromptTarget(
+        sessionId,
+        workspacePath,
+        queueStore,
+      );
+      if (target.transferredPrompts.length > 0) {
+        for (const window of BrowserWindow.getAllWindows()) {
+          if (!window.isDestroyed()) {
+            window.webContents.send('ai:queuedPromptsReceived', {
+              sessionId,
+              promptCount: 0,
+              redirectedToSessionId: target.sessionId,
+            });
+            window.webContents.send('ai:queuedPromptsReceived', {
+              sessionId: target.sessionId,
+              promptCount: target.transferredPrompts.length,
+              continuedFromSessionId: target.continuedFromSessionId,
+            });
+          }
+        }
+      }
+      return this.dispatchQueuedPromptToClaudeCliSession(target, source);
+    }
 
     // Captures whether the just-settled child chain ended in 'error' so the
     // meta-agent wakeup (onAfterSettled) can skip re-driving the parent for a
@@ -874,24 +945,9 @@ export class AIService {
    * the session's view points.
    */
   private async dispatchQueuedPromptToClaudeCliSession(
-    sessionId: string,
-    workspacePath: string,
-    session: { model?: string | null; worktreeId?: string | null },
+    target: ClaudeCliPromptTarget,
     source: string,
   ): Promise<boolean> {
-    let cwd: string | undefined;
-    if (session.worktreeId) {
-      try {
-        const { createWorktreeStore } = await import('../WorktreeStore');
-        const { getDatabase } = await import('../../database/initialize');
-        const db = getDatabase();
-        const worktree = db ? await createWorktreeStore(db).get(session.worktreeId) : null;
-        cwd = worktree?.path ?? undefined;
-      } catch (worktreeError) {
-        logger.main.warn(`[AIService] ${source}: worktree lookup failed for CLI queued dispatch:`, worktreeError);
-      }
-    }
-
     const terminalManager = getTerminalSessionManager();
     return dispatchQueuedPromptToClaudeCli(
       {
@@ -903,7 +959,12 @@ export class AIService {
         logInfo: (message) => logger.main.info(`[AIService] ${source}: ${message}`),
         logWarn: (message) => logger.main.warn(`[AIService] ${source}: ${message}`),
       },
-      { sessionId, workspacePath, model: session.model, cwd },
+      {
+        sessionId: target.sessionId,
+        workspacePath: target.workspacePath,
+        model: target.session.model,
+        cwd: target.cwd,
+      },
     );
   }
 
@@ -2350,6 +2411,7 @@ export class AIService {
     ) => {
       const { getQueuedPromptsStore } = await import('../RepositoryManager');
       const queueStore = getQueuedPromptsStore();
+      const routing = await this.resolveQueuedPromptCreationTarget(sessionId);
 
       // Generate a unique ID with 'local-' prefix to identify locally-created prompts
       // This prevents the mobile sync handler from re-broadcasting these prompts
@@ -2357,23 +2419,19 @@ export class AIService {
 
       const created = await queueStore.create({
         id: promptId,
-        sessionId,
+        sessionId: routing.sessionId,
         prompt,
         attachments,
         documentContext,
       });
 
-      logger.main.info(`[AIService] createQueuedPrompt: created ${promptId} for session ${sessionId}`);
+      logger.main.info(
+        `[AIService] createQueuedPrompt: created ${promptId} for session ${routing.sessionId}`,
+      );
 
       // Look up the session once (lightweight — no message log) for both the
       // analytics event and the claude-code-cli idle-flush kick below.
-      let queuedSession: { provider?: string; workspacePath?: string } | null = null;
-      try {
-        const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
-        queuedSession = await AISessionsRepository.get(sessionId);
-      } catch (lookupError) {
-        logger.main.warn('[AIService] createQueuedPrompt: session lookup failed:', lookupError);
-      }
+      const queuedSession = routing.session;
 
       // Track ai_message_queued analytics event
       try {
@@ -2394,8 +2452,11 @@ export class AIService {
       // Notify the renderer to update the queue list UI
       // This ensures locally-queued prompts are visible (same as mobile sync path)
       safeSend(event, 'ai:queuedPromptsReceived', {
-        sessionId,
-        promptCount: 1
+        sessionId: routing.sessionId,
+        promptCount: 1,
+        ...(routing.continuedFromSessionId
+          ? { continuedFromSessionId: routing.continuedFromSessionId }
+          : {}),
       });
 
       // claude-code-cli (NIM-806): the CLI queue normally drains on the PID
@@ -2415,15 +2476,15 @@ export class AIService {
       // claim is race-safe, so erring toward flushing is fine.
       if (queuedSession?.provider === 'claude-code-cli') {
         const terminalManager = getTerminalSessionManager();
-        const state = getSessionStateManager().getSessionState(sessionId);
+        const state = getSessionStateManager().getSessionState(routing.sessionId);
         const workspacePath = queuedSession.workspacePath ?? state?.workspacePath;
-        if (terminalManager.isTerminalActive(sessionId) && workspacePath) {
+        if (terminalManager.isTerminalActive(routing.sessionId) && workspacePath) {
           if (state?.status === 'idle') {
-            void flushNextClaudeCliQueuedPromptForSession(sessionId, workspacePath);
+            void flushNextClaudeCliQueuedPromptForSession(routing.sessionId, workspacePath);
           } else {
-            void terminalManager.getClaudeCliLiveTurnState(sessionId).then((live) => {
+            void terminalManager.getClaudeCliLiveTurnState(routing.sessionId).then((live) => {
               if (live === 'idle') {
-                void flushNextClaudeCliQueuedPromptForSession(sessionId, workspacePath);
+                void flushNextClaudeCliQueuedPromptForSession(routing.sessionId, workspacePath);
               }
             }).catch(() => {});
           }
@@ -2436,6 +2497,10 @@ export class AIService {
         timestamp: created.createdAt,
         attachments: created.attachments,
         documentContext: created.documentContext,
+        sessionId: routing.sessionId,
+        ...(routing.continuedFromSessionId
+          ? { continuedFromSessionId: routing.continuedFromSessionId }
+          : {}),
       };
     });
 

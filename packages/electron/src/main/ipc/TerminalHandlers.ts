@@ -6,8 +6,11 @@
  */
 
 import { getTerminalSessionManager } from '../services/TerminalSessionManager';
-import { ensureClaudeCliSession, isClaudeCliInstalled } from '../services/ai/claudeCliLauncherSingleton';
-import { submitClaudeCliPromptProduction } from '../services/ai/claudeCliSubmitSingleton';
+import { isClaudeCliInstalled } from '../services/ai/claudeCliLauncherSingleton';
+import {
+  ensureClaudeCliPromptTargetSession,
+  submitClaudeCliPromptToTarget,
+} from '../services/ai/claudeCliPromptTargetSingleton';
 import { switchClaudeCliModel } from '../services/ai/claudeCliModelSwitch';
 import type { ClaudeCliDocumentContext } from '../services/ai/claudeCliPromptComposer';
 import type { ChatAttachment } from '@nimbalyst/runtime/ai/server/types';
@@ -298,7 +301,7 @@ export function registerTerminalHandlers(): void {
       if (!payload?.workspacePath || typeof payload.workspacePath !== 'string') {
         throw new Error('workspacePath is required and must be a string');
       }
-      return ensureClaudeCliSession(payload);
+      return ensureClaudeCliPromptTargetSession(payload);
     }
   );
 
@@ -345,14 +348,13 @@ export function registerTerminalHandlers(): void {
         payload.documentContext && typeof payload.documentContext === 'object'
           ? payload.documentContext
           : undefined;
-      await submitClaudeCliPromptProduction({
+      return submitClaudeCliPromptToTarget({
         sessionId: payload.sessionId,
         workspacePath: payload.workspacePath,
         prompt,
         attachments,
         documentContext,
       });
-      return { success: true };
     }
   );
 

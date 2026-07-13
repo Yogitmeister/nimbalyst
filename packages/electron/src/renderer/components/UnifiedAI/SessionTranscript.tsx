@@ -1125,7 +1125,24 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         combinedPrompt,
         combinedAttachments,
         serializableContext
-      ) as { id: string; prompt: string; timestamp: number };
+      ) as {
+        id: string;
+        prompt: string;
+        timestamp: number;
+        sessionId?: string;
+        continuedFromSessionId?: string;
+      };
+
+      if (result.sessionId && result.sessionId !== sessionId) {
+        setLastSubmitAt(Date.now());
+        setDraftInput('');
+        setDraftAttachments([]);
+        clearAIInputHistory(sessionId);
+        window.dispatchEvent(new CustomEvent('open-ai-session', {
+          detail: { sessionId: result.sessionId, workspacePath },
+        }));
+        return;
+      }
 
       setQueuedPrompts(prev => {
         // Remove the old queued prompt (if we merged into it) and add the new combined one
@@ -1148,7 +1165,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     } finally {
       setIsQueueing(false);
     }
-  }, [sessionId, getEffectiveDocumentContext, setDraftInput, setDraftAttachments, setLastSubmitAt, isQueueing, queuedPrompts, clearAIInputHistory]);
+  }, [sessionId, workspacePath, getEffectiveDocumentContext, setDraftInput, setDraftAttachments, setLastSubmitAt, isQueueing, queuedPrompts, clearAIInputHistory]);
 
   const handleSend = useCallback(async () => {
     // Read draft state imperatively — we deliberately don't subscribe to
@@ -1198,13 +1215,18 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
           } catch (contextError) {
             console.warn('[SessionTranscript] Failed to capture document context for CLI submit:', contextError);
           }
-          await window.electronAPI.terminal.submitClaudeCliPrompt({
+          const submitResult = await window.electronAPI.terminal.submitClaudeCliPrompt({
             sessionId,
             workspacePath,
             prompt: cliMessage,
             attachments,
             documentContext,
           });
+          if (submitResult.sessionId !== sessionId) {
+            window.dispatchEvent(new CustomEvent('open-ai-session', {
+              detail: { sessionId: submitResult.sessionId, workspacePath },
+            }));
+          }
         }
         recordClaudeActivity();
       } catch (error) {

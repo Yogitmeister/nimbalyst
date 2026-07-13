@@ -2329,9 +2329,14 @@ app.whenReady().then(async () => {
                 if (!aiSvcRef) {
                     return { triggered: false };
                 }
-                await aiSvcRef.queuePromptForSession(sessionId, prompt, undefined, { promptOrigin: 'wakeup_resume' });
-                const triggered = await aiSvcRef.triggerQueuedPromptProcessingForSession(
+                const queued = await aiSvcRef.queuePromptForSession(
                     sessionId,
+                    prompt,
+                    undefined,
+                    { promptOrigin: 'wakeup_resume' },
+                );
+                const triggered = await aiSvcRef.triggerQueuedPromptProcessingForSession(
+                    queued.sessionId,
                     workspacePath,
                 );
                 return { triggered };

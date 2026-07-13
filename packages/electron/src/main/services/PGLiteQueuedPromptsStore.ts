@@ -54,6 +54,13 @@ export interface QueuedPromptsStore {
   listPending(sessionId: string): Promise<QueuedPrompt[]>;
 
   /**
+   * Atomically transfer every still-pending row to another session. Used when
+   * a retired worktree session redirects onto its durable continuation before
+   * dispatch. Executing/completed/failed rows never change ownership.
+   */
+  transferPending(sourceSessionId: string, targetSessionId: string): Promise<QueuedPrompt[]>;
+
+  /**
    * Atomically claim a pending prompt for execution.
    * Returns the prompt if successfully claimed, null if already claimed or not found.
    * This is the key atomic operation that prevents duplicate execution.
@@ -235,6 +242,29 @@ export function createPGLiteQueuedPromptsStore(
         [sessionId]
       );
 
+      return rows.map(rowToQueuedPrompt);
+    },
+
+    async transferPending(
+      sourceSessionId: string,
+      targetSessionId: string,
+    ): Promise<QueuedPrompt[]> {
+      await ensureReady();
+      if (sourceSessionId === targetSessionId) return [];
+
+      const { rows } = await db.query<any>(
+        `UPDATE queued_prompts
+         SET session_id = $2
+         WHERE session_id = $1 AND status = 'pending'
+         RETURNING *`,
+        [sourceSessionId, targetSessionId],
+      );
+
+      if (rows.length > 0) {
+        console.log(
+          `[QueuedPromptsStore] Transferred ${rows.length} pending prompt(s) from ${sourceSessionId} to ${targetSessionId}`,
+        );
+      }
       return rows.map(rowToQueuedPrompt);
     },
 
