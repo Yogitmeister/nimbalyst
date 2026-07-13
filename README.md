@@ -1,1 +1,1 @@
-hi
+binding test
