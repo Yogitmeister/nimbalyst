@@ -20,7 +20,6 @@ type CreateSessionArgs = {
   model?: string;
   prompt?: string;
   useWorktree?: boolean;
-  worktreeId?: string;
   toolScope?: string;
   reasoning?: ReasoningSelection;
 };
@@ -204,12 +203,17 @@ export interface MetaAgentOpenAITool {
 export const META_AGENT_TOOL_DEFS: Array<{
   name: string;
   description: string;
-  inputSchema: { type: "object"; properties: Record<string, unknown>; required?: string[] };
+  inputSchema: {
+    type: "object";
+    properties: Record<string, unknown>;
+    required?: string[];
+    additionalProperties?: boolean;
+  };
 }> = [
   {
     name: "list_worktrees",
     description:
-      "List the available git worktrees for this workspace so you can attach a child session to an existing branch or decide whether to create a fresh worktree.",
+      "List diagnostic information about project-owned git worktrees. Listing a worktree does not grant authority to attach, adopt, or rebind a session to it.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -218,7 +222,7 @@ export const META_AGENT_TOOL_DEFS: Array<{
   {
     name: "create_session",
     description:
-      "Spawn a new child session for a focused task. Can optionally create a dedicated worktree or attach the session to an existing worktree, then seed it with an initial prompt. Pass toolScope to control the child's capabilities: use \"read\" or \"write\" for analyze/research tasks so the child cannot run builds or claim to have run them; \"full\" (default) grants run_command.",
+      "Spawn a new child session for a focused task. By default the child inherits the caller's immutable checkout binding; use useWorktree=true with an initial prompt to atomically create a fresh project-owned worktree for the child. Existing worktrees cannot be selected or attached. Pass toolScope to control the child's capabilities: use \"read\" or \"write\" for analyze/research tasks so the child cannot run builds or claim to have run them; \"full\" (default) grants run_command.",
     inputSchema: {
       type: "object",
       properties: {
@@ -242,11 +246,7 @@ export const META_AGENT_TOOL_DEFS: Array<{
         useWorktree: {
           type: "boolean",
           description:
-            "Ignored. Child sessions always run in the SHARED workspace so you (the parent) can read the files they write and synthesize them. A fresh worktree would isolate the child's deliverable where you cannot reach it. Tell the child to save deliverables to the workspace root.",
-        },
-        worktreeId: {
-          type: "string",
-          description: "Ignored. Children run in the shared workspace (see useWorktree).",
+            "Default false. The child otherwise inherits the caller's immutable checkout binding. Set true only to create a fresh project-owned worktree; a non-empty initial prompt is required.",
         },
         toolScope: {
           type: "string",
@@ -268,6 +268,7 @@ export const META_AGENT_TOOL_DEFS: Array<{
           additionalProperties: false,
         },
       },
+      additionalProperties: false,
     },
   },
   {
@@ -325,6 +326,7 @@ export const META_AGENT_TOOL_DEFS: Array<{
           additionalProperties: false,
         },
       },
+      additionalProperties: false,
       required: ["prompt"],
     },
   },

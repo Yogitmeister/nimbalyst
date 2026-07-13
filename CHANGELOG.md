@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- Agent-created sessions can no longer attach to arbitrary worktrees and now inherit only the caller's verified checkout or create a fresh one.
 
 ### Removed
 <!-- Removed features go here -->

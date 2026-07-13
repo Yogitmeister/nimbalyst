@@ -73,7 +73,6 @@ interface CreateChildSessionArgs {
   model?: string;
   prompt?: string;
   useWorktree?: boolean;
-  worktreeId?: string;
   toolScope?: string;
   reasoning?: ReasoningSelection;
   /** Internal provenance used by spawn_session after it resolves inheritance. */
@@ -406,8 +405,12 @@ export class MetaAgentService {
     promotedParent: boolean;
     queuedInitialPrompt: boolean;
   }> {
+    this.assertNoWorktreeAttachmentArgument(args);
     if (!args?.prompt?.trim()) {
       throw new Error('prompt is required');
+    }
+    if (args.useWorktree && !args.autoSubmit) {
+      throw new Error('A fresh worktree requires its initial prompt to be submitted atomically');
     }
 
     const parent = await AISessionsRepository.get(parentSessionId);
@@ -417,14 +420,6 @@ export class MetaAgentService {
 
     const resolved = await this.resolveOrCreateWorkstream(parent, workspaceId);
     const workstreamId = resolved.workstreamId;
-
-    // Meta-agent children ALWAYS run in the parent's working directory (the
-    // shared workspace), never a fresh isolated worktree. The parent synthesizes
-    // by reading each child's written deliverable; a child that writes into its
-    // own worktree leaves the parent unable to find the file. So we ignore the
-    // requested useWorktree and inherit the parent's worktree (the main checkout
-    // for a top-level meta-agent).
-    const inheritedWorktreeId = parent.worktreeId ?? undefined;
 
     // Explicit model wins; otherwise inherit caller's model (e.g. keep "opus"
     // on "opus") rather than dropping to the global default.
@@ -436,8 +431,7 @@ export class MetaAgentService {
     const childResult = await this.createChildSessionInternal(parentSessionId, workspaceId, {
       title: args.title,
       prompt: args.autoSubmit ? args.prompt : undefined,
-      useWorktree: false,
-      worktreeId: inheritedWorktreeId,
+      useWorktree: args.useWorktree === true,
       model: effectiveModel,
       parentSessionIdOverride: workstreamId,
     });
@@ -501,7 +495,7 @@ export class MetaAgentService {
     model: string;
     worktreeId: string | null;
     worktreePath: string | null;
-    worktreeMode: 'existing' | 'new' | 'none';
+    worktreeMode: 'inherited' | 'new' | 'none';
     createdBySessionId: string;
     queuedInitialPrompt: boolean;
     parentSessionId: string | null;
@@ -510,8 +504,9 @@ export class MetaAgentService {
     if (!this.aiService) {
       throw new Error('AI service not initialized');
     }
-    if (args.useWorktree && args.worktreeId) {
-      throw new Error('useWorktree and worktreeId cannot be combined');
+    this.assertNoWorktreeAttachmentArgument(args);
+    if (args.useWorktree && !args.prompt?.trim()) {
+      throw new Error('A fresh worktree requires a non-empty initial prompt');
     }
 
     // Defense-in-depth: a child-completion notification (built in
@@ -530,25 +525,20 @@ export class MetaAgentService {
       );
     }
 
+    const parentSession = await this.getControlledParentSession(metaSessionId, workspaceId);
+
     // Inherit the calling session's provider+model as the primary fallback so a
     // non-Claude parent (Gemini, OpenAI-Codex, LM Studio, etc.) spawning a child
     // via the meta-agent tools without an explicit model does NOT silently land
     // on the hardcoded Opus default and bill the user's Anthropic pool. Only fall
-    // through to getDefaultAIModel() / the last-resort default when the parent
-    // session cannot be loaded (orphan call) or carries no usable provider+model.
+    // through to getDefaultAIModel() / the last-resort default only when the
+    // controlled parent carries no usable provider+model.
     // An explicit args.provider/args.model still wins; that is what they are for.
-    let parentProvider: string | null = null;
-    let parentModel: string | null = null;
-    let parentSession: Awaited<ReturnType<typeof AISessionsRepository.get>> = null;
-    try {
-      parentSession = await AISessionsRepository.get(metaSessionId);
-      if (parentSession) {
-        parentProvider = parentSession.provider ?? null;
-        parentModel = normalizeStoredChildModelIdentifier(parentProvider, parentSession.model ?? null);
-      }
-    } catch {
-      // Best-effort lookup; fall through to the hardcoded default below.
-    }
+    const parentProvider = parentSession.provider ?? null;
+    const parentModel = normalizeStoredChildModelIdentifier(
+      parentProvider,
+      parentSession.model ?? null
+    );
 
     const defaultModel =
       parentModel
@@ -598,58 +588,6 @@ export class MetaAgentService {
     const callerProvidedTitle = !!args.title?.trim();
     const title = (args.title || this.deriveTitleFromPrompt(args.prompt) || 'Meta Task').trim();
 
-    let worktreeId: string | null = null;
-    let worktreePath: string | null = null;
-
-    const db = getDatabase();
-    if ((args.useWorktree || args.worktreeId) && !db) {
-      throw new Error('Database not initialized');
-    }
-    const worktreeStore = db ? createWorktreeStore(db) : null;
-
-    if (args.worktreeId) {
-      if (!worktreeStore) {
-        throw new Error('Worktree store not initialized');
-      }
-
-      const existingWorktree = await worktreeStore.get(args.worktreeId);
-      if (!existingWorktree) {
-        throw new Error(`Worktree ${args.worktreeId} not found`);
-      }
-      if (existingWorktree.projectPath !== workspaceId) {
-        throw new Error(`Worktree ${args.worktreeId} does not belong to this workspace`);
-      }
-      if (existingWorktree.isArchived) {
-        throw new Error(`Worktree ${args.worktreeId} is archived`);
-      }
-
-      worktreeId = existingWorktree.id;
-      worktreePath = existingWorktree.path;
-    } else if (args.useWorktree) {
-      if (!worktreeStore) {
-        throw new Error('Worktree store not initialized');
-      }
-
-      const gitWorktreeService = new GitWorktreeService();
-      const [dbNames, filesystemNames, branchNames] = await Promise.all([
-        worktreeStore.getAllNames(),
-        Promise.resolve(gitWorktreeService.getExistingWorktreeDirectories(workspaceId)),
-        gitWorktreeService.getAllBranchNames(workspaceId),
-      ]);
-      const existingNames = new Set<string>();
-      for (const name of dbNames) existingNames.add(name);
-      for (const name of filesystemNames) existingNames.add(name);
-      for (const name of branchNames) existingNames.add(name);
-      const finalName = gitWorktreeService.generateUniqueWorktreeName(existingNames);
-      const worktree = await gitWorktreeService.createWorktree(workspaceId, { name: finalName });
-      await worktreeStore.create(worktree);
-      gitRefWatcher.start(worktree.path).catch((error: Error) => {
-        console.error('[MetaAgentService] Failed to start GitRefWatcher for meta-agent worktree:', error);
-      });
-      worktreeId = worktree.id;
-      worktreePath = worktree.path;
-    }
-
     // Two independent gates on how many children a parent can spawn:
     //
     //   1. MAX_IN_FLIGHT — the controllable "max parallel" limit. Counts only
@@ -694,6 +632,92 @@ export class MetaAgentService {
       );
     }
 
+    let worktreeId: string | null = null;
+    let worktreePath: string | null = null;
+    let worktreeMode: 'inherited' | 'new' | 'none' = 'none';
+    const needsWorktree = args.useWorktree === true || !!parentSession.worktreeId;
+    const db = getDatabase();
+    if (needsWorktree && !db) {
+      throw new Error('Database not initialized');
+    }
+    const worktreeStore = db ? createWorktreeStore(db) : null;
+    const gitWorktreeService = needsWorktree ? new GitWorktreeService() : null;
+    let freshWorktree: Awaited<ReturnType<GitWorktreeService['createWorktree']>> | null = null;
+    let freshRecordCreated = false;
+
+    if (!args.useWorktree && parentSession.worktreeId) {
+      if (!worktreeStore || !gitWorktreeService) {
+        throw new Error('Worktree services are not initialized');
+      }
+      const inheritedWorktree = await worktreeStore.get(parentSession.worktreeId);
+      if (!inheritedWorktree) {
+        throw new Error(`Caller-bound worktree ${parentSession.worktreeId} was not found`);
+      }
+      if (inheritedWorktree.isArchived) {
+        throw new Error(`Caller-bound worktree ${parentSession.worktreeId} is archived`);
+      }
+      const identity = await gitWorktreeService.verifyWorktreeBinding(
+        workspaceId,
+        inheritedWorktree
+      );
+      worktreeId = inheritedWorktree.id;
+      worktreePath = identity.worktreeRoot;
+      worktreeMode = 'inherited';
+    } else if (args.useWorktree) {
+      if (!worktreeStore || !gitWorktreeService) {
+        throw new Error('Worktree services are not initialized');
+      }
+      try {
+        const [dbNames, filesystemNames, branchNames] = await Promise.all([
+          worktreeStore.getAllNames(),
+          Promise.resolve(gitWorktreeService.getExistingWorktreeDirectories(workspaceId)),
+          gitWorktreeService.getAllBranchNames(workspaceId),
+        ]);
+        const existingNames = new Set<string>();
+        for (const name of dbNames) existingNames.add(name);
+        for (const name of filesystemNames) existingNames.add(name);
+        for (const name of branchNames) existingNames.add(name);
+        const finalName = gitWorktreeService.generateUniqueWorktreeName(existingNames);
+        freshWorktree = await gitWorktreeService.createWorktree(workspaceId, { name: finalName });
+        await worktreeStore.create(freshWorktree);
+        freshRecordCreated = true;
+        const identity = await gitWorktreeService.verifyWorktreeBinding(
+          workspaceId,
+          freshWorktree,
+          { requireProjectHeadMatch: true }
+        );
+        worktreeId = freshWorktree.id;
+        worktreePath = identity.worktreeRoot;
+        worktreeMode = 'new';
+      } catch (error) {
+        const rollbackErrors: string[] = [];
+        if (freshRecordCreated && freshWorktree) {
+          try {
+            await worktreeStore.delete(freshWorktree.id);
+          } catch (rollbackError) {
+            rollbackErrors.push(
+              `record cleanup failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
+            );
+          }
+        }
+        if (freshWorktree) {
+          try {
+            await gitWorktreeService.deleteWorktree(freshWorktree.path, workspaceId);
+          } catch (rollbackError) {
+            rollbackErrors.push(
+              `Git cleanup failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
+            );
+          }
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          rollbackErrors.length > 0
+            ? `${message}; fresh-worktree rollback incomplete: ${rollbackErrors.join('; ')}`
+            : message
+        );
+      }
+    }
+
     // NIM-858: do NOT auto-promote the spawning parent to agent_role='meta-agent'.
     // The renderer META AGENT group is reserved for genuine meta-agents (created
     // via the Meta Agent button, which sets agentRole='meta-agent' at create
@@ -710,44 +734,88 @@ export class MetaAgentService {
     // the block actually fired and wrongly relabeled standard parents.
 
     const sessionId = randomUUID();
-    await AISessionsRepository.create({
-      id: sessionId,
-      provider,
-      model: normalizedModel,
-      title,
-      workspaceId,
-      worktreeId: worktreeId ?? undefined,
-      agentRole: 'standard',
-      createdBySessionId: metaSessionId,
-      parentSessionId: args.parentSessionIdOverride ?? null,
-      // When the meta-agent (or any caller of spawn_session) supplies an
-      // explicit title, treat the session as already named so the out-of-band
-      // SDK title generator (see ClaudeCodeProvider.runTitleGeneration) does
-      // not clobber it via updateTitleIfNotNamed.
-      hasBeenNamed: callerProvidedTitle,
-      ...(Object.keys(reasoningConfig.metadata).length > 0
-        ? { metadata: reasoningConfig.metadata }
-        : {}),
-    } as any);
-
-    // Read-only tool segregation: persist a restricted capability scope so the
-    // child is granted only the matching dev tools at turn time (an analyze
-    // child physically cannot run_command, so it cannot build or claim to).
-    const childToolScope =
-      args.toolScope === 'read' || args.toolScope === 'write' ? args.toolScope : undefined;
-    if (childToolScope) {
-      await AISessionsRepository.updateMetadata(sessionId, { metadata: { toolScope: childToolScope } });
-    }
-
     const initialPrompt = args.prompt?.trim();
     const shouldBypassExecution = this.shouldBypassChildAgentExecutionForTests();
+    let sessionCreated = false;
+    try {
+      await AISessionsRepository.create({
+        id: sessionId,
+        provider,
+        model: normalizedModel,
+        title,
+        workspaceId,
+        worktreeId: worktreeId ?? undefined,
+        agentRole: 'standard',
+        createdBySessionId: metaSessionId,
+        parentSessionId: args.parentSessionIdOverride ?? null,
+        // When the meta-agent (or any caller of spawn_session) supplies an
+        // explicit title, treat the session as already named so the out-of-band
+        // SDK title generator (see ClaudeCodeProvider.runTitleGeneration) does
+        // not clobber it via updateTitleIfNotNamed.
+        hasBeenNamed: callerProvidedTitle,
+        ...(Object.keys(reasoningConfig.metadata).length > 0
+          ? { metadata: reasoningConfig.metadata }
+          : {}),
+      } as any);
+      sessionCreated = true;
 
-    if (initialPrompt) {
-      if (shouldBypassExecution) {
-        await this.persistSyntheticInputMessage(sessionId, initialPrompt);
-      } else {
-        await this.aiService.queuePromptForSession(sessionId, initialPrompt);
+      // Read-only tool segregation: persist a restricted capability scope so the
+      // child is granted only the matching dev tools at turn time (an analyze
+      // child physically cannot run_command, so it cannot build or claim to).
+      const childToolScope =
+        args.toolScope === 'read' || args.toolScope === 'write' ? args.toolScope : undefined;
+      if (childToolScope) {
+        await AISessionsRepository.updateMetadata(sessionId, { metadata: { toolScope: childToolScope } });
       }
+
+      if (initialPrompt) {
+        if (shouldBypassExecution) {
+          await this.persistSyntheticInputMessage(sessionId, initialPrompt);
+        } else {
+          await this.aiService.queuePromptForSession(sessionId, initialPrompt);
+        }
+      }
+    } catch (error) {
+      const rollbackErrors: string[] = [];
+      if (sessionCreated) {
+        try {
+          await AISessionsRepository.delete(sessionId);
+        } catch (rollbackError) {
+          rollbackErrors.push(
+            `session cleanup failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
+          );
+        }
+      }
+      if (freshRecordCreated && freshWorktree && worktreeStore) {
+        try {
+          await worktreeStore.delete(freshWorktree.id);
+        } catch (rollbackError) {
+          rollbackErrors.push(
+            `record cleanup failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
+          );
+        }
+      }
+      if (freshWorktree && gitWorktreeService) {
+        try {
+          await gitWorktreeService.deleteWorktree(freshWorktree.path, workspaceId);
+        } catch (rollbackError) {
+          rollbackErrors.push(
+            `Git cleanup failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
+          );
+        }
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        rollbackErrors.length > 0
+          ? `${message}; child creation rollback incomplete: ${rollbackErrors.join('; ')}`
+          : message
+      );
+    }
+
+    if (freshWorktree) {
+      gitRefWatcher.start(freshWorktree.path).catch((error: Error) => {
+        console.error('[MetaAgentService] Failed to start GitRefWatcher for meta-agent worktree:', error);
+      });
     }
 
     const newChildParentId = args.parentSessionIdOverride ?? null;
@@ -786,7 +854,7 @@ export class MetaAgentService {
       model: normalizedModel,
       worktreeId,
       worktreePath,
-      worktreeMode: args.worktreeId ? 'existing' : args.useWorktree ? 'new' : 'none',
+      worktreeMode,
       createdBySessionId: metaSessionId,
       queuedInitialPrompt: !!initialPrompt,
       parentSessionId: args.parentSessionIdOverride ?? null,
@@ -799,14 +867,12 @@ export class MetaAgentService {
     workspaceId: string,
     args: SpawnSessionArgs
   ): Promise<string> {
+    this.assertNoWorktreeAttachmentArgument(args);
     if (!args?.prompt?.trim()) {
       throw new Error('prompt is required');
     }
 
-    const parent = await AISessionsRepository.get(parentSessionId);
-    if (!parent || parent.workspacePath !== workspaceId) {
-      throw new Error(`Parent session ${parentSessionId} not found in this workspace`);
-    }
+    const parent = await this.getControlledParentSession(parentSessionId, workspaceId);
 
     const isolated = args.isolated === true;
 
@@ -822,14 +888,6 @@ export class MetaAgentService {
       workstreamId = resolved.workstreamId;
       promotedParent = resolved.promotedParent;
     }
-
-    // Inherit the caller's worktree by default. spawn_session means "continue
-    // work in the same checkout I'm in"; without this, a child created from a
-    // worktree-resident parent silently lands in the project root and any edits
-    // it makes go to the wrong tree. Skip inheritance only when the caller
-    // explicitly asked for a brand-new worktree (useWorktree=true).
-    const inheritedWorktreeId =
-      !args.useWorktree && parent.worktreeId ? parent.worktreeId : undefined;
 
     // Resolve effective model: explicit `model` wins; otherwise `inheritModel`
     // copies the caller's model so the new session keeps the same provider/model
@@ -852,7 +910,6 @@ export class MetaAgentService {
       title: args.title,
       prompt: args.prompt,
       useWorktree: !!args.useWorktree,
-      worktreeId: inheritedWorktreeId,
       model: effectiveModel,
       reasoning: effectiveReasoning,
       reasoningSource,
@@ -875,6 +932,33 @@ export class MetaAgentService {
       promotedParent,
       notifyOnComplete,
     }, null, 2);
+  }
+
+  private assertNoWorktreeAttachmentArgument(args: object): void {
+    if (Object.prototype.hasOwnProperty.call(args, 'worktreeId')) {
+      throw new Error(
+        'worktreeId attachment is not supported; inherit the caller binding or create a fresh worktree'
+      );
+    }
+  }
+
+  private async getControlledParentSession(metaSessionId: string, workspaceId: string) {
+    let parentSession: Awaited<ReturnType<typeof AISessionsRepository.get>>;
+    try {
+      parentSession = await AISessionsRepository.get(metaSessionId);
+    } catch (error) {
+      throw new Error(
+        `Cannot establish the parent control route for session ${metaSessionId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+    if (!parentSession || parentSession.workspacePath !== workspaceId) {
+      throw new Error(
+        `Cannot establish the parent control route for session ${metaSessionId} in this workspace`
+      );
+    }
+    return parentSession;
   }
 
   private async setModelControl(

@@ -63,3 +63,56 @@ describe('GitWorktreeService.validateWorkspaceHasCommits', () => {
       .toThrow(/Not a git repository/);
   });
 });
+
+describe('GitWorktreeService.verifyWorktreeBinding', () => {
+  let tmpDir: string;
+  let projectPath: string;
+  const service = new GitWorktreeService();
+  const comparable = (value: string) => {
+    const normalized = path.normalize(value);
+    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  };
+
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nimbalyst-binding-test-'));
+    projectPath = path.join(tmpDir, 'project');
+    fs.mkdirSync(projectPath);
+    const git = simpleGit(projectPath);
+    await git.init();
+    await git.addConfig('user.email', 'test@example.com', false, 'local');
+    await git.addConfig('user.name', 'Test', false, 'local');
+    fs.writeFileSync(path.join(projectPath, 'README.md'), 'binding test');
+    await git.add('README.md');
+    await git.commit('initial');
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // ignore Windows file-lock noise during teardown
+    }
+  });
+
+  it('proves fresh project/worktree roots, Git dirs, branch, and HEAD identity', async () => {
+    const worktree = await service.createWorktree(projectPath, { name: 'binding-child' });
+
+    const identity = await service.verifyWorktreeBinding(projectPath, worktree, {
+      requireProjectHeadMatch: true,
+    });
+
+    expect(comparable(identity.projectRoot)).toBe(comparable(fs.realpathSync(projectPath)));
+    expect(comparable(identity.worktreeRoot)).toBe(comparable(fs.realpathSync(worktree.path)));
+    expect(comparable(identity.gitDir)).not.toBe(comparable(identity.commonDir));
+    expect(identity.branch).toBe(worktree.branch);
+    expect(identity.head).toBe(identity.projectHead);
+  });
+
+  it('rejects a record whose branch no longer matches the registered checkout', async () => {
+    const worktree = await service.createWorktree(projectPath, { name: 'binding-mismatch' });
+
+    await expect(
+      service.verifyWorktreeBinding(projectPath, { ...worktree, branch: 'worktree/not-this-one' })
+    ).rejects.toThrow(/branch mismatch/);
+  });
+});

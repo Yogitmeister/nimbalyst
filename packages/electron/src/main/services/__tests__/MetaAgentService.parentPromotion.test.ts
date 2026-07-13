@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('@nimbalyst/runtime', () => ({
   AISessionsRepository: {
     create: vi.fn(),
+    delete: vi.fn(),
     updateMetadata: vi.fn(),
     get: vi.fn(),
   },
@@ -53,8 +54,12 @@ vi.mock('../ai/providerResolution', () => ({
 
 vi.mock('electron', () => ({
   BrowserWindow: { getAllWindows: () => [] },
+  app: { isPackaged: false, getPath: () => '/tmp' },
 }));
 
+vi.mock('../NotificationService', () => ({
+  notificationService: { showNotificationWithResult: vi.fn() },
+}));
 vi.mock('../SyncManager', () => ({ getSyncProvider: () => ({ pushChange: vi.fn() }) }));
 vi.mock('../../utils/ipcRegistry', () => ({ safeHandle: vi.fn() }));
 vi.mock('../../utils/store', () => ({ getDefaultAIModel: () => null }));
@@ -88,6 +93,7 @@ const STANDARD_PARENT = {
   model: 'claude-code:opus',
   agentRole: 'standard',
   sessionType: 'session',
+  workspacePath: '/workspace/path',
 };
 
 function promotedToMetaAgent(parentId: string): boolean {

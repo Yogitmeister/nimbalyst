@@ -44,6 +44,22 @@ describe('meta-agent reasoning MCP contract', () => {
     expect(getMetaAgentOpenAITools().map((tool) => tool.function.name)).toContain('set_model_control');
   });
 
+  it('publishes fresh-or-inherit worktree authority without an attachment field', () => {
+    const list = META_AGENT_TOOL_DEFS.find((tool) => tool.name === 'list_worktrees');
+    const create = META_AGENT_TOOL_DEFS.find((tool) => tool.name === 'create_session');
+    const spawn = META_AGENT_TOOL_DEFS.find((tool) => tool.name === 'spawn_session');
+
+    expect(create?.inputSchema.properties).not.toHaveProperty('worktreeId');
+    expect(spawn?.inputSchema.properties).not.toHaveProperty('worktreeId');
+    expect(create?.inputSchema.additionalProperties).toBe(false);
+    expect(spawn?.inputSchema.additionalProperties).toBe(false);
+    expect(list?.description).toContain('diagnostic');
+    expect(list?.description).toContain('does not grant authority');
+    expect(create?.description).toContain("inherits the caller's immutable checkout binding");
+    expect(create?.description).toContain('fresh project-owned worktree');
+    expect(create?.description).not.toContain('attach the session');
+  });
+
   it('dispatches the exact prefixed tool name with self-targeting arguments intact', async () => {
     await expect(dispatchMetaAgentTool(
       'mcp__nimbalyst-host__set_model_control',

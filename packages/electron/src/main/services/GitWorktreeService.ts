@@ -125,6 +125,17 @@ export interface WorktreeValidationResult {
   issues: string[];
 }
 
+/** Immutable Git identity proven before a session is bound to a worktree. */
+export interface WorktreeBindingIdentity {
+  projectRoot: string;
+  worktreeRoot: string;
+  gitDir: string;
+  commonDir: string;
+  branch: string;
+  head: string;
+  projectHead: string;
+}
+
 /**
  * Git state information
  */
@@ -141,6 +152,121 @@ export interface GitState {
  * Service for managing git worktrees
  */
 export class GitWorktreeService {
+  /**
+   * Fail closed unless a persisted native worktree still names the exact
+   * registered checkout, branch, repository, and HEAD that Git reports.
+   */
+  async verifyWorktreeBinding(
+    projectPath: string,
+    worktree: Pick<Worktree, 'path' | 'branch' | 'projectPath'>,
+    options?: { requireProjectHeadMatch?: boolean }
+  ): Promise<WorktreeBindingIdentity> {
+    const canonical = async (value: string): Promise<string> =>
+      fs.promises.realpath(path.resolve(value));
+    const comparable = (value: string): string => {
+      const normalized = path.normalize(value);
+      return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+    };
+    const samePath = (left: string, right: string): boolean =>
+      comparable(left) === comparable(right);
+
+    if (!projectPath) {
+      throw new Error('projectPath is required');
+    }
+
+    const [projectRoot, recordedProjectRoot, worktreeRoot] = await Promise.all([
+      canonical(projectPath),
+      canonical(worktree.projectPath),
+      canonical(worktree.path),
+    ]);
+    if (!samePath(projectRoot, recordedProjectRoot)) {
+      throw new Error('Worktree record does not belong to the requested project root');
+    }
+
+    const inspect = async (cwd: string) => {
+      const git = simpleGit(cwd);
+      const [topLevelRaw, gitDirRaw, commonDirRaw, branchRaw, headRaw] = await Promise.all([
+        git.revparse(['--show-toplevel']),
+        git.revparse(['--absolute-git-dir']),
+        git.revparse(['--path-format=absolute', '--git-common-dir']),
+        git.revparse(['--abbrev-ref', 'HEAD']),
+        git.revparse(['HEAD']),
+      ]);
+      const [topLevel, gitDir, commonDir] = await Promise.all([
+        canonical(topLevelRaw.trim()),
+        canonical(gitDirRaw.trim()),
+        canonical(commonDirRaw.trim()),
+      ]);
+      return {
+        topLevel,
+        gitDir,
+        commonDir,
+        branch: branchRaw.trim(),
+        head: headRaw.trim(),
+      };
+    };
+
+    const [projectIdentity, worktreeIdentity] = await Promise.all([
+      inspect(projectRoot),
+      inspect(worktreeRoot),
+    ]);
+    if (!samePath(projectIdentity.topLevel, projectRoot)) {
+      throw new Error('Requested project path is not the canonical Git top-level');
+    }
+    if (!samePath(worktreeIdentity.topLevel, worktreeRoot)) {
+      throw new Error('Worktree record path is not the checkout Git top-level');
+    }
+    if (!samePath(projectIdentity.commonDir, worktreeIdentity.commonDir)) {
+      throw new Error('Worktree does not share the project Git common directory');
+    }
+    if (samePath(worktreeIdentity.gitDir, worktreeIdentity.commonDir)) {
+      throw new Error('Worktree record resolves to the main checkout Git directory');
+    }
+    if (worktreeIdentity.branch !== worktree.branch) {
+      throw new Error(
+        `Worktree branch mismatch: expected ${worktree.branch}, found ${worktreeIdentity.branch}`
+      );
+    }
+    if (options?.requireProjectHeadMatch && worktreeIdentity.head !== projectIdentity.head) {
+      throw new Error('Fresh worktree HEAD does not match the project HEAD');
+    }
+
+    const worktreeList = await simpleGit(projectRoot).raw(['worktree', 'list', '--porcelain']);
+    const registrations = worktreeList
+      .split(/\r?\n\r?\n/)
+      .map((block) => {
+        const fields = new Map<string, string>();
+        for (const line of block.split(/\r?\n/)) {
+          const separator = line.indexOf(' ');
+          if (separator > 0) fields.set(line.slice(0, separator), line.slice(separator + 1));
+        }
+        return fields;
+      });
+    const registration = registrations.find((entry) => {
+      const registeredPath = entry.get('worktree');
+      return registeredPath ? samePath(path.resolve(registeredPath), worktreeRoot) : false;
+    });
+    if (!registration) {
+      throw new Error('Worktree is not registered in the project');
+    }
+    if (registration.get('HEAD') !== worktreeIdentity.head) {
+      throw new Error('Registered worktree HEAD does not match the checkout HEAD');
+    }
+    if (registration.get('branch') !== `refs/heads/${worktree.branch}`) {
+      throw new Error('Registered worktree branch does not match the worktree record');
+    }
+
+    return {
+      projectRoot,
+      worktreeRoot,
+      gitDir: worktreeIdentity.gitDir,
+      commonDir: worktreeIdentity.commonDir,
+      branch: worktreeIdentity.branch,
+      head: worktreeIdentity.head,
+      projectHead: projectIdentity.head,
+    };
+  }
+
   /**
    * Validate that a worktree is in a healthy state.
    *

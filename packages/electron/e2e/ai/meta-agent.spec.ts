@@ -189,7 +189,7 @@ type CreateSessionToolResult = {
   title: string;
   worktreeId?: string | null;
   worktreePath?: string | null;
-  worktreeMode?: 'new' | 'existing' | 'none';
+  worktreeMode?: 'new' | 'inherited' | 'none';
 };
 
 type WorktreeSummary = {
@@ -209,14 +209,12 @@ async function createChildSessionWithMetaAgent(
   overrides: Partial<{
     title: string;
     useWorktree: boolean;
-    worktreeId: string;
   }> = {}
 ): Promise<CreateSessionToolResult> {
   return await callMetaAgentTool<CreateSessionToolResult>(metaAgentClient, 'create_session', {
     title: overrides.title ?? 'Delegated parser task',
     prompt,
     useWorktree: overrides.useWorktree ?? false,
-    ...(overrides.worktreeId ? { worktreeId: overrides.worktreeId } : {}),
   });
 }
 
@@ -464,7 +462,7 @@ test('respond_to_prompt resolves child AskUserQuestion prompts when a real waite
   expect(pendingPrompts.prompts).toHaveLength(0);
 });
 
-test('creates worktree-backed child sessions and can attach new child sessions to an existing worktree', async () => {
+test('creates fresh worktree children, rejects attachment, and preserves caller inheritance', async () => {
   const worktreeChild = await createChildSessionWithMetaAgent('Implement parser worktree flow', {
     title: 'Worktree parser task',
     useWorktree: true,
@@ -495,33 +493,61 @@ test('creates worktree-backed child sessions and can attach new child sessions t
   expect(createdWorktree?.branch).toContain('worktree/');
   expect(createdWorktree?.sessionCount).toBeGreaterThanOrEqual(1);
 
-  const attachedChild = await createChildSessionWithMetaAgent('Continue parser work in existing worktree', {
-    title: 'Existing worktree follow-up',
-    worktreeId: worktreeChild.worktreeId!,
-  });
-  expect(attachedChild.worktreeMode).toBe('existing');
-  expect(attachedChild.worktreeId).toBe(worktreeChild.worktreeId);
-  expect(attachedChild.worktreePath).toBe(worktreeChild.worktreePath);
-
-  const spawnedSessions = await callMetaAgentTool<Array<{ sessionId: string; worktreeId: string | null }>>(
+  const beforeRejectedAttach = await callMetaAgentTool<Array<{ sessionId: string; worktreeId: string | null }>>(
     metaAgentClient,
     'list_spawned_sessions',
     {}
   );
-  const matchingSessions = spawnedSessions.filter(
-    (session) => session.worktreeId === worktreeChild.worktreeId
+  await expect(
+    callMetaAgentTool(metaAgentClient, 'create_session', {
+      title: 'Forbidden attachment',
+      prompt: 'Do not create this child',
+      worktreeId: worktreeChild.worktreeId,
+    })
+  ).rejects.toThrow(/worktreeId|additional properties|not supported/i);
+  const afterRejectedAttach = await callMetaAgentTool<Array<{ sessionId: string; worktreeId: string | null }>>(
+    metaAgentClient,
+    'list_spawned_sessions',
+    {}
   );
-  expect(matchingSessions.map((session) => session.sessionId)).toEqual(
-    expect.arrayContaining([worktreeChild.sessionId, attachedChild.sessionId])
+  expect(afterRejectedAttach.map((session) => session.sessionId)).toEqual(
+    beforeRejectedAttach.map((session) => session.sessionId)
   );
 
-  const afterAttachWorktrees = await callMetaAgentTool<WorktreeSummary[]>(
+  const originalMetaSessionId = metaSessionId;
+  await reconnectMetaAgentClient(worktreeChild.sessionId);
+  const inheritedChild = await createChildSessionWithMetaAgent('Continue in the caller-bound worktree', {
+    title: 'Caller-bound follow-up',
+  });
+  expect(inheritedChild.worktreeMode).toBe('inherited');
+  expect(inheritedChild.worktreeId).toBe(worktreeChild.worktreeId);
+  expect(inheritedChild.worktreePath).toBe(worktreeChild.worktreePath);
+
+  const inheritedSpawned = await callMetaAgentTool<Array<{ sessionId: string; worktreeId: string | null }>>(
+    metaAgentClient,
+    'list_spawned_sessions',
+    {}
+  );
+  expect(inheritedSpawned).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        sessionId: inheritedChild.sessionId,
+        worktreeId: worktreeChild.worktreeId,
+      }),
+    ])
+  );
+
+  const afterInheritanceWorktrees = await callMetaAgentTool<WorktreeSummary[]>(
     metaAgentClient,
     'list_worktrees',
     {}
   );
-  const updatedWorktree = afterAttachWorktrees.find((worktree) => worktree.id === worktreeChild.worktreeId);
+  const updatedWorktree = afterInheritanceWorktrees.find(
+    (worktree) => worktree.id === worktreeChild.worktreeId
+  );
   expect(updatedWorktree?.sessionCount).toBeGreaterThanOrEqual(2);
+
+  await reconnectMetaAgentClient(originalMetaSessionId);
 });
 
 // =========================================================================
@@ -746,13 +772,29 @@ test('get_session_status returns error for non-existent session', async () => {
   ).rejects.toThrow(/not found/i);
 });
 
-test('create_session rejects conflicting useWorktree and worktreeId', async () => {
+test('create_session schema omits worktreeId and runtime rejects it without mutation', async () => {
+  const listedTools = await metaAgentClient.client.listTools();
+  const createSessionTool = listedTools.tools.find((tool) => tool.name === 'create_session');
+  expect(createSessionTool?.inputSchema.properties).not.toHaveProperty('worktreeId');
+
+  const before = await callMetaAgentTool<Array<{ sessionId: string }>>(
+    metaAgentClient,
+    'list_spawned_sessions',
+    {}
+  );
   await expect(
     callMetaAgentTool(metaAgentClient, 'create_session', {
-      title: 'Conflicting worktree args',
+      title: 'Forbidden worktree attachment',
       prompt: 'test',
-      useWorktree: true,
       worktreeId: 'some-worktree-id',
     })
-  ).rejects.toThrow(/cannot be combined/i);
+  ).rejects.toThrow(/worktreeId|additional properties|not supported/i);
+  const after = await callMetaAgentTool<Array<{ sessionId: string }>>(
+    metaAgentClient,
+    'list_spawned_sessions',
+    {}
+  );
+  expect(after.map((session) => session.sessionId)).toEqual(
+    before.map((session) => session.sessionId)
+  );
 });

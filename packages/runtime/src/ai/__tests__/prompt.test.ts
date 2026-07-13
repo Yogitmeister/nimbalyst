@@ -91,3 +91,15 @@ describe('extension agent self-identification (gemini)', () => {
     expect(prompt).toContain('gemini-3-flash-agent');
   });
 });
+
+describe('meta-agent worktree authority prompt', () => {
+  it('allows only fresh creation or caller-bound inheritance', () => {
+    const prompt = buildMetaAgentSystemPrompt('codex');
+
+    expect(prompt).toContain('diagnostics only');
+    expect(prompt).toContain("caller's immutable checkout binding");
+    expect(prompt).toContain('freshly created worktree');
+    expect(prompt).toContain('Never select, attach, adopt, or rebind');
+    expect(prompt).not.toContain('whether to use a fresh or existing worktree');
+  });
+});

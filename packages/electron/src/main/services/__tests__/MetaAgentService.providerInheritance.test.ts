@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('@nimbalyst/runtime', () => ({
   AISessionsRepository: {
     create: vi.fn(),
+    delete: vi.fn(),
     updateMetadata: vi.fn(),
     get: vi.fn(),
   },
@@ -111,6 +112,7 @@ const GEMINI_PARENT = {
   id: 'parent-gemini-session',
   provider: 'antigravity-gemini-agent',
   model: 'antigravity-gemini-agent:gemini-flash-3.5',
+  workspacePath: '/workspace/path',
 };
 
 const CLAUDE_PARENT = {
@@ -258,20 +260,16 @@ describe('MetaAgentService child-spawn provider inheritance', () => {
     ).rejects.toThrow('Unsupported Claude Agent model');
   });
 
-  it('falls back to the hardcoded default for a genuine orphan call (no parent session found)', async () => {
+  it('rejects a child when the parent control route cannot be established', async () => {
     const service = MetaAgentService.getInstance();
     (service as any).aiService = { queuePromptForSession: vi.fn() };
     vi.mocked(AISessionsRepository.get).mockResolvedValue(null as any);
 
-    await (service as any).createChildSessionInternal('orphan-session', '/workspace/path', {});
+    await expect(
+      (service as any).createChildSessionInternal('orphan-session', '/workspace/path', {})
+    ).rejects.toThrow(/parent control route/);
 
-    const created = vi.mocked(AISessionsRepository.create).mock.calls[0][0] as any;
-    // With no parent and getDefaultAIModel() null, the child falls back to the
-    // claude-code provider's default (stored as normalizedModel via
-    // ModelIdentifier.getDefaultModelId('claude-code')). The invariant that
-    // matters: an orphan call still resolves to claude-code, unchanged by the fix.
-    expect(created.provider).toBe('claude-code');
-    expect(created.model).toMatch(/^claude-code:/);
+    expect(AISessionsRepository.create).not.toHaveBeenCalled();
   });
 
   it('inherits the gemini MODEL via args.model from a gemini parent (spawn_session inheritModel path)', async () => {
