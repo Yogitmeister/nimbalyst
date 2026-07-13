@@ -3,6 +3,15 @@ import { BrowserWindow } from 'electron';
 import { randomUUID } from 'crypto';
 import { safeHandle } from '../utils/ipcRegistry';
 import { SessionManager } from '@nimbalyst/runtime/ai/server';
+import { defaultEffortForPolicy } from '@nimbalyst/runtime/ai/server/reasoningPolicy';
+import {
+  reasoningCapabilitiesForModel,
+  reasoningSelectionToMetadata,
+  validateReasoningSelection,
+  type ReasoningCapabilities,
+  type ReasoningSelection,
+  type NormalizedReasoningSelection,
+} from '@nimbalyst/runtime/ai/server/providers/claudeCode/reasoning';
 import type { AIProviderType } from '@nimbalyst/runtime/ai/server/types';
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
 import { AISessionsRepository, AgentMessagesRepository, SessionFilesRepository } from '@nimbalyst/runtime';
@@ -66,6 +75,9 @@ interface CreateChildSessionArgs {
   useWorktree?: boolean;
   worktreeId?: string;
   toolScope?: string;
+  reasoning?: ReasoningSelection;
+  /** Internal provenance used by spawn_session after it resolves inheritance. */
+  reasoningSource?: 'explicit' | 'inherited' | 'default';
 }
 
 function normalizeStoredChildModelIdentifier(
@@ -92,6 +104,7 @@ interface SpawnSessionArgs {
   prompt: string;
   useWorktree?: boolean;
   model?: string;
+  reasoning?: ReasoningSelection;
   /**
    * When true and `model` is not explicitly set, the new session uses the
    * caller's model instead of the global app default. Ignored if `model` is
@@ -112,6 +125,107 @@ interface SpawnSessionArgs {
    * caller's workstream.
    */
   isolated?: boolean;
+}
+
+interface SetModelControlArgs {
+  sessionId?: string;
+  reasoning?: ReasoningSelection;
+  model?: string;
+}
+
+type ReasoningConfigSource = 'explicit' | 'inherited' | 'default';
+
+interface ResolvedReasoningConfig {
+  metadata: Record<string, unknown>;
+  requested: ReasoningSelection | null;
+  normalized: NormalizedReasoningSelection;
+  capabilities: ReasoningCapabilities;
+  source: ReasoningConfigSource;
+  concreteEffort?: string;
+}
+
+function reasoningSelectionFromStored(value: unknown): ReasoningSelection | null {
+  const metadata = value && typeof value === 'object'
+    ? value as Record<string, unknown>
+    : {};
+  const effortPolicy = metadata.effortPolicy === 'auto' || metadata.effortPolicy === 'auto-plus'
+    ? metadata.effortPolicy
+    : 'fixed';
+  const selection: ReasoningSelection = { effortPolicy };
+  if (effortPolicy === 'fixed' && typeof metadata.effortLevel === 'string') {
+    selection.effort = metadata.effortLevel;
+  }
+  if (typeof metadata.reasoningMode === 'string') selection.mode = metadata.reasoningMode;
+  if (
+    metadata.reasoningThinking === 'provider-default'
+    || metadata.reasoningThinking === 'enabled'
+    || metadata.reasoningThinking === 'disabled'
+  ) {
+    selection.thinking = metadata.reasoningThinking;
+  }
+  if (typeof metadata.reasoningBudgetTokens === 'number') {
+    selection.budgetTokens = metadata.reasoningBudgetTokens;
+  }
+  return Object.keys(metadata).some((key) => [
+    'effortLevel',
+    'effortPolicy',
+    'reasoningMode',
+    'reasoningThinking',
+    'reasoningBudgetTokens',
+  ].includes(key)) ? selection : null;
+}
+
+function resolveReasoningConfig(params: {
+  provider: string;
+  model: string;
+  customBackendId?: string | null;
+  selection?: ReasoningSelection;
+  source?: ReasoningConfigSource;
+}): ResolvedReasoningConfig {
+  const capabilities = reasoningCapabilitiesForModel(
+    params.provider,
+    params.model,
+    params.customBackendId,
+  );
+  const source = params.source ?? (params.selection ? 'explicit' : 'default');
+  const requested = params.selection ?? {};
+  const validation = validateReasoningSelection(requested, capabilities);
+  if (!validation.ok) throw new Error(validation.error);
+  const normalized = validation.normalized;
+  const metadata = reasoningSelectionToMetadata(normalized, capabilities);
+  const concreteEffort = normalized.effortPolicy === 'fixed'
+    ? normalized.effort
+    : defaultEffortForPolicy(normalized.effortPolicy, capabilities);
+  return {
+    metadata,
+    requested: params.selection ?? null,
+    normalized,
+    capabilities,
+    source,
+    concreteEffort,
+  };
+}
+
+function buildResolvedExecutionConfig(
+  provider: string,
+  model: string,
+  reasoning: ResolvedReasoningConfig,
+): Record<string, unknown> {
+  return {
+    provider,
+    model,
+    reasoning: {
+      thinking: reasoning.normalized.thinking ?? null,
+      mode: reasoning.normalized.mode ?? null,
+      effortPolicy: reasoning.normalized.effortPolicy,
+      effort: reasoning.concreteEffort ?? null,
+      selectedEffort: reasoning.normalized.effort ?? null,
+      budgetTokens: reasoning.normalized.budgetTokens ?? null,
+      source: reasoning.source,
+    },
+    capabilities: reasoning.capabilities,
+    effectiveFrom: 'next-turn',
+  };
 }
 
 interface SendPromptOptions {
@@ -195,6 +309,8 @@ export class MetaAgentService {
           this.createChildSession(metaSessionId, workspaceId, args),
         spawnSession: (callerSessionId, workspaceId, args) =>
           this.spawnSession(callerSessionId, workspaceId, args),
+        setModelControl: (callerSessionId, workspaceId, args) =>
+          this.setModelControl(callerSessionId, workspaceId, args),
         getSessionStatus: (_metaSessionId, workspaceId, targetSessionId) =>
           this.getSessionStatusJson(targetSessionId, workspaceId),
         getSessionResult: (_metaSessionId, workspaceId, targetSessionId) =>
@@ -389,6 +505,7 @@ export class MetaAgentService {
     createdBySessionId: string;
     queuedInitialPrompt: boolean;
     parentSessionId: string | null;
+    resolvedExecutionConfig: Record<string, unknown>;
   }> {
     if (!this.aiService) {
       throw new Error('AI service not initialized');
@@ -422,8 +539,9 @@ export class MetaAgentService {
     // An explicit args.provider/args.model still wins; that is what they are for.
     let parentProvider: string | null = null;
     let parentModel: string | null = null;
+    let parentSession: Awaited<ReturnType<typeof AISessionsRepository.get>> = null;
     try {
-      const parentSession = await AISessionsRepository.get(metaSessionId);
+      parentSession = await AISessionsRepository.get(metaSessionId);
       if (parentSession) {
         parentProvider = parentSession.provider ?? null;
         parentModel = normalizeStoredChildModelIdentifier(parentProvider, parentSession.model ?? null);
@@ -464,6 +582,18 @@ export class MetaAgentService {
       explicitModel
       || (parentModel && parentModelProvider === provider ? parentModel : null)
       || ModelIdentifier.getDefaultModelId(provider);
+
+    const reasoningConfig = resolveReasoningConfig({
+      provider,
+      model: normalizedModel,
+      selection: args.reasoning,
+      source: args.reasoningSource,
+    });
+    const resolvedExecutionConfig = buildResolvedExecutionConfig(
+      provider,
+      normalizedModel,
+      reasoningConfig,
+    );
 
     const callerProvidedTitle = !!args.title?.trim();
     const title = (args.title || this.deriveTitleFromPrompt(args.prompt) || 'Meta Task').trim();
@@ -595,6 +725,9 @@ export class MetaAgentService {
       // SDK title generator (see ClaudeCodeProvider.runTitleGeneration) does
       // not clobber it via updateTitleIfNotNamed.
       hasBeenNamed: callerProvidedTitle,
+      ...(Object.keys(reasoningConfig.metadata).length > 0
+        ? { metadata: reasoningConfig.metadata }
+        : {}),
     } as any);
 
     // Read-only tool segregation: persist a restricted capability scope so the
@@ -657,6 +790,7 @@ export class MetaAgentService {
       createdBySessionId: metaSessionId,
       queuedInitialPrompt: !!initialPrompt,
       parentSessionId: args.parentSessionIdOverride ?? null,
+      resolvedExecutionConfig,
     };
   }
 
@@ -703,6 +837,16 @@ export class MetaAgentService {
     // createChildSessionInternal use the global default.
     const effectiveModel =
       args.model ?? (args.inheritModel ? parent.model ?? undefined : undefined);
+    const parentStoredReasoning = reasoningSelectionFromStored(
+      parent.metadata,
+    );
+    const effectiveReasoning = args.reasoning
+      ?? (args.inheritModel ? parentStoredReasoning ?? undefined : undefined);
+    const reasoningSource: ReasoningConfigSource = args.reasoning
+      ? 'explicit'
+      : effectiveReasoning
+        ? 'inherited'
+        : 'default';
 
     const childResult = await this.createChildSessionInternal(parentSessionId, workspaceId, {
       title: args.title,
@@ -710,6 +854,8 @@ export class MetaAgentService {
       useWorktree: !!args.useWorktree,
       worktreeId: inheritedWorktreeId,
       model: effectiveModel,
+      reasoning: effectiveReasoning,
+      reasoningSource,
       parentSessionIdOverride: workstreamId,
     });
 
@@ -728,6 +874,90 @@ export class MetaAgentService {
       workstreamId,
       promotedParent,
       notifyOnComplete,
+    }, null, 2);
+  }
+
+  private async setModelControl(
+    callerSessionId: string,
+    workspaceId: string,
+    args: SetModelControlArgs,
+  ): Promise<string> {
+    if (args.model !== undefined) {
+      throw new Error(
+        'set_model_control v1 is reasoning-only; model changes are not applied. Omit model and pass reasoning.',
+      );
+    }
+    if (!args.reasoning) {
+      throw new Error('reasoning is required');
+    }
+
+    const caller = await AISessionsRepository.get(callerSessionId);
+    if (!caller || caller.workspacePath !== workspaceId) {
+      throw new Error(`Caller session ${callerSessionId} not found in this workspace`);
+    }
+    const targetSessionId = args.sessionId ?? callerSessionId;
+    const target = targetSessionId === callerSessionId
+      ? caller
+      : await AISessionsRepository.get(targetSessionId);
+    if (!target || target.workspacePath !== workspaceId) {
+      throw new Error(`Session ${targetSessionId} not found in this workspace`);
+    }
+    if (
+      targetSessionId !== callerSessionId
+      && target.createdBySessionId !== callerSessionId
+    ) {
+      throw new Error(
+        `Session ${callerSessionId} may only change its own reasoning control or a session it created.`,
+      );
+    }
+
+    const model = target.model ?? ModelIdentifier.getDefaultModelId(target.provider as AIProviderType);
+    const customBackendId = (
+      target.metadata as Record<string, unknown> | undefined
+    )?.claudeBackend as string | undefined;
+    const storedSelection = reasoningSelectionFromStored(target.metadata) ?? {};
+    const mergedSelection: ReasoningSelection = {
+      ...storedSelection,
+      ...args.reasoning,
+    };
+    // Auto policies own the effort for each turn. Do not accidentally carry a
+    // previously fixed effort into the atomic selection when only the policy
+    // changes; provider reasoning mode remains independent and is preserved.
+    if (
+      (args.reasoning.effortPolicy === 'auto' || args.reasoning.effortPolicy === 'auto-plus')
+      && args.reasoning.effort === undefined
+    ) {
+      delete mergedSelection.effort;
+    }
+    const reasoningConfig = resolveReasoningConfig({
+      provider: target.provider,
+      model,
+      customBackendId,
+      selection: mergedSelection,
+      source: 'explicit',
+    });
+    if (!reasoningConfig.capabilities.effort) {
+      throw new Error(
+        `Model '${model}' does not expose a reasoning effort control.`,
+      );
+    }
+
+    const metadataUpdate = reasoningConfig.metadata;
+    await AISessionsRepository.updateMetadata(targetSessionId, { metadata: metadataUpdate });
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+        window.webContents.send('sessions:session-updated', targetSessionId, metadataUpdate);
+      }
+    }
+
+    return JSON.stringify({
+      sessionId: targetSessionId,
+      requested: args.reasoning,
+      resolved: buildResolvedExecutionConfig(target.provider, model, reasoningConfig),
+      capabilities: reasoningConfig.capabilities,
+      effectiveFrom: 'next-turn',
+      requiresRestart: false,
+      warnings: [],
     }, null, 2);
   }
 

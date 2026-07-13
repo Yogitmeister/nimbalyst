@@ -20,14 +20,11 @@ import {
 } from '../../effortLevels';
 import { resolveClaudeCodeBackend } from './customBackends';
 
-/**
- * 'fixed'     — a concrete effort level is pinned (today's behavior).
- * 'auto'      — host-side per-turn policy picks the effort (defaults high).
- * 'auto-plus' — auto biased one level hotter ("sports mode").
- */
-export type ReasoningMode = 'fixed' | 'auto' | 'auto-plus';
+/** Nimbalyst's effort-selection policy; independent of provider reasoning mode. */
+export type EffortPolicy = 'fixed' | 'auto' | 'auto-plus';
+export type ReasoningThinking = 'provider-default' | 'enabled' | 'disabled';
 
-export const REASONING_MODES: readonly ReasoningMode[] = ['fixed', 'auto', 'auto-plus'];
+export const EFFORT_POLICIES: readonly EffortPolicy[] = ['fixed', 'auto', 'auto-plus'];
 
 export interface ReasoningCapabilities {
   /** Backend-declared effort vocabulary, ascending. Never assumed to be Claude's ladder. */
@@ -36,20 +33,48 @@ export interface ReasoningCapabilities {
     default: string;
     labels?: Readonly<Record<string, string>>;
   };
-  /** Policy modes available for this model (requires an effort axis). */
-  modes: readonly ReasoningMode[];
+  /** Provider-native reasoning modes, e.g. GPT-5.6 standard|pro. */
+  mode?: {
+    values: readonly string[];
+    default: string;
+  };
+  /** Provider-native thinking toggle. Omitted when the transport cannot drive it. */
+  thinking?: {
+    values: readonly ReasoningThinking[];
+    default: ReasoningThinking;
+  };
+  /** Provider-native reasoning budget. Omitted when the transport cannot drive it. */
+  budgetTokens?: {
+    min: number;
+    max: number;
+    default: number;
+  };
+  /** Host-side effort policies available for this model. */
+  effortPolicies: readonly EffortPolicy[];
 }
 
 /** Atomic selection — validated as a whole against ReasoningCapabilities. */
 export interface ReasoningSelection {
-  /** Concrete effort value from the model's declared vocabulary (fixed mode). */
+  thinking?: ReasoningThinking;
+  /** Provider-native reasoning mode. This is never fixed/auto/auto-plus. */
+  mode?: string;
+  /** Concrete effort value from the model's declared vocabulary. */
   effort?: string;
-  /** Selection mode; omitted means 'fixed'. */
-  mode?: ReasoningMode;
+  /** Host-side effort policy; omitted means fixed. */
+  effortPolicy?: EffortPolicy;
+  budgetTokens?: number;
+}
+
+export interface NormalizedReasoningSelection {
+  thinking?: ReasoningThinking;
+  mode?: string;
+  effort?: string;
+  effortPolicy: EffortPolicy;
+  budgetTokens?: number;
 }
 
 export type ReasoningValidation =
-  | { ok: true; normalized: { mode: ReasoningMode; effort?: string } }
+  | { ok: true; normalized: NormalizedReasoningSelection }
   | { ok: false; error: string };
 
 /**
@@ -62,30 +87,33 @@ export function reasoningCapabilitiesForModel(
   modelId: string | undefined | null,
   customBackendId?: string | undefined | null
 ): ReasoningCapabilities {
-  const backend = resolveClaudeCodeBackend(customBackendId ?? undefined);
-  if (backend?.effortValues && backend.effortValues.length > 0) {
-    return {
-      effort: {
-        values: backend.effortValues,
-        default: backend.effortValues.includes(DEFAULT_EFFORT_LEVEL)
-          ? DEFAULT_EFFORT_LEVEL
-          : backend.effortValues[backend.effortValues.length - 1],
-      },
-      modes: REASONING_MODES,
-    };
+  if (provider !== 'claude-code' && provider !== 'openai-codex') {
+    return { effortPolicies: ['fixed'] };
   }
 
-  const supported = supportedEffortLevelsForModel(modelId ?? undefined);
-  if (supported.length === 0) {
-    return { modes: ['fixed'] };
+  const backend = resolveClaudeCodeBackend(customBackendId ?? undefined);
+  if (customBackendId && !backend) {
+    throw new Error(
+      `Claude Agent backend '${customBackendId}' is stale or invalid. Select a current backend before changing reasoning controls.`
+    );
   }
+  const supportedValues = backend?.effortValues?.length
+    ? backend.effortValues
+    : supportedEffortLevelsForModel(modelId ?? undefined).map((l) => l.key);
+  if (supportedValues.length === 0) return { effortPolicies: ['fixed'] };
+
   return {
     effort: {
-      values: supported.map((l) => l.key),
-      default: DEFAULT_EFFORT_LEVEL,
-      ...(supported.some((l) => l.key === 'ultra') ? { labels: { ultra: 'Pro' } } : {}),
+      values: supportedValues,
+      default: supportedValues.includes(DEFAULT_EFFORT_LEVEL)
+        ? DEFAULT_EFFORT_LEVEL
+        : supportedValues[supportedValues.length - 1],
     },
-    modes: REASONING_MODES,
+    // Today's transports keep thinking on their provider default. Advertising
+    // only that neutral value makes the public shape transport-aware without
+    // pretending enabled/disabled is drivable.
+    thinking: { values: ['provider-default'], default: 'provider-default' },
+    effortPolicies: EFFORT_POLICIES,
   };
 }
 
@@ -98,49 +126,94 @@ export function validateReasoningSelection(
   selection: ReasoningSelection,
   capabilities: ReasoningCapabilities
 ): ReasoningValidation {
-  const mode: ReasoningMode = selection.mode ?? 'fixed';
-
-  if (!REASONING_MODES.includes(mode)) {
-    return { ok: false, error: `Unknown reasoning mode '${selection.mode}'. Valid modes: ${REASONING_MODES.join(', ')}.` };
+  const allowedKeys = new Set(['thinking', 'mode', 'effort', 'effortPolicy', 'budgetTokens']);
+  const unknownKey = Object.keys(selection as Record<string, unknown>).find((key) => !allowedKeys.has(key));
+  if (unknownKey) {
+    return { ok: false, error: `Unknown reasoning field '${unknownKey}'; the selection was not applied.` };
   }
-  if (!capabilities.modes.includes(mode)) {
-    return { ok: false, error: `Reasoning mode '${mode}' is not supported for this model (supported: ${capabilities.modes.join(', ')}).` };
+  const effortPolicy: EffortPolicy = selection.effortPolicy ?? 'fixed';
+  if (!EFFORT_POLICIES.includes(effortPolicy)) {
+    return { ok: false, error: `Unknown effort policy '${selection.effortPolicy}'. Valid policies: ${EFFORT_POLICIES.join(', ')}.` };
+  }
+  if (!capabilities.effortPolicies.includes(effortPolicy)) {
+    return { ok: false, error: `Effort policy '${effortPolicy}' is not supported for this model.` };
   }
 
-  if (mode === 'auto' || mode === 'auto-plus') {
+  let mode: string | undefined;
+  if (selection.mode !== undefined) {
+    if (!capabilities.mode?.values.includes(selection.mode)) {
+      return {
+        ok: false,
+        error: `Provider reasoning mode '${selection.mode}' is not supported for this model (supported: ${capabilities.mode?.values.join(', ') || 'none'}).`,
+      };
+    }
+    mode = selection.mode;
+  } else {
+    mode = capabilities.mode?.default;
+  }
+
+  let thinking: ReasoningThinking | undefined;
+  if (selection.thinking !== undefined) {
+    if (!capabilities.thinking?.values.includes(selection.thinking)) {
+      return { ok: false, error: `Thinking '${selection.thinking}' is not supported by this transport.` };
+    }
+    thinking = selection.thinking;
+  } else {
+    thinking = capabilities.thinking?.default;
+  }
+
+  let budgetTokens: number | undefined;
+  if (selection.budgetTokens !== undefined) {
+    const budget = capabilities.budgetTokens;
+    if (!budget) return { ok: false, error: 'This model/transport does not expose a reasoning token budget.' };
+    if (!Number.isInteger(selection.budgetTokens) || selection.budgetTokens < budget.min || selection.budgetTokens > budget.max) {
+      return { ok: false, error: `budgetTokens must be an integer from ${budget.min} to ${budget.max}.` };
+    }
+    budgetTokens = selection.budgetTokens;
+  } else {
+    budgetTokens = capabilities.budgetTokens?.default;
+  }
+
+  if (effortPolicy === 'auto' || effortPolicy === 'auto-plus') {
     if (selection.effort !== undefined) {
       return {
         ok: false,
-        error: `Mode '${mode}' resolves effort per turn — do not pass a fixed 'effort' alongside it. Use mode 'fixed' with an effort value instead.`,
+        error: `Effort policy '${effortPolicy}' resolves effort per turn — do not pass a fixed 'effort' alongside it. Use effortPolicy 'fixed' instead.`,
       };
     }
     if (!capabilities.effort) {
-      return { ok: false, error: `Mode '${mode}' requires a model with an effort ladder; this model declares none.` };
+      return { ok: false, error: `Effort policy '${effortPolicy}' requires a model with an effort ladder; this model declares none.` };
     }
-    return { ok: true, normalized: { mode } };
+    return { ok: true, normalized: { effortPolicy, ...(mode && { mode }), ...(thinking && { thinking }), ...(budgetTokens !== undefined && { budgetTokens }) } };
   }
 
-  // fixed mode
-  if (selection.effort === undefined) {
-    return { ok: false, error: `Mode 'fixed' requires an 'effort' value (one of: ${capabilities.effort?.values.join(', ') ?? 'none available'}).` };
+  const effort = selection.effort ?? capabilities.effort?.default;
+  if (effort === undefined && !capabilities.effort) {
+    return { ok: true, normalized: { effortPolicy: 'fixed', ...(mode && { mode }), ...(thinking && { thinking }), ...(budgetTokens !== undefined && { budgetTokens }) } };
   }
   if (!capabilities.effort) {
     return { ok: false, error: 'This model declares no effort ladder; reasoning effort cannot be set for it.' };
   }
-  if (!capabilities.effort.values.includes(selection.effort)) {
+  if (!capabilities.effort.values.includes(effort as string)) {
     return {
       ok: false,
-      error: `Effort '${selection.effort}' is not supported for this model. Supported values: ${capabilities.effort.values.join(', ')}.`,
+      error: `Effort '${effort}' is not supported for this model. Supported values: ${capabilities.effort.values.join(', ')}.`,
     };
   }
-  return { ok: true, normalized: { mode: 'fixed', effort: selection.effort } };
+  return { ok: true, normalized: { effortPolicy: 'fixed', effort, ...(mode && { mode }), ...(thinking && { thinking }), ...(budgetTokens !== undefined && { budgetTokens }) } };
 }
 
-/** The metadata.effortLevel value a normalized selection persists as. */
-export function reasoningSelectionToStoredEffort(normalized: {
-  mode: ReasoningMode;
-  effort?: string;
-}): string {
-  if (normalized.mode === 'auto' || normalized.mode === 'auto-plus') return normalized.mode;
-  return normalized.effort as EffortLevel;
+/** Flat metadata fields for the orthogonal provider-mode / effort-policy axes. */
+export function reasoningSelectionToMetadata(
+  normalized: NormalizedReasoningSelection,
+  capabilities: ReasoningCapabilities,
+): Record<string, unknown> {
+  const storedEffort = normalized.effort ?? capabilities.effort?.default;
+  return {
+    ...(storedEffort && { effortLevel: storedEffort as EffortLevel }),
+    effortPolicy: normalized.effortPolicy,
+    ...(normalized.mode && { reasoningMode: normalized.mode }),
+    ...(normalized.thinking && { reasoningThinking: normalized.thinking }),
+    ...(normalized.budgetTokens !== undefined && { reasoningBudgetTokens: normalized.budgetTokens }),
+  };
 }

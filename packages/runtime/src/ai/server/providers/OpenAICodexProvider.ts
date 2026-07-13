@@ -18,7 +18,7 @@ import {
 } from '../types';
 import { CodexSDKProtocol } from '../protocols/CodexSDKProtocol';
 import { CodexAppServerProtocol, type CodexAppServerHostBindings } from '../protocols/CodexAppServerProtocol';
-import { AgentProtocol, ProtocolEvent, ProtocolSession } from '../protocols/ProtocolInterface';
+import { AgentProtocol, ProtocolEvent, ProtocolSession, type SessionOptions } from '../protocols/ProtocolInterface';
 import { ToolPermissionService } from '../permissions/ToolPermissionService';
 import { PermissionMode, TrustChecker, PermissionPatternSaver, PermissionPatternChecker, SecurityLogger } from './ProviderPermissionMixin';
 import { CodexSdkModuleLike, loadCodexSdkModule } from './codex/codexSdkLoader';
@@ -53,6 +53,7 @@ export type CodexTransport = 'sdk' | 'app-server';
  */
 export interface CodexProtocol extends AgentProtocol {
   setApiKey?(apiKey: string): void;
+  updateSessionOptions?(session: ProtocolSession, options: SessionOptions): void;
 }
 
 interface OpenAICodexProviderDeps {
@@ -1118,6 +1119,10 @@ export class OpenAICodexProvider extends BaseAgentProvider {
         session = await this.protocol.createSession(sessionOptions);
         isResumedThread = false;
       }
+      // A live app-server child is reused across turns. Refresh its turn
+      // options so set_model_control changes are consumed by the next
+      // turn/start instead of remaining frozen at thread creation.
+      this.protocol.updateSessionOptions?.(session, sessionOptions);
       // Stash live sessions so future turns on the same Nimbalyst session reuse
       // the same child. Skip when sessionId is absent (anonymous turns -- nothing
       // to key by) and when we just hit the cache (no-op).

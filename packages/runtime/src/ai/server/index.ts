@@ -14,6 +14,8 @@ export * from './providers/OpenCodeProvider';
 export * from './providers/CopilotCLIProvider';
 export * from './utils/errorDetection';
 export * from './preferredAgentLanguageConfig';
+export * from './reasoningPolicy';
+export * from './providers/claudeCode/reasoning';
 export { McpConfigService } from './services/McpConfigService';
 export type { McpConfigServiceDeps } from './services/McpConfigService';
 export {

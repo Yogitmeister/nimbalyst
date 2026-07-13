@@ -30,6 +30,7 @@ import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStat
 import { parseContextUsageMessage } from '@nimbalyst/runtime/ai/server/utils/contextUsage';
 import { isBedrockToolSearchError } from '@nimbalyst/runtime/ai/server/utils/errorDetection';
 import { resolveEffortLevel } from '@nimbalyst/runtime/ai/server/effortLevels';
+import { resolveEffortForTurn } from '@nimbalyst/runtime/ai/server/reasoningPolicy';
 import type { SessionStore } from '@nimbalyst/runtime';
 import {
   ModelIdentifier,
@@ -638,6 +639,8 @@ export class AIService {
     const apiKey = this.getApiKeyForProvider('claude-code', effectiveWorkspacePath);
 
     let customBackend: string | undefined;
+    let storedEffort: unknown = (session.metadata as any)?.effortLevel;
+    let storedEffortPolicy: unknown = (session.metadata as any)?.effortPolicy;
     try {
       const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
       const fresh: any = await AISessionsRepository.get(session.id);
@@ -649,12 +652,23 @@ export class AIService {
         sessionMetadata.claudeBackend ??
         sessionMetadata.metadata?.claudeBackend ??
         undefined;
+      storedEffort = freshMetadata.effortLevel ?? storedEffort;
+      storedEffortPolicy = freshMetadata.effortPolicy ?? storedEffortPolicy;
     } catch {
       const sessionMetadata: any = session.metadata ?? {};
       customBackend = sessionMetadata.claudeBackend ?? sessionMetadata.metadata?.claudeBackend ?? undefined;
     }
 
-    const effortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
+    const effortDecision = resolveEffortForTurn({
+      sessionId: session.id,
+      storedEffort,
+      storedEffortPolicy,
+      appDefault: getDefaultEffortLevel(),
+      provider: 'claude-code',
+      modelId: session.model || session.providerConfig?.model,
+      customBackendId: customBackend,
+    });
+    const effortLevel = effortDecision.effort;
     const config: ProviderConfig = {
       maxTokens: (session.providerConfig as any)?.maxTokens,
       temperature: (session.providerConfig as any)?.temperature,
@@ -2078,9 +2092,16 @@ export class AIService {
 
       // Pass effort level for OpenAI Codex
       if (provider === 'openai-codex') {
-        const effortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
-        if (effortLevel) {
-          initConfig.effortLevel = effortLevel;
+        const effortDecision = resolveEffortForTurn({
+          sessionId: session.id,
+          storedEffort: (session.metadata as any)?.effortLevel,
+          storedEffortPolicy: (session.metadata as any)?.effortPolicy,
+          appDefault: getDefaultEffortLevel(),
+          provider,
+          modelId: session.model || session.providerConfig?.model,
+        });
+        if (effortDecision.effort) {
+          initConfig.effortLevel = effortDecision.effort;
         }
       }
 

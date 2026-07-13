@@ -10,9 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 <!-- New features go here -->
+- Claude Agent can now choose effort automatically per turn while showing the actual level used.
 
 ### Changed
 <!-- Changes to existing functionality go here -->
+- DeepSeek Claude-compatible backends now use the V4 Pro and V4 Flash models ahead of the legacy ID shutdown.
 
 ### Fixed
 <!-- Bug fixes go here -->

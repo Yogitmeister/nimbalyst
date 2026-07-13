@@ -199,6 +199,12 @@ export class CodexAppServerProtocol implements AgentProtocol {
     this.apiKey = apiKey;
   }
 
+  updateSessionOptions(session: ProtocolSession, options: SessionOptions): void {
+    const raw = this.assertRaw(session);
+    raw.options = options;
+    raw.dynamicTools = this.extractDynamicTools(options);
+  }
+
   /**
    * Spawn a new codex app-server child, complete the JSON-RPC handshake, and
    * start a fresh thread. Each `ProtocolSession` owns its child process.
@@ -307,6 +313,14 @@ export class CodexAppServerProtocol implements AgentProtocol {
     const turnInput = await this.buildInput(message);
     let turnStartResultId: string | null = null;
     try {
+      const settings: Record<string, unknown> = { threadId: raw.threadId };
+      if (typeof raw.options.model === 'string') settings.model = raw.options.model;
+      if (typeof raw.options.raw?.effortLevel === 'string') {
+        settings.effort = raw.options.raw.effortLevel;
+      }
+      if (Object.keys(settings).length > 1) {
+        await raw.client.request('thread/settings/update', settings);
+      }
       const turnStart = await raw.client.request<{ turn?: { id?: string } }>('turn/start', {
         threadId: raw.threadId,
         input: turnInput,

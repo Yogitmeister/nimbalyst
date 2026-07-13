@@ -37,6 +37,7 @@ export abstract class BaseAgentProvider extends BaseAIProvider {
     'mcp__nimbalyst-host__list_spawned_sessions',
     'mcp__nimbalyst-host__list_worktrees',
     'mcp__nimbalyst-host__create_session',
+    'mcp__nimbalyst-host__set_model_control',
     'mcp__nimbalyst-host__get_session_status',
     'mcp__nimbalyst-host__get_session_result',
     'mcp__nimbalyst-host__list_queued_prompts',

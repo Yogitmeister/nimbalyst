@@ -191,6 +191,51 @@ describe('CodexAppServerProtocol', () => {
     protocol.cleanupSession(session);
   });
 
+  it('applies supported Codex model and effort updates before the next turn without restart', async () => {
+    const protocol = new CodexAppServerProtocol();
+    const options = {
+      workspacePath: '/tmp/ws',
+      model: 'gpt-5.6-sol',
+      raw: {
+        effortLevel: 'max',
+        effortPolicy: 'fixed',
+      },
+    };
+    const sessionPromise = protocol.createSession(options);
+    const initReq = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: initReq.id, result: { codexHome: '/fake', platformFamily: 'unix', platformOs: 'macos', userAgent: 'fake/0' } });
+    const startReq = await nextWrittenMatching(child, 'thread/start');
+    child.emitLine({ id: startReq.id, result: { thread: { id: 'thread-effort' } } });
+    const session = await sessionPromise;
+
+    // Mirrors the provider's cached-session refresh on the next turn.
+    protocol.updateSessionOptions(session, options);
+    const collector = (async () => {
+      for await (const _event of protocol.sendMessage(session, { content: 'review this migration' })) {
+        // drain
+      }
+    })();
+    const settingsReq = await nextWrittenMatching(child, 'thread/settings/update');
+    expect(settingsReq.params).toEqual({
+      threadId: 'thread-effort',
+      model: 'gpt-5.6-sol',
+      effort: 'max',
+    });
+    child.emitLine({ id: settingsReq.id, result: {} });
+    const turnReq = await nextWrittenMatching(child, 'turn/start');
+    expect(turnReq.params).toMatchObject({ threadId: 'thread-effort' });
+    expect(turnReq.params).not.toHaveProperty('effort');
+    expect(turnReq.params).not.toHaveProperty('reasoning');
+
+    child.emitLine({ id: turnReq.id, result: { turn: { id: 'turn-effort', items: [], status: 'inProgress' } } });
+    child.emitLine({
+      method: 'turn/completed',
+      params: { threadId: 'thread-effort', turn: { id: 'turn-effort', status: 'completed' } },
+    });
+    await collector;
+    protocol.cleanupSession(session);
+  });
+
   it('translates fileChange item/completed into a tool_call event with diff-based baselines', async () => {
     const protocol = new CodexAppServerProtocol();
     const sessionPromise = protocol.createSession({ workspacePath: '/tmp/ws' });

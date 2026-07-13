@@ -25,6 +25,7 @@ import type { InteractiveWidgetHost, PermissionScope } from '@nimbalyst/runtime/
 import type { TodoItem } from '@nimbalyst/runtime/ui/AgentTranscript/types';
 import { isToolLikeMessage } from '@nimbalyst/runtime/ui/AgentTranscript/utils/messageTypeHelpers';
 import { AIInput, AIInputRef } from './AIInput';
+import type { EffortSetting } from './EffortLevelSelector';
 import { PromptQueueList } from './PromptQueueList';
 import { TranscriptEmbeddedFileCard } from './TranscriptEmbeddedFileCard';
 import { getDiffPeekSizeForInteractiveWidgetHost } from './interactiveWidgetHostProxy';
@@ -59,6 +60,8 @@ import {
   sessionWorktreePathAtom,
   sessionDocumentContextAtom,
   sessionEffortLevelRawAtom,
+  sessionEffortPolicyRawAtom,
+  sessionAutoEffortLastAtom,
   sessionOpenCodeAgentAtom,
   sessionClaudeBackendAtom,
   sessionLoadingAtom,
@@ -106,7 +109,8 @@ import {
 import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom } from '../../store/atoms/agentMode';
 import { usePostHog } from 'posthog-js/react';
 import { setAgentModeSettingsAtom, showPromptAdditionsAtom, hasExternalEditorAtom, externalEditorNameAtom, openInExternalEditorAtom, defaultAgentModelAtom, defaultEffortLevelAtom, chatShowToolCallsAtom } from '../../store/atoms/appSettings';
-import { supportsEffortLevel, parseEffortLevel, supportedEffortLevelsForModel, type EffortLevel } from '../../utils/modelUtils';
+import { supportsEffortLevel, parseEffortLevel, supportedEffortLevelsForModel } from '../../utils/modelUtils';
+import { reasoningCapabilitiesForModel } from '@nimbalyst/runtime/ai/server/providers/claudeCode/reasoning';
 import { buildPlanImplementationPrompt, resolvePlanFilePath } from '../../utils/pathUtils';
 import { resolveTranscriptClickPath } from '../../utils/resolveTranscriptClickPath';
 import { autoCommitEnabledAtom, setAutoCommitEnabledAtom } from '../../store/atoms/autoCommitAtoms';
@@ -315,6 +319,19 @@ async function updateSessionMetadataField<T>(
   _sessionData: SessionData | null,  // Deprecated - kept for backwards compatibility, not used
   updateSessionStore: (params: { sessionId: string; updates: Partial<SessionData> }) => void
 ): Promise<void> {
+  return updateSessionMetadataFields(
+    sessionId,
+    { [field]: value },
+    updateSessionStore,
+  );
+}
+
+/** Persist related metadata axes in one store update and one database write. */
+async function updateSessionMetadataFields(
+  sessionId: string,
+  fields: Record<string, unknown>,
+  updateSessionStore: (params: { sessionId: string; updates: Partial<SessionData> }) => void
+): Promise<void> {
   try {
     // Update local store FIRST (before async IPC) to ensure immediate availability
     const currentSessionData = store.get(sessionStoreAtom(sessionId));
@@ -322,7 +339,7 @@ async function updateSessionMetadataField<T>(
     if (currentSessionData) {
       const newMetadata = {
         ...(currentSessionData.metadata as Record<string, unknown> || {}),
-        [field]: value
+        ...fields,
       };
       updateSessionStore({
         sessionId,
@@ -334,10 +351,10 @@ async function updateSessionMetadataField<T>(
 
     // Then persist to database
     await window.electronAPI.invoke('sessions:update-metadata', sessionId, {
-      metadata: { [field]: value }
+      metadata: fields
     });
   } catch (error) {
-    console.error(`[SessionTranscript] Failed to update ${field} metadata:`, error);
+    console.error('[SessionTranscript] Failed to update session metadata:', error);
   }
 }
 
@@ -465,6 +482,8 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const sessionWorktreePath = useAtomValue(sessionWorktreePathAtom(sessionId));
   const sessionDocumentContext = useAtomValue(sessionDocumentContextAtom(sessionId));
   const rawEffortLevel = useAtomValue(sessionEffortLevelRawAtom(sessionId));
+  const rawEffortPolicy = useAtomValue(sessionEffortPolicyRawAtom(sessionId));
+  const autoEffortLast = useAtomValue(sessionAutoEffortLastAtom(sessionId));
   const rawOpenCodeAgent = useAtomValue(sessionOpenCodeAgentAtom(sessionId));
   const rawClaudeBackend = useAtomValue(sessionClaudeBackendAtom(sessionId));
   const [availableAgents, setAvailableAgents] = useState<string[]>([]);
@@ -526,16 +545,36 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     sessionDocumentContext,
     sessionWorktreePath,
     rawEffortLevel,
+    rawEffortPolicy,
     sessionStatus,
     metadataTeammates,
     currentTodos,
   ]);
 
-  // Effort level: read from session metadata, fall back to global default
-  const showEffortLevel = useMemo(() => supportsEffortLevel(currentModel), [currentModel]);
-  const effortLevel = useMemo(() => {
+  // Effort level: read from session metadata, fall back to global default.
+  // Custom backends may declare a narrower vocabulary than the selected
+  // Claude model (DeepSeek currently supports only high|max), so the picker
+  // must use the same provider-aware capabilities as MCP/runtime validation.
+  const supportedEffortLevels = useMemo(() => {
+    const modelLevels = supportedEffortLevelsForModel(currentModel);
+    if (provider !== 'claude-code' || !rawClaudeBackend) return modelLevels;
+    try {
+      const allowed = reasoningCapabilitiesForModel(provider, currentModel, rawClaudeBackend).effort?.values;
+      if (!allowed) return [];
+      return modelLevels.filter((level) => allowed.includes(level.key));
+    } catch {
+      // A stale backend is invalid and must not expose a misleading ladder.
+      return [];
+    }
+  }, [currentModel, provider, rawClaudeBackend]);
+  const showEffortLevel = useMemo(
+    () => supportsEffortLevel(currentModel) && supportedEffortLevels.length > 0,
+    [currentModel, supportedEffortLevels]
+  );
+  const effortLevel = useMemo<EffortSetting>(() => {
+    if (rawEffortPolicy === 'auto' || rawEffortPolicy === 'auto-plus') return rawEffortPolicy;
     return rawEffortLevel != null ? parseEffortLevel(rawEffortLevel) : defaultEffortLevel;
-  }, [rawEffortLevel, defaultEffortLevel]);
+  }, [rawEffortLevel, rawEffortPolicy, defaultEffortLevel]);
 
   // Memoize the teammate list passed to AgentTranscriptPanel so its memo
   // comparison doesn't see a new array reference on every keystroke. Without
@@ -1542,10 +1581,18 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     }
   }, [currentModel, sessionId, setCurrentModel, setAgentModeSettings, provider, cliSessionCommitted]);
 
-  const handleEffortLevelChange = useCallback(async (level: EffortLevel) => {
+  const handleEffortLevelChange = useCallback(async (level: EffortSetting) => {
     const previousLevel = effortLevel;
-    await updateSessionMetadataField(sessionId, 'effortLevel', level, null, updateSessionStore);
-    setAgentModeSettings({ defaultEffortLevel: level });
+    if (level === 'auto' || level === 'auto-plus') {
+      await updateSessionMetadataFields(sessionId, { effortPolicy: level }, updateSessionStore);
+    } else {
+      await updateSessionMetadataFields(
+        sessionId,
+        { effortLevel: level, effortPolicy: 'fixed' },
+        updateSessionStore,
+      );
+      setAgentModeSettings({ defaultEffortLevel: level });
+    }
     posthog?.capture('ai_effort_level_changed', {
       effort_level: level,
       previous_level: previousLevel,
@@ -2621,7 +2668,8 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         effortLevel={effortLevel}
         onEffortLevelChange={handleEffortLevelChange}
         showEffortLevel={isClaudeCliTerminalSession(provider) && cliSessionCommitted ? false : showEffortLevel}
-        supportedEffortLevels={supportedEffortLevelsForModel(currentModel)}
+        supportedEffortLevels={supportedEffortLevels}
+        resolvedEffort={autoEffortLast?.effort ?? null}
         opencodeAgent={rawOpenCodeAgent}
         onAgentChange={handleAgentChange}
         availableAgents={availableAgents}

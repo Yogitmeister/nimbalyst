@@ -121,14 +121,15 @@ export function resolveClaudeCodeBackend(backendId: string | undefined | null): 
 
 export function applyClaudeCodeBackendEnv(env: Record<string, any>, backend: ClaudeCodeBackend): void {
   const token = process.env[backend.authTokenEnv];
+  if (!token) {
+    throw new Error(
+      `Claude Agent backend '${backend.id}' requires configured credential ${backend.authTokenEnv}; refusing to fall back to Anthropic.`
+    );
+  }
 
   delete env.ANTHROPIC_API_KEY;
   env.ANTHROPIC_BASE_URL = backend.baseUrl;
-  if (token) {
-    env.ANTHROPIC_AUTH_TOKEN = token;
-  } else {
-    delete env.ANTHROPIC_AUTH_TOKEN;
-  }
+  env.ANTHROPIC_AUTH_TOKEN = token;
 
   env.ANTHROPIC_DEFAULT_OPUS_MODEL = backend.upstreamModel;
   env.ANTHROPIC_DEFAULT_SONNET_MODEL = backend.upstreamModel;

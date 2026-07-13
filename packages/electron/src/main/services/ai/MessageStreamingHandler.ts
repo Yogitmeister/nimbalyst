@@ -36,6 +36,11 @@ import {
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { isBedrockToolSearchError } from '@nimbalyst/runtime/ai/server/utils/errorDetection';
 import { resolveEffortLevel } from '@nimbalyst/runtime/ai/server/effortLevels';
+import {
+  isAutoEffortPolicy,
+  resolveEffortForTurn,
+  type TurnEffortDecision,
+} from '@nimbalyst/runtime/ai/server/reasoningPolicy';
 import type { RawDocumentContext, DocumentContextService } from '@nimbalyst/runtime';
 import { AISessionsRepository } from '@nimbalyst/runtime';
 import { toolRegistry } from './tools';
@@ -292,6 +297,62 @@ export class MessageStreamingHandler {
     installScopedProviderListener(this.providerListeners, provider, event, listener);
   }
 
+  private async recordAutoEffortDecision(
+    session: SessionData,
+    decision: TurnEffortDecision,
+  ): Promise<void> {
+    if (decision.source !== 'policy' || !decision.effort || !decision.tier) return;
+
+    const fresh = await AISessionsRepository.get(session.id);
+    const currentMetadata = (fresh?.metadata ?? session.metadata ?? {}) as Record<string, any>;
+    const previousCounters = currentMetadata.autoEffortCounters as Record<string, any> | undefined;
+    const cap = (value: unknown): number =>
+      Math.min(1_000_000_000, Math.max(0, Number.isFinite(Number(value)) ? Number(value) : 0) + 1);
+    const allowedEfforts = new Set(decision.effortValues ?? [decision.effort]);
+    const priorByEffort = previousCounters?.byEffort as Record<string, unknown> | undefined;
+    const byEffort: Record<string, number> = {};
+    for (const effort of allowedEfforts) {
+      const existing = Number(priorByEffort?.[effort]);
+      if (Number.isFinite(existing) && existing > 0) byEffort[effort] = Math.min(1_000_000_000, existing);
+    }
+    byEffort[decision.effort] = cap(byEffort[decision.effort]);
+
+    const tiers = ['SIMPLE', 'MEDIUM', 'COMPLEX', 'REASONING'] as const;
+    const priorByTier = previousCounters?.byTier as Record<string, unknown> | undefined;
+    const byTier: Record<string, number> = {};
+    for (const tier of tiers) {
+      const existing = Number(priorByTier?.[tier]);
+      if (Number.isFinite(existing) && existing > 0) byTier[tier] = Math.min(1_000_000_000, existing);
+    }
+    byTier[decision.tier] = cap(byTier[decision.tier]);
+
+    const metadataUpdate = {
+      autoEffortLast: {
+        effort: decision.effort,
+        tier: decision.tier,
+        effortPolicy: decision.effortPolicy,
+        source: decision.source,
+        at: Date.now(),
+      },
+      autoEffortCounters: {
+        total: cap(previousCounters?.total),
+        escalations: decision.escalated
+          ? cap(previousCounters?.escalations)
+          : Math.min(1_000_000_000, Math.max(0, Number(previousCounters?.escalations) || 0)),
+        byEffort,
+        byTier,
+      },
+    };
+
+    await AISessionsRepository.updateMetadata(session.id, { metadata: metadataUpdate });
+    session.metadata = { ...(session.metadata ?? {}), ...metadataUpdate };
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+        window.webContents.send('sessions:session-updated', session.id, metadataUpdate);
+      }
+    }
+  }
+
   handle: SendMessageHandler = async (
     event,
     message: string,
@@ -467,6 +528,24 @@ export class MessageStreamingHandler {
       }
     }
 
+    const storedEffort = (session.metadata as any)?.effortLevel;
+    const storedEffortPolicy = (session.metadata as any)?.effortPolicy;
+    const shouldUseReasoningPolicy =
+      session.provider === 'claude-code' ||
+      session.provider === 'openai-codex' ||
+      isAutoEffortPolicy(storedEffortPolicy);
+    const turnEffortDecision = shouldUseReasoningPolicy
+      ? resolveEffortForTurn({
+          sessionId: session.id,
+          storedEffort,
+          storedEffortPolicy,
+          appDefault: getDefaultEffortLevel(),
+          provider: session.provider,
+          modelId: session.model || session.providerConfig?.model,
+          customBackendId: freshClaudeBackend,
+          promptText: message,
+        })
+      : undefined;
     if (provider && isProviderClaudeCode) {
       const activeBackend = (provider as any)?.config?.customBackend ?? undefined;
       if (freshClaudeBackend !== activeBackend) {
@@ -577,7 +656,8 @@ export class MessageStreamingHandler {
       if (isProviderClaudeCode) {
       }
 
-      const reinitEffortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
+      const reinitEffortLevel = turnEffortDecision?.effort
+        ?? resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
       const reinitConfig: any = {
         apiKey,
         maxTokens: (session.providerConfig as any)?.maxTokens,
@@ -1233,6 +1313,9 @@ export class MessageStreamingHandler {
       if (isClaudeCode) {
         // Refresh provider config every turn so auth/key changes in settings apply immediately.
         const refreshedConfig = await this.svc.buildClaudeCodeRuntimeConfig(session, effectiveWorkspacePath);
+        if (turnEffortDecision?.effort) {
+          refreshedConfig.effortLevel = turnEffortDecision.effort;
+        }
         await provider.initialize(refreshedConfig);
 
         //   messageLength: message.length,
@@ -1247,7 +1330,8 @@ export class MessageStreamingHandler {
       } else {
         // Refresh credentials every turn for all providers so key changes in settings apply immediately.
         const freshApiKey = this.svc.getApiKeyForProvider(session.provider, effectiveWorkspacePath);
-        const turnEffortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
+        const turnEffortLevel = turnEffortDecision?.effort
+          ?? resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
         const turnConfig: any = {
           apiKey: freshApiKey,
           maxTokens: (session.providerConfig as any)?.maxTokens,
@@ -1272,6 +1356,14 @@ export class MessageStreamingHandler {
           }
         }
         await provider.initialize(turnConfig);
+      }
+
+      // Persist/announce the actual automatic choice only after the provider
+      // accepted the concrete per-turn configuration. Failed authentication,
+      // backend validation, or initialization must not look like an executed
+      // policy turn in the badge or counters.
+      if (turnEffortDecision?.source === 'policy') {
+        await this.recordAutoEffortDecision(session, turnEffortDecision);
       }
 
       // Attach @ mentioned files for non-agent providers

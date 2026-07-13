@@ -12,6 +12,7 @@
  */
 
 import { resolveProjectPath } from "../utils/workspaceDetection";
+import type { ReasoningSelection } from "@nimbalyst/runtime/ai/server";
 
 type CreateSessionArgs = {
   title?: string;
@@ -21,6 +22,7 @@ type CreateSessionArgs = {
   useWorktree?: boolean;
   worktreeId?: string;
   toolScope?: string;
+  reasoning?: ReasoningSelection;
 };
 
 type SpawnSessionArgs = {
@@ -28,6 +30,8 @@ type SpawnSessionArgs = {
   prompt: string;
   useWorktree?: boolean;
   model?: string;
+  inheritModel?: boolean;
+  reasoning?: ReasoningSelection;
   notifyOnComplete?: boolean;
   /**
    * When true, the new session is created at the top level — no parent,
@@ -37,6 +41,12 @@ type SpawnSessionArgs = {
    * spawned as a sibling under the caller's workstream.
    */
   isolated?: boolean;
+};
+
+type SetModelControlArgs = {
+  sessionId?: string;
+  reasoning?: ReasoningSelection;
+  model?: string;
 };
 
 type RespondToPromptArgs = {
@@ -113,6 +123,11 @@ interface MetaAgentToolFns {
     callerSessionId: string,
     workspaceId: string,
     args: SpawnSessionArgs
+  ) => Promise<string>;
+  setModelControl: (
+    callerSessionId: string,
+    workspaceId: string,
+    args: SetModelControlArgs
   ) => Promise<string>;
   getSessionStatus: (
     metaSessionId: string,
@@ -239,6 +254,19 @@ export const META_AGENT_TOOL_DEFS: Array<{
           description:
             "Capability scope for the child. \"read\" = read_file/list_files/search_files only (pure investigation). \"write\" = those plus write_file but NO run_command, so the child can save a file deliverable (e.g. a report) yet cannot build/test/run anything. \"full\" (default) = all tools including run_command. Use read or write for analyze/research tasks so the child physically cannot run a build, and reserve full for tasks that must build/test.",
         },
+        reasoning: {
+          type: "object",
+          description:
+            "Optional reasoning control for the child. The whole selection is validated atomically against the resolved model/backend.",
+          properties: {
+            thinking: { type: "string", enum: ["provider-default", "enabled", "disabled"] },
+            mode: { type: "string", description: "Provider reasoning mode, such as standard or pro." },
+            effort: { type: "string", description: "Concrete reasoning effort." },
+            effortPolicy: { type: "string", enum: ["fixed", "auto", "auto-plus"] },
+            budgetTokens: { type: "integer", minimum: 0 },
+          },
+          additionalProperties: false,
+        },
       },
     },
   },
@@ -283,8 +311,52 @@ export const META_AGENT_TOOL_DEFS: Array<{
           description:
             "Default false. When false (the default), the calling session receives no follow-up prompt when the spawned session completes/errors/waits — fire and forget. Set true only when the caller specifically wants to be told the result and continue working with it.",
         },
+        reasoning: {
+          type: "object",
+          description:
+            "Optional reasoning control. Explicit reasoning wins; otherwise reasoning is inherited only when inheritModel=true and the caller has a stored setting.",
+          properties: {
+            thinking: { type: "string", enum: ["provider-default", "enabled", "disabled"] },
+            mode: { type: "string", description: "Provider reasoning mode, such as standard or pro." },
+            effort: { type: "string", description: "Concrete reasoning effort." },
+            effortPolicy: { type: "string", enum: ["fixed", "auto", "auto-plus"] },
+            budgetTokens: { type: "integer", minimum: 0 },
+          },
+          additionalProperties: false,
+        },
       },
       required: ["prompt"],
+    },
+  },
+  {
+    name: "set_model_control",
+    description:
+      "Set reasoning control for the calling session or a session it created. Changes are validated atomically and take effect on the next turn. V1 is reasoning-only; model changes are rejected.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: {
+          type: "string",
+          description: "Optional target session. Omit to update the calling session.",
+        },
+        reasoning: {
+          type: "object",
+          description: "Required atomic reasoning selection.",
+          properties: {
+            thinking: { type: "string", enum: ["provider-default", "enabled", "disabled"] },
+            mode: { type: "string", description: "Provider reasoning mode, such as standard or pro." },
+            effort: { type: "string", description: "Concrete reasoning effort." },
+            effortPolicy: { type: "string", enum: ["fixed", "auto", "auto-plus"] },
+            budgetTokens: { type: "integer", minimum: 0 },
+          },
+          additionalProperties: false,
+        },
+        model: {
+          type: "string",
+          description: "Reserved for a later version. Supplying it is rejected.",
+        },
+      },
+      required: ["reasoning"],
     },
   },
   {
@@ -526,6 +598,7 @@ export const META_AGENT_TOOL_DEFS: Array<{
 const EXTENSION_META_AGENT_ALLOWED_TOOLS = new Set<string>([
   "list_worktrees",
   "create_session",
+  "set_model_control",
   "get_session_status",
   "get_session_result",
   "list_queued_prompts",
@@ -583,6 +656,8 @@ export async function dispatchMetaAgentTool(
       return toolFns.createSession(aiSessionId, effectiveWorkspaceId, (args ?? {}) as CreateSessionArgs);
     case "spawn_session":
       return toolFns.spawnSession(aiSessionId, effectiveWorkspaceId, (args ?? {}) as SpawnSessionArgs);
+    case "set_model_control":
+      return toolFns.setModelControl(aiSessionId, effectiveWorkspaceId, (args ?? {}) as SetModelControlArgs);
     case "get_session_status":
       return toolFns.getSessionStatus(
         aiSessionId,

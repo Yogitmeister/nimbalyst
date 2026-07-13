@@ -11,10 +11,20 @@ import path from 'path';
 import { app } from 'electron';
 import { ClaudeCodeDeps } from './dependencyInjection';
 import { resolveClaudeAgentCliPath } from './cliPathResolver';
-import { DEFAULT_EFFORT_LEVEL } from '../../effortLevels';
 import { applyClaudeCodeBackendEnv, resolveClaudeCodeBackend } from './customBackends';
 
 type SessionMode = 'planning' | 'agent' | 'auto' | undefined;
+const CONCRETE_CLAUDE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+function resolveConcreteClaudeEffort(effort: string | undefined): string | undefined {
+  if (effort === undefined || effort === '') return undefined;
+  if (!CONCRETE_CLAUDE_EFFORTS.has(effort)) {
+    throw new Error(
+      `Claude Agent runtime requires a concrete effort (low, medium, high, xhigh, or max); received unresolved/unsupported '${effort}'.`
+    );
+  }
+  return effort;
+}
 
 type SDKUserMessage = {
   type: 'user';
@@ -317,6 +327,7 @@ export async function buildSdkOptions(
   const { ANTHROPIC_API_KEY: _settingsAnthropicKey, OPENAI_API_KEY: _settingsOpenaiKey, ...sanitizedSettingsEnv } = settingsEnv;
 
   const enableAgentTeams = sanitizedSettingsEnv.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1';
+  const concreteEffort = resolveConcreteClaudeEffort(config.effortLevel);
   const env: any = {
     ...sanitizedProcessEnv,
     ...sanitizedShellEnv,
@@ -346,11 +357,7 @@ export async function buildSdkOptions(
     // the official CLI and removes that asymmetry. The user can still
     // override via their own env var if they want the original sdk-ts label.
     ...(process.env.CLAUDE_CODE_ENTRYPOINT == null && { CLAUDE_CODE_ENTRYPOINT: 'cli' }),
-    ...(config.effortLevel && config.effortLevel !== DEFAULT_EFFORT_LEVEL && {
-      // 'ultra' is a Codex-5.6-only tier; the Claude CLI slider tops out at
-      // 'max', so clamp rather than hand it an unknown level.
-      CLAUDE_CODE_EFFORT_LEVEL: config.effortLevel === 'ultra' ? 'max' : config.effortLevel
-    }),
+    ...(concreteEffort && { CLAUDE_CODE_EFFORT_LEVEL: concreteEffort }),
     // The bundled claude binary runs a per-tool idle-timeout watchdog (default
     // 300s) over MCP servers whose transport is http/sse/ws. ALL Nimbalyst
     // in-app MCP servers use SSE, and the interactive input tools
@@ -452,19 +459,15 @@ export async function buildSdkOptions(
   }
 
   const customBackend = resolveClaudeCodeBackend(config.customBackend);
+  if (config.customBackend && !customBackend) {
+    throw new Error(
+      `Claude Agent backend '${config.customBackend}' is stale or invalid; refusing to fall back to Anthropic.`
+    );
+  }
   if (customBackend) {
-    // Applying a backend deletes ANTHROPIC_API_KEY; without the gateway token
-    // present that would spawn a session that sends unauthenticated requests.
-    // Keep the default Claude backend instead and say so loudly.
-    if (!process.env[customBackend.authTokenEnv]) {
-      console.warn(
-        `[ClaudeCodeProvider] Custom backend '${customBackend.id}' requires env ${customBackend.authTokenEnv}, which is not set — keeping the default Claude backend for this session.`
-      );
-    } else {
-      applyClaudeCodeBackendEnv(env, customBackend);
-      if (teammateManager.packagedBuildOptions?.env) {
-        applyClaudeCodeBackendEnv(teammateManager.packagedBuildOptions.env, customBackend);
-      }
+    applyClaudeCodeBackendEnv(env, customBackend);
+    if (teammateManager.packagedBuildOptions?.env) {
+      applyClaudeCodeBackendEnv(teammateManager.packagedBuildOptions.env, customBackend);
     }
   }
 

@@ -853,6 +853,29 @@ export const sessionEffortLevelRawAtom = atomFamily((sessionId: string) =>
   })
 );
 
+export const sessionEffortPolicyRawAtom = atomFamily((sessionId: string) =>
+  atom((get) => {
+    const metadata = get(sessionStoreAtom(sessionId))?.metadata as Record<string, unknown> | undefined;
+    return metadata?.effortPolicy;
+  })
+);
+
+export interface AutoEffortLast {
+  effort: string;
+  tier: 'SIMPLE' | 'MEDIUM' | 'COMPLEX' | 'REASONING';
+  effortPolicy: 'auto' | 'auto-plus';
+  source: 'policy' | 'sticky';
+  at: number;
+}
+
+export const sessionAutoEffortLastAtom = atomFamily((sessionId: string) =>
+  atom((get) => {
+    const metadata = get(sessionStoreAtom(sessionId))?.metadata as Record<string, unknown> | undefined;
+    const value = metadata?.autoEffortLast;
+    return value && typeof value === 'object' ? value as AutoEffortLast : null;
+  })
+);
+
 export const sessionOpenCodeAgentAtom = atomFamily((sessionId: string) =>
   atom((get) => {
     const metadata = get(sessionStoreAtom(sessionId))?.metadata as Record<string, unknown> | undefined;

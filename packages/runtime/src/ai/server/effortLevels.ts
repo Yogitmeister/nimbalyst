@@ -24,10 +24,11 @@ const VALID_EFFORT_LEVELS = new Set<string>(['low', 'medium', 'high', 'xhigh', '
  * Per-model effort ceilings, from each provider's own catalog rather than one
  * global ladder. Codex's embedded catalog (verified live 2026-07-10) declares
  * `supported_reasoning_levels` per model: gpt-5.6-sol/terra go up to `ultra`
- * ("maximum reasoning with automatic task delegation" — what ChatGPT's web UI
- * brands "Pro"), gpt-5.6-luna up to `max`, and every pre-5.6 Codex model stops
- * at `xhigh` (the codex backend errors above a model's ceiling rather than
- * clamping). Claude Code's CLI effort slider tops out at `max`.
+ * (Codex's proactive multi-agent effort), gpt-5.6-luna up to `max`, and every
+ * pre-5.6 Codex model stops at `xhigh` (the codex backend errors above a
+ * model's ceiling rather than clamping). Provider `reasoning.mode: "pro"` is
+ * an independent GPT-5.6 Responses API axis and is never inferred from this
+ * ladder. Claude Code's CLI effort slider tops out at `max`.
  *
  * Re-verified against the GA-day fetched catalog (2026-07-10 evening): all
  * ceilings unchanged; gpt-5.3-codex-spark (new) stops at xhigh like every

@@ -1,10 +1,10 @@
 /**
  * Host-side pre-dispatch reasoning policy — Auto / Auto+ effort modes.
  *
- * When a session's stored effort setting is 'auto' or 'auto-plus', the host
+ * When a session's stored effortPolicy is 'auto' or 'auto-plus', the host
  * classifies each outgoing user turn BEFORE provider initialization and picks
  * a concrete effort level for that turn. The decision is turn-scoped: the
- * session's stored setting stays 'auto'/'auto-plus' (the user's dropdown never
+ * session's stored effortPolicy stays 'auto'/'auto-plus' (the user's dropdown never
  * flaps), and the per-turn resolution is surfaced separately (indicator +
  * metadata.autoEffortLast + launch/MCP payloads).
  *
@@ -18,16 +18,20 @@
  * effort selection. Deterministic, zero external calls, O(prompt length).
  */
 
-import { clampEffortForModel, type EffortLevel } from './effortLevels';
-import type { ReasoningMode } from './providers/claudeCode/reasoning';
+import type { EffortLevel } from './effortLevels';
+import {
+  reasoningCapabilitiesForModel,
+  type ReasoningCapabilities,
+  type EffortPolicy,
+} from './providers/claudeCode/reasoning';
 
 export type ComplexityTier = 'SIMPLE' | 'MEDIUM' | 'COMPLEX' | 'REASONING';
 
 export interface TurnEffortDecision {
-  /** Concrete effort to run this turn at (already ceiling-clamped). */
-  effort: EffortLevel | undefined;
+  /** Concrete effort to run this turn at, drawn from the target's declared ladder. */
+  effort: string | undefined;
   /** The stored mode the decision came from. */
-  mode: ReasoningMode;
+  effortPolicy: EffortPolicy;
   /** Classifier tier — only present for auto modes with a classified prompt. */
   tier?: ComplexityTier;
   /**
@@ -36,15 +40,22 @@ export interface TurnEffortDecision {
    * 'sticky'  — auto mode, no prompt available (config refresh) → last decision
    */
   source: 'fixed' | 'policy' | 'sticky';
+  /** Whether this classified turn moved upward from the prior sticky decision. */
+  escalated?: boolean;
+  /** The target ladder used for validation/resolution, ascending. */
+  effortValues?: readonly string[];
 }
 
 interface PolicyState {
-  lastEffort: EffortLevel;
-  /** Consecutive low-signal turns — used to decay gradually, not instantly. */
-  simpleStreak: number;
+  lastEffort: string;
+  effortPolicy: 'auto' | 'auto-plus';
+  lastUsedAt: number;
 }
 
-const EFFORT_ORDER: EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const POLICY_TARGETS: EffortLevel[] = ['medium', 'high', 'xhigh', 'max'];
+const MAX_POLICY_STATES = 500;
+const POLICY_STATE_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_CLASSIFIER_CHARS = 8_000;
 
 /** Yogev's spec: Auto defaults high and moves per turn; Auto+ runs one level hotter. */
 const AUTO_TIER_MAP: Record<ComplexityTier, EffortLevel> = {
@@ -96,8 +107,31 @@ export interface PromptClassification {
   continuation: boolean;
 }
 
+/**
+ * Keep the classifier on the user-authored segment. Nimbalyst may append
+ * system/document/attachment wrappers to messages on some transport paths;
+ * those blocks are useful provider context but must not be able to pump spend.
+ */
+export function sanitizePromptForReasoningPolicy(text: string): string {
+  let sanitized = text ?? '';
+  const wrappedBlocks = [
+    'NIMBALYST_SYSTEM_MESSAGE',
+    'DOCUMENT_CONTENT',
+    'NIMBALYST_ATTACHMENT',
+    'ATTACHMENT',
+    'FILE_CONTENT',
+  ];
+  for (const tag of wrappedBlocks) {
+    sanitized = sanitized.replace(
+      new RegExp(`<${tag}(?:\\s[^>]*)?>[\\s\\S]*?<\\/${tag}>`, 'gi'),
+      ' '
+    );
+  }
+  return sanitized.slice(0, MAX_CLASSIFIER_CHARS).trim();
+}
+
 export function classifyPrompt(text: string): PromptClassification {
-  const trimmed = (text ?? '').trim();
+  const trimmed = sanitizePromptForReasoningPolicy(text);
   const lower = trimmed.toLowerCase();
   const words = trimmed.split(/\s+/).filter(Boolean);
   const wordCount = words.length;
@@ -141,14 +175,44 @@ export function classifyPrompt(text: string): PromptClassification {
   return { tier, continuation };
 }
 
-function stepDownOne(from: EffortLevel, to: EffortLevel): EffortLevel {
-  const fromIdx = EFFORT_ORDER.indexOf(from);
-  const toIdx = EFFORT_ORDER.indexOf(to);
-  if (toIdx >= fromIdx) return to;
-  return EFFORT_ORDER[fromIdx - 1];
+function projectPolicyTarget(target: EffortLevel, values: readonly string[]): string {
+  if (values.includes(target)) return target;
+  if (values.length === 1) return values[0];
+  const targetIndex = Math.max(0, POLICY_TARGETS.indexOf(target));
+  const projectedIndex = Math.round((targetIndex / (POLICY_TARGETS.length - 1)) * (values.length - 1));
+  return values[projectedIndex];
 }
 
-export function isAutoEffortSetting(value: unknown): value is 'auto' | 'auto-plus' {
+function stepDownOne(from: string, to: string, values: readonly string[]): string {
+  const fromIdx = values.indexOf(from);
+  const toIdx = values.indexOf(to);
+  if (fromIdx <= 0 || toIdx < 0 || toIdx >= fromIdx) return to;
+  return values[fromIdx - 1];
+}
+
+function prunePolicyStates(now: number): void {
+  for (const [sessionId, state] of policyStates) {
+    if (now - state.lastUsedAt > POLICY_STATE_TTL_MS) policyStates.delete(sessionId);
+  }
+  while (policyStates.size >= MAX_POLICY_STATES) {
+    const oldest = policyStates.keys().next().value as string | undefined;
+    if (!oldest) break;
+    policyStates.delete(oldest);
+  }
+}
+
+export function defaultEffortForPolicy(
+  effortPolicy: EffortPolicy,
+  capabilities: ReasoningCapabilities
+): string | undefined {
+  const values = capabilities.effort?.values;
+  if (!values?.length) return undefined;
+  if (effortPolicy === 'fixed') return capabilities.effort?.default;
+  const target = effortPolicy === 'auto-plus' ? AUTO_PLUS_DEFAULT_EFFORT : AUTO_DEFAULT_EFFORT;
+  return projectPolicyTarget(target, values);
+}
+
+export function isAutoEffortPolicy(value: unknown): value is 'auto' | 'auto-plus' {
   return value === 'auto' || value === 'auto-plus';
 }
 
@@ -165,54 +229,91 @@ export function isAutoEffortSetting(value: unknown): value is 'auto' | 'auto-plu
  */
 export function resolveEffortForTurn(params: {
   sessionId: string;
-  storedSetting: unknown;
+  storedEffort: unknown;
+  storedEffortPolicy: unknown;
   appDefault: EffortLevel | undefined;
+  provider?: string;
   modelId?: string | null;
+  customBackendId?: string | null;
   promptText?: string;
 }): TurnEffortDecision {
-  const { sessionId, storedSetting, appDefault, modelId, promptText } = params;
+  const {
+    sessionId,
+    storedEffort,
+    storedEffortPolicy,
+    appDefault,
+    provider,
+    modelId,
+    customBackendId,
+    promptText,
+  } = params;
+  const capabilities = reasoningCapabilitiesForModel(provider, modelId, customBackendId);
+  const values = capabilities.effort?.values ?? [];
 
-  if (!isAutoEffortSetting(storedSetting)) {
+  if (!isAutoEffortPolicy(storedEffortPolicy)) {
+    policyStates.delete(sessionId);
     // Pre-existing fixed behavior: explicit per-session value wins, else the
     // app default; undefined leaves the CLI on its own default.
-    const fixed =
-      storedSetting != null && storedSetting !== '' && EFFORT_ORDER.includes(storedSetting as EffortLevel)
-        ? (storedSetting as EffortLevel)
+    const requested =
+      storedEffort != null && storedEffort !== ''
+        ? String(storedEffort)
         : appDefault;
-    return { effort: fixed, mode: 'fixed', source: 'fixed' };
+    if (requested !== undefined && !values.includes(requested)) {
+      throw new Error(
+        `Effort '${requested}' is not supported for this model/backend. Supported values: ${values.join(', ') || 'none'}.`
+      );
+    }
+    return { effort: requested, effortPolicy: 'fixed', source: 'fixed', effortValues: values };
   }
 
-  const mode: ReasoningMode = storedSetting;
-  const tierMap = mode === 'auto-plus' ? AUTO_PLUS_TIER_MAP : AUTO_TIER_MAP;
-  const defaultEffort = mode === 'auto-plus' ? AUTO_PLUS_DEFAULT_EFFORT : AUTO_DEFAULT_EFFORT;
-  const state = policyStates.get(sessionId);
+  const effortPolicy: EffortPolicy = storedEffortPolicy;
+  const tierMap = effortPolicy === 'auto-plus' ? AUTO_PLUS_TIER_MAP : AUTO_TIER_MAP;
+  const defaultEffort = defaultEffortForPolicy(effortPolicy, capabilities);
+  if (!defaultEffort || values.length === 0) {
+    throw new Error(`Effort policy '${effortPolicy}' requires a model/backend with an effort ladder.`);
+  }
+  const now = Date.now();
+  prunePolicyStates(now);
+  const priorState = policyStates.get(sessionId);
+  const state = priorState?.effortPolicy === effortPolicy ? priorState : undefined;
 
   if (promptText === undefined) {
     const sticky = state?.lastEffort ?? defaultEffort;
-    return { effort: clampEffortForModel(modelId, sticky), mode, source: 'sticky' };
+    return { effort: sticky, effortPolicy, source: 'sticky', effortValues: values };
   }
 
   const { tier, continuation } = classifyPrompt(promptText);
   const last = state?.lastEffort ?? defaultEffort;
-  let target = tierMap[tier];
+  let target = projectPolicyTarget(tierMap[tier], values);
+  const lastIndex = values.indexOf(last);
 
   if (continuation) {
     // Inherit the running level: a two-word "continue" carries no information
     // about the task's difficulty.
     target = last;
-  } else if (EFFORT_ORDER.indexOf(target) < EFFORT_ORDER.indexOf(last)) {
+  } else if (values.indexOf(target) < lastIndex) {
     // Hysteresis: decay one level per turn instead of cliff-dropping — a hard
     // task's follow-up turns are usually still the hard task.
-    target = stepDownOne(last, target);
+    target = stepDownOne(last, target, values);
   }
 
-  const clamped = clampEffortForModel(modelId, target);
+  const targetIndex = values.indexOf(target);
+  const escalated = lastIndex >= 0 && targetIndex > lastIndex;
+  policyStates.delete(sessionId);
   policyStates.set(sessionId, {
-    lastEffort: clamped,
-    simpleStreak: tier === 'SIMPLE' ? (state?.simpleStreak ?? 0) + 1 : 0,
+    lastEffort: target,
+    effortPolicy,
+    lastUsedAt: now,
   });
 
-  return { effort: clamped, mode, tier, source: 'policy' };
+  return {
+    effort: target,
+    effortPolicy,
+    tier,
+    source: 'policy',
+    escalated,
+    effortValues: values,
+  };
 }
 
 /** Test/lifecycle helper. */

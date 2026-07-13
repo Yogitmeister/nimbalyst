@@ -14,6 +14,8 @@ import {
   sessionRegistryAtom,
   sessionChildrenAtom,
   sessionParentIdAtom,
+  sessionStoreAtom,
+  updateSessionStoreAtom,
 } from '../atoms/sessions';
 import { workstreamStateAtom } from '../atoms/workstreamState';
 
@@ -82,6 +84,33 @@ export function initSessionListListeners(): () => void {
         ...(updates.isPinned !== undefined && { isPinned: updates.isPinned as boolean }),
       });
       store.set(sessionRegistryAtom, registry);
+    }
+
+    const loaded = store.get(sessionStoreAtom(sessionId));
+    if (loaded) {
+      const metadataUpdates: Record<string, unknown> = {};
+      for (const key of [
+        'effortLevel',
+        'effortPolicy',
+        'reasoningMode',
+        'reasoningThinking',
+        'reasoningBudgetTokens',
+        'autoEffortLast',
+        'autoEffortCounters',
+      ]) {
+        if (updates[key] !== undefined) metadataUpdates[key] = updates[key];
+      }
+      if (Object.keys(metadataUpdates).length > 0) {
+        store.set(updateSessionStoreAtom, {
+          sessionId,
+          updates: {
+            metadata: {
+              ...(loaded.metadata ?? {}),
+              ...metadataUpdates,
+            },
+          },
+        });
+      }
     }
   };
 

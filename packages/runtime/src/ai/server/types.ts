@@ -419,7 +419,7 @@ export interface ProviderConfig {
   temperature?: number;
   baseUrl?: string;
   allowedTools?: string[];  // List of allowed tool names, ['*'] for all tools
-  effortLevel?: EffortLevel;  // Effort level for Opus 4.6 adaptive reasoning (low/medium/high/max)
+  effortLevel?: string;  // Concrete provider/backend effort value; auto modes resolve before initialization.
   responseFormat?: ProviderResponseFormat;  // Response format constraint (extension chat completions)
   skipLogging?: boolean;  // Skip message logging to DB (extension stateless completions)
   agent?: string;  // OpenCode agent (role) to activate for this session

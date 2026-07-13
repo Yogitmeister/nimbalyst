@@ -11,7 +11,7 @@ vi.mock('@nimbalyst/runtime', () => ({
     updateMetadata: vi.fn(),
     get: vi.fn(),
   },
-  AgentMessagesRepository: {},
+  AgentMessagesRepository: { create: vi.fn() },
   SessionFilesRepository: {},
 }));
 
@@ -68,8 +68,12 @@ vi.mock('../ai/providerResolution', () => ({
 
 vi.mock('electron', () => ({
   BrowserWindow: { getAllWindows: () => [] },
+  app: { isPackaged: false, getPath: () => '/tmp' },
 }));
 
+vi.mock('../NotificationService', () => ({
+  notificationService: { showNotificationWithResult: vi.fn() },
+}));
 vi.mock('../SyncManager', () => ({ getSyncProvider: () => ({ pushChange: vi.fn() }) }));
 vi.mock('../../utils/ipcRegistry', () => ({ safeHandle: vi.fn() }));
 vi.mock('../../utils/store', () => ({ getDefaultAIModel: () => null }));
@@ -113,12 +117,16 @@ const CLAUDE_PARENT = {
   id: 'parent-claude-session',
   provider: 'claude-code',
   model: 'claude-code:opus',
+  workspacePath: '/workspace/path',
+  parentSessionId: 'existing-workstream',
+  metadata: { effortLevel: 'high', effortPolicy: 'auto' },
 };
 
 const CODEX_PARENT = {
   id: 'parent-codex-session',
   provider: 'openai-codex',
   model: 'openai-codex:gpt-5.4',
+  workspacePath: '/workspace/path',
 };
 
 
@@ -126,6 +134,7 @@ describe('MetaAgentService child-spawn provider inheritance', () => {
   beforeEach(() => {
     vi.mocked(AISessionsRepository.create).mockReset();
     vi.mocked(AISessionsRepository.get).mockReset();
+    vi.mocked(AISessionsRepository.updateMetadata).mockReset();
   });
 
   it('inherits the gemini parent provider+model when the parent is a chat-only extension agent and no provider is given', async () => {
@@ -298,6 +307,214 @@ describe('MetaAgentService child-spawn provider inheritance', () => {
     const created = vi.mocked(AISessionsRepository.create).mock.calls[0][0] as any;
     expect(created.provider).toBe('antigravity-gemini-agent');
     expect(created.provider).not.toBe('claude-code');
+  });
+});
+
+describe('MetaAgentService reasoning controls', () => {
+  beforeEach(() => {
+    vi.mocked(AISessionsRepository.create).mockReset();
+    vi.mocked(AISessionsRepository.get).mockReset();
+    vi.mocked(AISessionsRepository.updateMetadata).mockReset();
+    vi.mocked(databaseWorker.query).mockResolvedValue({ rows: [{ in_flight: '0', total: '0' }] } as any);
+  });
+
+  it('returns and persists explicit reasoning for create_session', async () => {
+    const service = MetaAgentService.getInstance();
+    (service as any).aiService = { queuePromptForSession: vi.fn() };
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(CLAUDE_PARENT as any);
+
+    const result = await (service as any).createChildSessionInternal(
+      CLAUDE_PARENT.id,
+      '/workspace/path',
+      { reasoning: { effortPolicy: 'auto' } },
+    );
+
+    expect(result.resolvedExecutionConfig.reasoning).toMatchObject({
+      effortPolicy: 'auto',
+      effort: 'high',
+      source: 'explicit',
+    });
+    expect(vi.mocked(AISessionsRepository.create).mock.calls[0][0]).toMatchObject({
+      metadata: {
+        effortLevel: 'high',
+        effortPolicy: 'auto',
+        reasoningThinking: 'provider-default',
+      },
+    });
+  });
+
+  it('rejects an unavailable Codex provider mode atomically', async () => {
+    const service = MetaAgentService.getInstance();
+    (service as any).aiService = { queuePromptForSession: vi.fn() };
+    const parent = {
+      ...CODEX_PARENT,
+      model: 'openai-codex:gpt-5.6-sol',
+    };
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(parent as any);
+
+    await expect((service as any).createChildSessionInternal(
+      parent.id,
+      '/workspace/path',
+      { reasoning: { mode: 'pro', effort: 'max', effortPolicy: 'fixed' } },
+    )).rejects.toThrow("Provider reasoning mode 'pro' is not supported");
+    expect(AISessionsRepository.create).not.toHaveBeenCalled();
+  });
+
+  it('changes the Codex effort policy independently', async () => {
+    const service = MetaAgentService.getInstance();
+    const parent = {
+      ...CODEX_PARENT,
+      model: 'openai-codex:gpt-5.6-sol',
+      metadata: {
+        effortLevel: 'max',
+        effortPolicy: 'fixed',
+        reasoningThinking: 'provider-default',
+      },
+    };
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(parent as any);
+
+    const result = JSON.parse(await (service as any).setModelControl(
+      parent.id,
+      '/workspace/path',
+      { reasoning: { effortPolicy: 'auto' } },
+    ));
+
+    expect(result.resolved.reasoning).toMatchObject({
+      effortPolicy: 'auto',
+    });
+    expect(AISessionsRepository.updateMetadata).toHaveBeenLastCalledWith(
+      parent.id,
+      { metadata: expect.objectContaining({ effortPolicy: 'auto' }) },
+    );
+  });
+
+  it('uses the resolved model default when creation has no reasoning selection', async () => {
+    const service = MetaAgentService.getInstance();
+    (service as any).aiService = { queuePromptForSession: vi.fn() };
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(CLAUDE_PARENT as any);
+
+    const result = await (service as any).createChildSessionInternal(
+      CLAUDE_PARENT.id,
+      '/workspace/path',
+      {},
+    );
+
+    expect(result.resolvedExecutionConfig.reasoning).toMatchObject({
+      effortPolicy: 'fixed',
+      effort: 'high',
+      source: 'default',
+    });
+  });
+
+  it('inherits reasoning only when spawn_session inheritModel is true', async () => {
+    const service = MetaAgentService.getInstance();
+    (service as any).aiService = {
+      queuePromptForSession: vi.fn(),
+      triggerQueuedPromptProcessingForSession: vi.fn(),
+    };
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(CLAUDE_PARENT as any);
+
+    const inherited = JSON.parse(await (service as any).spawnSession(
+      CLAUDE_PARENT.id,
+      '/workspace/path',
+      { prompt: 'work', inheritModel: true },
+    ));
+    expect(inherited.resolvedExecutionConfig.reasoning).toMatchObject({
+      effortPolicy: 'auto',
+      source: 'inherited',
+    });
+
+    const defaulted = JSON.parse(await (service as any).spawnSession(
+      CLAUDE_PARENT.id,
+      '/workspace/path',
+      { prompt: 'work', inheritModel: false },
+    ));
+    expect(defaulted.resolvedExecutionConfig.reasoning).toMatchObject({
+      effortPolicy: 'fixed',
+      source: 'default',
+    });
+  });
+
+  it('allows self and direct-child updates but rejects unrelated sessions', async () => {
+    const service = MetaAgentService.getInstance();
+    const child = {
+      ...CLAUDE_PARENT,
+      id: 'child-session',
+      createdBySessionId: CLAUDE_PARENT.id,
+    };
+    const unrelated = {
+      ...CLAUDE_PARENT,
+      id: 'unrelated-session',
+      createdBySessionId: 'someone-else',
+    };
+    vi.mocked(AISessionsRepository.get).mockImplementation(async (id: string) => {
+      if (id === CLAUDE_PARENT.id) return CLAUDE_PARENT as any;
+      if (id === child.id) return child as any;
+      if (id === unrelated.id) return unrelated as any;
+      return null;
+    });
+
+    const self = JSON.parse(await (service as any).setModelControl(
+      CLAUDE_PARENT.id,
+      '/workspace/path',
+      { reasoning: { effortPolicy: 'auto-plus' } },
+    ));
+    expect(self).toMatchObject({
+      sessionId: CLAUDE_PARENT.id,
+      effectiveFrom: 'next-turn',
+      requiresRestart: false,
+    });
+
+    await expect((service as any).setModelControl(
+      CLAUDE_PARENT.id,
+      '/workspace/path',
+      { sessionId: child.id, reasoning: { effortPolicy: 'fixed', effort: 'max' } },
+    )).resolves.toContain('child-session');
+
+    await expect((service as any).setModelControl(
+      CLAUDE_PARENT.id,
+      '/workspace/path',
+      { sessionId: unrelated.id, reasoning: { effortPolicy: 'auto' } },
+    )).rejects.toThrow(/only change its own reasoning control or a session it created/);
+  });
+
+  it('rejects model writes and persists a selection that the next turn consumes', async () => {
+    const service = MetaAgentService.getInstance();
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(CLAUDE_PARENT as any);
+
+    await expect((service as any).setModelControl(
+      CLAUDE_PARENT.id,
+      '/workspace/path',
+      { model: 'claude-code:sonnet', reasoning: { effortPolicy: 'auto' } },
+    )).rejects.toThrow(/reasoning-only/);
+
+    await (service as any).setModelControl(
+      CLAUDE_PARENT.id,
+      '/workspace/path',
+      { reasoning: { effortPolicy: 'auto-plus' } },
+    );
+    expect(AISessionsRepository.updateMetadata).toHaveBeenLastCalledWith(
+      CLAUDE_PARENT.id,
+      { metadata: {
+        effortLevel: 'high',
+        effortPolicy: 'auto-plus',
+        reasoningThinking: 'provider-default',
+      } },
+    );
+
+    const { resolveEffortForTurn, resetReasoningPolicyState } = await import(
+      '@nimbalyst/runtime/ai/server/reasoningPolicy'
+    );
+    resetReasoningPolicyState();
+    expect(resolveEffortForTurn({
+      sessionId: CLAUDE_PARENT.id,
+      storedEffort: 'high',
+      storedEffortPolicy: 'auto-plus',
+      appDefault: 'high',
+      provider: 'claude-code',
+      modelId: 'claude-code:opus',
+      promptText: 'hello',
+    }).effort).toBe('high');
   });
 });
 

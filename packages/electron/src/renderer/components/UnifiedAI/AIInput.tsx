@@ -9,7 +9,7 @@ import type { EffortLevel } from '../../utils/modelUtils';
 import { AttachmentPreviewList } from '../AgenticCoding/AttachmentPreviewList';
 import { ModeTag, AIMode } from './ModeTag';
 import { ModelSelector } from './ModelSelector';
-import { EffortLevelSelector } from './EffortLevelSelector';
+import { EffortLevelSelector, type EffortSetting } from './EffortLevelSelector';
 import { registerPendingVoiceCommandSetter } from './VoiceModeButton.tsx';
 import { PendingVoiceCommand } from './PendingVoiceCommand';
 import { pendingVoiceCommandAtom, voiceActiveSessionIdAtom, type PendingVoiceCommand as PendingVoiceCommandType } from '../../store/atoms/voiceModeState';
@@ -86,10 +86,11 @@ interface AIInputProps {
   readOnlyModelTitle?: string;
 
   // Effort level support (Opus 4.6 adaptive reasoning)
-  effortLevel?: EffortLevel;
-  onEffortLevelChange?: (level: EffortLevel) => void;
+  effortLevel?: EffortSetting;
+  onEffortLevelChange?: (level: EffortSetting) => void;
   showEffortLevel?: boolean;
   supportedEffortLevels?: { key: EffortLevel; label: string }[];
+  resolvedEffort?: string | null;
 
   // OpenCode agent (role) selection
   opencodeAgent?: string | null;
@@ -180,6 +181,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     onEffortLevelChange,
     showEffortLevel,
     supportedEffortLevels,
+    resolvedEffort,
     opencodeAgent,
     onAgentChange,
     availableAgents,
@@ -1385,6 +1387,8 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
                 level={effortLevel}
                 onLevelChange={onEffortLevelChange}
                 supportedLevels={supportedEffortLevels}
+                allowAuto={currentProvider === 'claude-code'}
+                resolvedEffort={resolvedEffort}
               />
             )}
             {currentProvider === 'opencode' && availableAgents && availableAgents.length > 0 && onAgentChange && (

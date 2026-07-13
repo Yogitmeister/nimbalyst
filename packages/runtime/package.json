@@ -42,6 +42,14 @@
       "import": "./dist/ai/server/effortLevels.js",
       "types": "./dist/ai/server/effortLevels.d.ts"
     },
+    "./ai/server/reasoningPolicy": {
+      "import": "./dist/ai/server/reasoningPolicy.js",
+      "types": "./dist/ai/server/reasoningPolicy.d.ts"
+    },
+    "./ai/server/providers/claudeCode/reasoning": {
+      "import": "./dist/ai/server/providers/claudeCode/reasoning.js",
+      "types": "./dist/ai/server/providers/claudeCode/reasoning.d.ts"
+    },
     "./ai/types": {
       "import": "./dist/ai/types.js",
       "types": "./dist/ai/types.d.ts"
