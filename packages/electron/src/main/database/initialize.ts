@@ -18,7 +18,7 @@ import { DatabaseBackupService } from '../services/database/DatabaseBackupServic
 import { SQLiteBackupService } from '../services/database/SQLiteBackupService';
 import { checkWorktreeArchiveConsistency, createWorktreeStore } from '../services/WorktreeStore';
 import { archiveProgressManager } from '../services/ArchiveProgressManager';
-import { GitWorktreeService } from '../services/GitWorktreeService';
+import { createWorktreeLifecycleService } from '../services/WorktreeLifecycleService';
 import { timeStartupPhase } from '../utils/startupTiming';
 
 // Backup service instance — only used by the PGLite path now. The SQLite
@@ -257,11 +257,22 @@ export async function initializeDatabase(): Promise<SessionStore> {
       logger.main.error('[Database] Worktree archive consistency check failed:', consistencyError);
     }
 
+    // Reconcile persisted rows against disk and Git registration before any
+    // listing surface can advertise them as usable worktrees.
+    try {
+      await createWorktreeLifecycleService(database).reconcileAllWorkspaces();
+    } catch (reconciliationError) {
+      logger.main.error('[Database] Worktree availability reconciliation failed:', reconciliationError);
+    }
+
     // Load persisted archive queue tasks
     // This handles cases where the app crashed while processing archive cleanup
     try {
-      const gitWorktreeService = new GitWorktreeService();
+      const { createRuntimeWorktreeLifecycleService } = await import(
+        '../services/WorktreeLifecycleRuntime'
+      );
       const worktreeStore = createWorktreeStore(database);
+      const lifecycleService = createRuntimeWorktreeLifecycleService(database);
 
       const { recovered, failed } = await archiveProgressManager.loadPersistedTasks(
         async (worktreeId: string, worktreeName: string) => {
@@ -272,25 +283,18 @@ export async function initializeDatabase(): Promise<SessionStore> {
             return null;
           }
 
-          // If worktree is already archived, no callback needed
-          if (worktree.isArchived) {
+          // An archived row with no directory is already terminal. If the
+          // directory remains, rerun the same guarded lifecycle transaction;
+          // never replay a raw disk deletion from persisted queue state.
+          if (worktree.isArchived && !fs.existsSync(worktree.path)) {
             logger.main.info('[Database] Worktree already archived, skipping persisted task', { worktreeId });
             return null;
           }
 
-          // Create cleanup callback that mirrors the original archive flow
           return async () => {
             archiveProgressManager.updateTaskStatus(worktreeId, 'removing-worktree');
-
-            // Delete the worktree from disk
-            await gitWorktreeService.deleteWorktree(worktree.path, worktree.projectPath);
-
-            logger.main.info('[Database] Recovered archive task cleanup completed', { worktreeId });
-
-            // Mark as archived in database
-            await worktreeStore.updateArchived(worktreeId, true);
-
-            logger.main.info('[Database] Recovered archive task marked as archived', { worktreeId });
+            await lifecycleService.cleanupWorktree(worktreeId, worktree.projectPath, 'archive');
+            logger.main.info('[Database] Recovered archive task completed through lifecycle gate', { worktreeId });
           };
         }
       );

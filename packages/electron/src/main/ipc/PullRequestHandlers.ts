@@ -31,6 +31,7 @@ import { computePrPermissions, type PrPermissions } from '../services/prPermissi
 import { GitStatusService } from '../services/GitStatusService';
 import { GitWorktreeService } from '../services/GitWorktreeService';
 import { createWorktreeStore, type Worktree } from '../services/WorktreeStore';
+import { createWorktreeLifecycleService } from '../services/WorktreeLifecycleService';
 import { gitOperationLock } from '../services/GitOperationLock';
 import { gitRefWatcher } from '../file/GitRefWatcher';
 import { getDatabase } from '../database/initialize';
@@ -614,9 +615,10 @@ export function registerPullRequestHandlers(): void {
           throw new Error('Database not initialized');
         }
         const worktreeStore = createWorktreeStore(db);
+        await createWorktreeLifecycleService(db).reconcileWorkspace(workspacePath);
 
         // Idempotent: reuse an existing worktree bound to this PR if its dir
-        // still exists on disk.
+        // still exists on disk and remains registered with Git.
         const existing = await worktreeStore.findByPullRequest(workspacePath, remote, number);
         if (existing && fs.existsSync(existing.path)) {
           logger.info('Reusing existing PR worktree', { id: existing.id, number });

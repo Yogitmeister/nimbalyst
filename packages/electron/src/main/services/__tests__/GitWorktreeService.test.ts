@@ -115,4 +115,91 @@ describe('GitWorktreeService.verifyWorktreeBinding', () => {
       service.verifyWorktreeBinding(projectPath, { ...worktree, branch: 'worktree/not-this-one' })
     ).rejects.toThrow(/branch mismatch/);
   });
+
+  async function configureOrigin(): Promise<void> {
+    const remotePath = path.join(tmpDir, 'origin.git');
+    fs.mkdirSync(remotePath);
+    await simpleGit(remotePath).init(true);
+    const git = simpleGit(projectPath);
+    await git.addRemote('origin', remotePath);
+    const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
+    await git.push(['-u', 'origin', branch]);
+  }
+
+  it('proves clean, merged, and pushed durability before removal', async () => {
+    await configureOrigin();
+    const worktree = await service.createWorktree(projectPath, { name: 'durable-child' });
+
+    const readiness = await service.verifyWorktreeRemovalReadiness(projectPath, worktree);
+
+    expect(readiness.head).toBe(readiness.projectHead);
+    expect(readiness.remoteRefsContainingHead).toContain(
+      `refs/remotes/origin/${worktree.baseBranch}`,
+    );
+  });
+
+  it('rejects a dirty worktree even when its current HEAD is durable', async () => {
+    await configureOrigin();
+    const worktree = await service.createWorktree(projectPath, { name: 'dirty-child' });
+    fs.writeFileSync(path.join(worktree.path, 'dirty.txt'), 'not committed');
+
+    await expect(
+      service.verifyWorktreeRemovalReadiness(projectPath, worktree),
+    ).rejects.toThrow(/uncommitted changes/);
+  });
+
+  it('rejects a clean checkout with an in-progress Git operation', async () => {
+    await configureOrigin();
+    const worktree = await service.createWorktree(projectPath, { name: 'rebasing-child' });
+    const gitDir = (await simpleGit(worktree.path).revparse(['--absolute-git-dir'])).trim();
+    fs.mkdirSync(path.join(gitDir, 'rebase-merge'));
+
+    await expect(
+      service.verifyWorktreeRemovalReadiness(projectPath, worktree),
+    ).rejects.toThrow(/in-progress Git operation \(rebase\)/);
+  });
+
+  it('rejects a pushed worktree HEAD that is not merged into its base', async () => {
+    await configureOrigin();
+    const worktree = await service.createWorktree(projectPath, { name: 'unmerged-child' });
+    const worktreeGit = simpleGit(worktree.path);
+    fs.writeFileSync(path.join(worktree.path, 'feature.txt'), 'feature');
+    await worktreeGit.add('feature.txt');
+    await worktreeGit.commit('feature');
+    await worktreeGit.push(['-u', 'origin', worktree.branch]);
+
+    await expect(
+      service.verifyWorktreeRemovalReadiness(projectPath, worktree),
+    ).rejects.toThrow(/not merged/);
+  });
+
+  it('rejects a locally merged worktree HEAD that is not pushed', async () => {
+    await configureOrigin();
+    const worktree = await service.createWorktree(projectPath, { name: 'unpushed-child' });
+    const worktreeGit = simpleGit(worktree.path);
+    fs.writeFileSync(path.join(worktree.path, 'local-only.txt'), 'local');
+    await worktreeGit.add('local-only.txt');
+    await worktreeGit.commit('local only');
+    await simpleGit(projectPath).merge([worktree.branch, '--ff-only']);
+
+    await expect(
+      service.verifyWorktreeRemovalReadiness(projectPath, worktree),
+    ).rejects.toThrow(/not present on any remote-tracking ref/);
+  });
+
+  it('removes only after revalidation and retains the committed branch', async () => {
+    await configureOrigin();
+    const worktree = await service.createWorktree(projectPath, { name: 'safe-remove-child' });
+
+    await service.deleteWorktreeSafely(
+      worktree.path,
+      projectPath,
+      () => service.verifyWorktreeRemovalReadiness(projectPath, worktree),
+    );
+
+    expect(fs.existsSync(worktree.path)).toBe(false);
+    expect((await service.listWorktrees(projectPath)).some((entry) =>
+      comparable(entry.path) === comparable(worktree.path))).toBe(false);
+    expect((await simpleGit(projectPath).branchLocal()).all).toContain(worktree.branch);
+  });
 });

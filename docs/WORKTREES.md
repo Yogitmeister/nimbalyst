@@ -53,7 +53,7 @@ ALTER TABLE ai_sessions ADD COLUMN worktree_id TEXT REFERENCES worktrees(id) ON 
 CREATE INDEX idx_ai_sessions_worktree ON ai_sessions(worktree_id);
 ```
 
-When a worktree is deleted, the `worktree_id` is set to NULL for all associated sessions. This preserves the session history while marking that the worktree no longer exists.
+When a worktree is deleted, the `worktree_id` is set to NULL for all associated sessions. Before that happens, linked sessions are archived and retain lifecycle metadata that marks the deleted checkout as non-resumable, so later prompts create a main-workspace continuation instead of reusing the deleted path.
 
 ### TypeScript Interface
 
@@ -98,6 +98,8 @@ Manages git worktree operations using the `simple-git` library.
   - Deletes the worktree directory
   - Removes git worktree registration
   - Deletes the associated branch
+- `verifyWorktreeRemovalReadiness(projectPath, worktree)`: Proves the exact registered HEAD is clean, merged, and present on a remote-tracking ref
+- `deleteWorktreeSafely(worktreePath, workspacePath, beforeRemove)`: Revalidates inside the Git lock and removes without force or branch deletion
 - `listWorktrees(workspacePath)`: Lists all git worktrees for a repository
   - Returns array of worktree paths, branches, and isMain flag
 
@@ -118,6 +120,12 @@ Database persistence layer for worktree metadata.
 - `exists(path)`: Check if worktree exists by path
 - `getWorktreeSessions(worktreeId)`: Get all session IDs associated with a worktree
 
+#### WorktreeLifecycleService
+
+**Location**: `packages/electron/src/main/services/WorktreeLifecycleService.ts`
+
+Owns every user-facing archive and delete transaction. It refuses cleanup while linked sessions are active, waiting, queued, missing captured completion evidence, or non-terminal; then rechecks Git identity, cleanliness, merge state, and push durability immediately before removal. Failed removal restores the prior visible/resumable session metadata when the checkout remains usable. Listing calls also reconcile missing or unregistered rows as archived and unavailable.
+
 ### IPC Communication
 
 **Location**: `packages/electron/src/main/ipc/WorktreeHandlers.ts`
@@ -127,8 +135,9 @@ Exposes worktree operations to the renderer process via IPC.
 **IPC Channels:**
 - `worktree:create` - Create new worktree
 - `worktree:get-status` - Get git status for worktree
-- `worktree:delete` - Delete worktree and its database record
-- `worktree:list` - List all worktrees for a workspace
+- `worktree:delete` - Lifecycle-gated removal of a worktree and its database record
+- `worktree:archive` - Lifecycle-gated removal that retains an archived worktree record
+- `worktree:list` - Reconcile and list only usable worktrees for a workspace
 - `worktree:get` - Get single worktree by ID
 
 **Preload API** (`packages/electron/src/preload/index.ts`):
@@ -229,6 +238,14 @@ The `worktreePath` is used as the working directory for Claude Code, ensuring al
 1. Sessions with `worktreeId` are rendered using `WorktreeSingle` component
 2. Sessions without `worktreeId` are rendered as regular sessions
 3. Worktree sessions appear first, followed by regular sessions
+
+### Archiving or Deleting a Worktree
+
+1. The lifecycle gate proves every linked session is idle, has no pending/executing prompt, has captured completion evidence, and is terminal.
+2. Inside the Git removal lock, Nimbalyst revalidates the path, registration, branch, exact HEAD, cleanliness, merge state, and remote durability.
+3. Linked sessions are retired as archived and non-resumable, terminals/watchers are stopped, and Git removes the checkout without force.
+4. Archive retains an unavailable database row; delete removes it. A later agent follow-up creates a new main-workspace continuation.
+5. Missing paths or registrations are reconciled as archived/unavailable and are excluded from UI and agent worktree lists.
 
 ## File Locations
 

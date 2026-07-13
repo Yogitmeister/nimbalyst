@@ -338,4 +338,83 @@ describe('MetaAgentService worktree authority', () => {
       WORKSPACE
     );
   });
+
+  it('routes a post-cleanup follow-up to a new main-workspace continuation', async () => {
+    service.shouldBypassChildAgentExecutionForTests = () => true;
+    const retiredSession = {
+      ...PARENT,
+      id: 'retired-session',
+      title: 'Completed worktree task',
+      providerConfig: { endpoint: 'configured' },
+      worktreeId: null,
+      isArchived: true,
+      metadata: {
+        worktreeLifecycle: {
+          terminalDisposition: 'retired',
+          resumable: false,
+          retiredWorktreePath: '/deleted/worktree',
+        },
+      },
+      parentSessionId: 'workstream-1',
+      createdBySessionId: PARENT.id,
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [],
+    };
+    let continuation: any = null;
+    vi.mocked(AISessionsRepository.get).mockImplementation(async (sessionId: string) => {
+      if (sessionId === retiredSession.id) return retiredSession as any;
+      if (continuation && sessionId === continuation.id) return continuation;
+      return null as any;
+    });
+    vi.mocked(AISessionsRepository.create).mockImplementation(async (payload: any) => {
+      continuation = {
+        ...payload,
+        workspacePath: payload.workspaceId,
+        messages: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+    });
+
+    const result = JSON.parse(await service.sendPromptToSession(
+      retiredSession.id,
+      WORKSPACE,
+      'follow up safely',
+    ));
+
+    expect(result).toMatchObject({
+      sessionId: continuation.id,
+      continuedFromSessionId: retiredSession.id,
+      bypassedExecutionForTest: true,
+    });
+    expect(AISessionsRepository.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceId: WORKSPACE,
+        branchedFromSessionId: retiredSession.id,
+        parentSessionId: retiredSession.parentSessionId,
+        providerConfig: retiredSession.providerConfig,
+      }),
+    );
+    expect(AISessionsRepository.create).toHaveBeenCalledWith(
+      expect.not.objectContaining({ worktreeId: expect.anything() }),
+    );
+    expect(AgentMessagesRepository.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: continuation.id,
+        content: 'follow up safely',
+      }),
+    );
+    expect(AISessionsRepository.updateMetadata).toHaveBeenCalledWith(
+      retiredSession.id,
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          worktreeLifecycle: expect.objectContaining({
+            continuationSessionId: continuation.id,
+            resumable: false,
+          }),
+        }),
+      }),
+    );
+  });
 });

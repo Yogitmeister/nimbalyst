@@ -10,7 +10,7 @@ interface ArchiveWorktreeDialogProps {
   onKeep: () => void;
   /** Optional message to show (e.g., "Merge successful!" after a merge) */
   contextMessage?: string;
-  /** Whether any worktree has uncommitted changes that will be lost */
+  /** Whether any worktree has uncommitted changes that block archival */
   hasUncommittedChanges?: boolean;
   /** Number of uncommitted files (for display) */
   uncommittedFileCount?: number;
@@ -38,6 +38,7 @@ export function ArchiveWorktreeDialog({
   unmergedWorktreeCount,
 }: ArchiveWorktreeDialogProps) {
   const isBulk = (worktreeCount ?? 1) > 1;
+  const archiveBlocked = hasUncommittedChanges === true || hasUnmergedChanges === true;
   const dialogRef = useRef<HTMLDivElement>(null);
 
   // Close on escape key
@@ -88,12 +89,12 @@ export function ArchiveWorktreeDialog({
               <MaterialSymbol icon="warning" size={20} className="text-[var(--nim-warning)] shrink-0 mt-0.5" />
               <div>
                 <p className="m-0 text-sm font-medium text-[var(--nim-warning)]">
-                  Uncommitted changes will be lost
+                  Commit changes before archiving
                 </p>
                 <p className="m-0 mt-1 text-[0.8125rem] text-[var(--nim-text-muted)]">
                   {isBulk
-                    ? <>{uncommittedWorktreeCount} {uncommittedWorktreeCount === 1 ? 'worktree has' : 'worktrees have'} uncommitted changes ({uncommittedFileCount} {uncommittedFileCount === 1 ? 'file' : 'files'} total). These changes will be permanently deleted.</>
-                    : <>This worktree has {uncommittedFileCount === 1 ? '1 file' : `${uncommittedFileCount} files`} with uncommitted changes. These changes will be permanently deleted.</>
+                    ? <>{uncommittedWorktreeCount} {uncommittedWorktreeCount === 1 ? 'worktree has' : 'worktrees have'} uncommitted changes ({uncommittedFileCount} {uncommittedFileCount === 1 ? 'file' : 'files'} total). Nimbalyst will not delete them.</>
+                    : <>This worktree has {uncommittedFileCount === 1 ? '1 file' : `${uncommittedFileCount} files`} with uncommitted changes. Nimbalyst will not delete them.</>
                   }
                 </p>
               </div>
@@ -105,7 +106,7 @@ export function ArchiveWorktreeDialog({
               <MaterialSymbol icon="warning" size={20} className="text-[var(--nim-warning)] shrink-0 mt-0.5" />
               <div>
                 <p className="m-0 text-sm font-medium text-[var(--nim-warning)]">
-                  Unmerged commits will be lost
+                  Merge and push commits before archiving
                 </p>
                 <p className="m-0 mt-1 text-[0.8125rem] text-[var(--nim-text-muted)]">
                   {isBulk
@@ -140,9 +141,10 @@ export function ArchiveWorktreeDialog({
             type="button"
             className="nim-btn-primary"
             onClick={onArchive}
+            disabled={archiveBlocked}
           >
             <MaterialSymbol icon="archive" size={16} />
-            <span>{isBulk ? 'Archive All' : 'Archive'}</span>
+            <span>{archiveBlocked ? 'Archive unavailable' : (isBulk ? 'Archive All' : 'Archive')}</span>
           </button>
         </div>
       </div>

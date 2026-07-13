@@ -52,6 +52,7 @@ import { initMobileSessionControlHandler } from './MobileSessionControlHandler';
 import { handleMobileVoiceToolCall } from '../voice/mobileVoiceToolHandler';
 import { SoundNotificationService } from '../SoundNotificationService';
 import { getTerminalSessionManager } from '../TerminalSessionManager';
+import { createWorktreeLifecycleService } from '../WorktreeLifecycleService';
 import { flushNextClaudeCliQueuedPromptForSession } from './claudeCliQueueFlushSingleton';
 import { notificationService } from '../NotificationService';
 import { TrayManager } from '../../tray/TrayManager';
@@ -1867,9 +1868,16 @@ export class AIService {
           throw new Error('Database not initialized');
         }
         const worktreeStore = createWorktreeStore(db);
-        const worktree = await worktreeStore.get(worktreeId);
-        if (!worktree) {
+        const recordedWorktree = await worktreeStore.get(worktreeId);
+        if (!recordedWorktree || recordedWorktree.isArchived) {
           throw new Error(`Worktree ${worktreeId} not found in database`);
+        }
+
+        const { usable } = await createWorktreeLifecycleService(db)
+          .reconcileWorkspace(recordedWorktree.projectPath);
+        const worktree = usable.find((candidate) => candidate.id === worktreeId);
+        if (!worktree) {
+          throw new Error(`Worktree ${worktreeId} is unavailable or no longer registered`);
         }
 
         // Validate that the worktree directory actually exists

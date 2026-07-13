@@ -12,7 +12,7 @@ import {
   type ReasoningSelection,
   type NormalizedReasoningSelection,
 } from '@nimbalyst/runtime/ai/server/providers/claudeCode/reasoning';
-import type { AIProviderType } from '@nimbalyst/runtime/ai/server/types';
+import type { AIProviderType, SessionData } from '@nimbalyst/runtime/ai/server/types';
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
 import { AISessionsRepository, AgentMessagesRepository, SessionFilesRepository } from '@nimbalyst/runtime';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
@@ -20,6 +20,11 @@ import { getDefaultAIModel } from '../utils/store';
 import { toMillis } from '../utils/timestampUtils';
 import { createWorktreeStore } from './WorktreeStore';
 import { GitWorktreeService } from './GitWorktreeService';
+import {
+  createWorktreeLifecycleService,
+  type WorktreeLifecycleMetadata,
+} from './WorktreeLifecycleService';
+import { recordWorktreeSessionResult } from './worktreeSessionLifecycle';
 import { database as databaseWorker } from '../database/PGLiteDatabaseWorker';
 import { getDatabase } from '../database/initialize';
 import { gitRefWatcher } from '../file/GitRefWatcher';
@@ -252,6 +257,7 @@ export class MetaAgentService {
   private sessionManager: SessionManager | null = null;
   private unsubscribeStateListener: (() => void) | null = null;
   private notificationSignatures = new Map<string, string>();
+  private retiredContinuationPromises = new Map<string, Promise<SessionData>>();
   private ipcHandlersRegistered = false;
 
   private constructor() {}
@@ -1119,7 +1125,8 @@ export class MetaAgentService {
     }
 
     const worktreeStore = createWorktreeStore(db);
-    const worktrees = await worktreeStore.list(workspaceId);
+    const { usable: worktrees } = await createWorktreeLifecycleService(db)
+      .reconcileWorkspace(workspaceId);
     const summaries = await Promise.all(
       worktrees.map(async (worktree) => {
         const sessionIds = await worktreeStore.getWorktreeSessions(worktree.id);
@@ -1165,6 +1172,9 @@ export class MetaAgentService {
 
   private async getSessionResultJson(sessionId: string, workspaceId: string): Promise<string> {
     const data = await this.buildSessionResultData(sessionId, workspaceId);
+    if (data.fullResponse?.trim() || data.lastResponse?.trim()) {
+      await recordWorktreeSessionResult(sessionId);
+    }
     return JSON.stringify(data, null, 2);
   }
 
@@ -1207,6 +1217,148 @@ export class MetaAgentService {
     }, null, 2);
   }
 
+  private getWorktreeLifecycleMetadata(session: SessionData): WorktreeLifecycleMetadata {
+    const metadata = (session.metadata as Record<string, unknown> | undefined) ?? {};
+    const lifecycle = metadata.worktreeLifecycle;
+    return lifecycle && typeof lifecycle === 'object' && !Array.isArray(lifecycle)
+      ? lifecycle as WorktreeLifecycleMetadata
+      : {};
+  }
+
+  private async resolvePromptTargetSession(
+    session: SessionData,
+    workspaceId: string,
+  ): Promise<{ session: SessionData; continuedFromSessionId: string | null }> {
+    const lifecycle = this.getWorktreeLifecycleMetadata(session);
+    let requiresContinuation = lifecycle.resumable === false || session.isArchived === true;
+
+    if (!requiresContinuation && session.worktreeId) {
+      const db = getDatabase();
+      if (!db) throw new Error('Database not initialized');
+      const worktreeStore = createWorktreeStore(db);
+      const worktree = await worktreeStore.get(session.worktreeId);
+      if (!worktree || worktree.isArchived) {
+        requiresContinuation = true;
+      } else {
+        try {
+          await new GitWorktreeService().verifyWorktreeBinding(workspaceId, worktree);
+        } catch {
+          requiresContinuation = true;
+          await createWorktreeLifecycleService(db).reconcileWorkspace(workspaceId).catch(() => {
+            // The prompt still routes away from the unverifiable cwd even if
+            // reconciliation cannot persist its archive marker right now.
+          });
+        }
+      }
+    }
+
+    if (!requiresContinuation) {
+      return { session, continuedFromSessionId: null };
+    }
+
+    const continuation = await this.getOrCreateRetiredContinuation(session, workspaceId);
+    return { session: continuation, continuedFromSessionId: session.id };
+  }
+
+  private async getOrCreateRetiredContinuation(
+    source: SessionData,
+    workspaceId: string,
+  ): Promise<SessionData> {
+    const lifecycle = this.getWorktreeLifecycleMetadata(source);
+    if (lifecycle.continuationSessionId) {
+      const existing = await AISessionsRepository.get(lifecycle.continuationSessionId);
+      if (
+        existing?.workspacePath === workspaceId
+        && !existing.worktreeId
+        && existing.isArchived !== true
+        && this.getWorktreeLifecycleMetadata(existing).resumable !== false
+      ) {
+        return existing;
+      }
+    }
+
+    const inFlight = this.retiredContinuationPromises.get(source.id);
+    if (inFlight) return inFlight;
+
+    const creation = (async (): Promise<SessionData> => {
+      const continuationId = randomUUID();
+      const sourceMetadata = (source.metadata as Record<string, unknown> | undefined) ?? {};
+      const continuationMetadata: Record<string, unknown> = {
+        continuedFromRetiredSessionId: source.id,
+      };
+      if (sourceMetadata.notifyParent !== undefined) {
+        continuationMetadata.notifyParent = sourceMetadata.notifyParent;
+      }
+      if (sourceMetadata.toolScope !== undefined) {
+        continuationMetadata.toolScope = sourceMetadata.toolScope;
+      }
+
+      await AISessionsRepository.create({
+        id: continuationId,
+        provider: source.provider,
+        model: source.model,
+        title: `${source.title || 'Session'} (continuation)`,
+        workspaceId,
+        sessionType: 'session',
+        mode: source.mode,
+        providerConfig: source.providerConfig as Record<string, unknown> | undefined,
+        agentRole: source.agentRole ?? 'standard',
+        createdBySessionId: source.createdBySessionId ?? null,
+        parentSessionId: source.parentSessionId ?? null,
+        branchedFromSessionId: source.id,
+        branchedAt: Date.now(),
+        hasBeenNamed: true,
+        metadata: continuationMetadata,
+      } as any);
+
+      try {
+        await AISessionsRepository.updateMetadata(source.id, {
+          isArchived: true,
+          metadata: {
+            worktreeLifecycle: {
+              ...lifecycle,
+              terminalDisposition: 'retired',
+              resumable: false,
+              continuationSessionId: continuationId,
+            } satisfies WorktreeLifecycleMetadata,
+          },
+        });
+      } catch (error) {
+        await AISessionsRepository.delete(continuationId).catch(() => undefined);
+        throw error;
+      }
+
+      const continuation = await AISessionsRepository.get(continuationId);
+      if (!continuation) {
+        throw new Error(`Continuation session ${continuationId} was not persisted`);
+      }
+
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed()) {
+          window.webContents.send('sessions:refresh-list', {
+            workspacePath: workspaceId,
+            sessionId: continuationId,
+          });
+          if (continuation.parentSessionId) {
+            window.webContents.send('sessions:child-added', {
+              workspacePath: workspaceId,
+              parentSessionId: continuation.parentSessionId,
+              childSessionId: continuationId,
+            });
+          }
+        }
+      }
+      return continuation;
+    })();
+
+    this.retiredContinuationPromises.set(source.id, creation);
+    try {
+      return await creation;
+    } finally {
+      this.retiredContinuationPromises.delete(source.id);
+    }
+  }
+
   private async sendPromptToSession(
     sessionId: string,
     workspaceId: string,
@@ -1220,10 +1372,14 @@ export class MetaAgentService {
       throw new Error('prompt is required');
     }
 
-    const session = await AISessionsRepository.get(sessionId);
-    if (!session || session.workspacePath !== workspaceId) {
+    const requestedSessionId = sessionId;
+    const requestedSession = await AISessionsRepository.get(requestedSessionId);
+    if (!requestedSession || requestedSession.workspacePath !== workspaceId) {
       throw new Error(`Session ${sessionId} not found`);
     }
+    const resolvedTarget = await this.resolvePromptTargetSession(requestedSession, workspaceId);
+    const session = resolvedTarget.session;
+    sessionId = session.id;
 
     const normalizedPrompt = prompt.trim();
     const interruptCurrentTurnRequested = options.interruptCurrentTurn === true || options.force === true;
@@ -1236,6 +1392,9 @@ export class MetaAgentService {
       await this.persistSyntheticInputMessage(sessionId, normalizedPrompt);
       return JSON.stringify({
         sessionId,
+        ...(resolvedTarget.continuedFromSessionId
+          ? { continuedFromSessionId: resolvedTarget.continuedFromSessionId }
+          : {}),
         queuedPromptId: null,
         prompt: normalizedPrompt,
         statusBeforeQueue,
@@ -1291,6 +1450,9 @@ export class MetaAgentService {
     const statusAfterQueue = (await this.getSessionStatusRow(sessionId, workspaceId))?.status || status;
     return JSON.stringify({
       sessionId,
+      ...(resolvedTarget.continuedFromSessionId
+        ? { continuedFromSessionId: resolvedTarget.continuedFromSessionId }
+        : {}),
       queuedPromptId: queued.id,
       prompt: queued.prompt,
       statusBeforeQueue: status,
@@ -1527,7 +1689,33 @@ export class MetaAgentService {
       }
 
       const session = await AISessionsRepository.get(sessionId);
-      if (!session || session.agentRole === 'meta-agent' || !session.createdBySessionId || !session.workspacePath) {
+      if (!session?.workspacePath) {
+        return;
+      }
+
+      let completedResult: SessionResultData | null = null;
+      if (eventType === 'session:completed') {
+        // A completed event can be an idle gap between queued turns. Capture
+        // lifecycle evidence only when no later prompt remains pending.
+        const { rows: pendingRows } = await databaseWorker.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM queued_prompts
+           WHERE session_id = $1 AND status = 'pending'`,
+          [sessionId]
+        );
+        if (Number(pendingRows[0]?.count ?? '0') > 0) return;
+
+        completedResult = await this.buildSessionResultData(
+          sessionId,
+          session.workspacePath,
+          undefined,
+          false,
+        );
+        if (completedResult.lastResponse?.trim()) {
+          await recordWorktreeSessionResult(sessionId, 'completion-report');
+        }
+      }
+
+      if (session.agentRole === 'meta-agent' || !session.createdBySessionId) {
         return;
       }
 
@@ -1544,36 +1732,11 @@ export class MetaAgentService {
         return;
       }
 
-      // NIM-6: session:completed fires on every turn idle, not only on terminal
-      // completion. If the child still has more prompts queued AFTER the one
-      // that just finished, this idle is a between-turn pause -- another
-      // session:completed will follow once the queue drains. Suppress it; the
-      // parent will be notified on the genuinely terminal idle (queue empty).
-      //
-      // The just-finished prompt is still in `executing` status at the moment
-      // session:completed fires (MessageStreamingHandler marks it `completed`
-      // only after endSession returns). So we count only `pending` rows --
-      // counting `executing` would include the current turn itself and
-      // suppress every notification, including the final terminal one.
-      //
-      // The other event types (error/waiting/interrupted) are always
-      // meaningful and pass through.
-      if (eventType === 'session:completed') {
-        const { rows: pendingRows } = await databaseWorker.query<{ count: string }>(
-          `SELECT COUNT(*)::text AS count FROM queued_prompts
-           WHERE session_id = $1 AND status = 'pending'`,
-          [sessionId]
-        );
-        const pendingCount = Number(pendingRows[0]?.count ?? '0');
-        if (pendingCount > 0) {
-          return;
-        }
-      }
-
       const metaStatusRow = await this.getSessionStatusRow(metaSession.id, metaSession.workspacePath);
       const metaStatus = (metaStatusRow?.status || 'idle') as SessionStatusValue;
 
-      const result = await this.buildSessionResultData(sessionId, session.workspacePath, undefined, false);
+      const result = completedResult
+        ?? await this.buildSessionResultData(sessionId, session.workspacePath, undefined, false);
 
       // NIM-6: real dedup gate. Drop notifications whose semantic content is
       // identical to the last one delivered for this child. The previous code
@@ -1642,6 +1805,9 @@ export class MetaAgentService {
         } catch (parseError) {
           console.warn('[MetaAgentService] failed to parse child notification delivery result:', parseError);
         }
+      }
+      if (eventType === 'session:completed') {
+        await recordWorktreeSessionResult(sessionId, 'parent-audit');
       }
     } catch (error) {
       console.error(`[MetaAgentService] handleChildSessionEvent failed for session ${sessionId} (${eventType}):`, error);

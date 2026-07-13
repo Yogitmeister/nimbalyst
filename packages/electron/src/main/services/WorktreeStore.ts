@@ -435,7 +435,10 @@ export function createWorktreeStore(db: PGliteLike, ensureDbReady?: EnsureReadyF
 
       const { rows } = await db.query<WorktreeRow>(
         `SELECT * FROM worktrees
-         WHERE workspace_id = $1 AND pr_remote = $2 AND pr_number = $3
+         WHERE workspace_id = $1
+           AND pr_remote = $2
+           AND pr_number = $3
+           AND (is_archived = FALSE OR is_archived IS NULL)
          LIMIT 1`,
         [workspaceId, remote, prNumber]
       );

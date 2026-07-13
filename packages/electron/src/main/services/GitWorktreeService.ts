@@ -136,6 +136,12 @@ export interface WorktreeBindingIdentity {
   projectHead: string;
 }
 
+/** Git evidence required immediately before lifecycle-safe removal. */
+export interface WorktreeRemovalReadiness extends WorktreeBindingIdentity {
+  baseBranch: string;
+  remoteRefsContainingHead: string[];
+}
+
 /**
  * Git state information
  */
@@ -264,6 +270,63 @@ export class GitWorktreeService {
       branch: worktreeIdentity.branch,
       head: worktreeIdentity.head,
       projectHead: projectIdentity.head,
+    };
+  }
+
+  /**
+   * Fail closed unless the registered checkout is clean, its exact HEAD is
+   * merged into the recorded base branch, and that commit is reachable from a
+   * remote-tracking ref. This is intentionally stricter than the status UI:
+   * cleanup must never depend on a best-effort/defaulted comparison.
+   */
+  async verifyWorktreeRemovalReadiness(
+    projectPath: string,
+    worktree: Worktree,
+  ): Promise<WorktreeRemovalReadiness> {
+    const identity = await this.verifyWorktreeBinding(projectPath, worktree);
+    const git = simpleGit(identity.worktreeRoot);
+    const status = await git.status();
+    if (!status.isClean()) {
+      throw new Error(`Worktree has uncommitted changes: ${worktree.path}`);
+    }
+    this.assertNoInProgressOperation(identity.gitDir, worktree.path);
+
+    try {
+      await git.revparse(['--verify', worktree.baseBranch]);
+    } catch {
+      throw new Error(`Worktree base branch cannot be verified: ${worktree.baseBranch}`);
+    }
+
+    const unmergedCommitCount = Number((await git.raw([
+      'rev-list',
+      '--count',
+      `${worktree.baseBranch}..${identity.head}`,
+    ])).trim());
+    if (!Number.isFinite(unmergedCommitCount) || unmergedCommitCount > 0) {
+      throw new Error(
+        `Worktree HEAD ${identity.head} is not merged into ${worktree.baseBranch}`,
+      );
+    }
+
+    const containingRefs = await git.raw([
+      'for-each-ref',
+      '--format=%(refname)',
+      '--contains',
+      identity.head,
+      'refs/remotes',
+    ]);
+    const remoteRefsContainingHead = containingRefs
+      .split(/\r?\n/)
+      .map((ref) => ref.trim())
+      .filter((ref) => ref.length > 0 && !ref.endsWith('/HEAD'));
+    if (remoteRefsContainingHead.length === 0) {
+      throw new Error(`Worktree HEAD ${identity.head} is not present on any remote-tracking ref`);
+    }
+
+    return {
+      ...identity,
+      baseBranch: worktree.baseBranch,
+      remoteRefsContainingHead,
     };
   }
 
@@ -573,6 +636,77 @@ export class GitWorktreeService {
     return gitOperationLock.withLock(workspacePath, 'deleteWorktree', () =>
       this.deleteWorktreeImpl(worktreePath, workspacePath)
     );
+  }
+
+  /**
+   * Remove a worktree without force, fallbacks, or branch deletion. The caller's
+   * lifecycle validator runs inside the same workspace Git lock, and its HEAD
+   * evidence is checked once more immediately before `git worktree remove`.
+   * The branch is deliberately retained as a final committed-work recovery ref.
+   */
+  async deleteWorktreeSafely(
+    worktreePath: string,
+    workspacePath: string,
+    beforeRemove: () => Promise<WorktreeRemovalReadiness>,
+  ): Promise<void> {
+    if (!worktreePath) throw new Error('worktreePath is required');
+    if (!workspacePath) throw new Error('workspacePath is required');
+
+    return gitOperationLock.withLock(workspacePath, 'deleteWorktreeSafely', async () => {
+      const readiness = await beforeRemove();
+      const comparable = (value: string) => {
+        const normalized = path.normalize(path.resolve(value));
+        return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+      };
+      if (comparable(readiness.worktreeRoot) !== comparable(worktreePath)) {
+        throw new Error('Removal readiness was captured for a different worktree path');
+      }
+
+      const worktreeGit = simpleGit(worktreePath);
+      const [status, headRaw, branchRaw] = await Promise.all([
+        worktreeGit.status(),
+        worktreeGit.revparse(['HEAD']),
+        worktreeGit.revparse(['--abbrev-ref', 'HEAD']),
+      ]);
+      if (!status.isClean()) {
+        throw new Error(`Worktree became dirty before removal: ${worktreePath}`);
+      }
+      if (headRaw.trim() !== readiness.head) {
+        throw new Error('Worktree HEAD changed after removal validation');
+      }
+      if (branchRaw.trim() !== readiness.branch) {
+        throw new Error('Worktree branch changed after removal validation');
+      }
+      this.assertNoInProgressOperation(readiness.gitDir, worktreePath);
+
+      const projectGit = simpleGit(workspacePath);
+      await projectGit.raw(['worktree', 'remove', worktreePath]);
+      if (fs.existsSync(worktreePath)) {
+        throw new Error(`Git reported success but worktree path still exists: ${worktreePath}`);
+      }
+
+      const registrations = await this.listWorktrees(workspacePath);
+      if (registrations.some((registration) =>
+        comparable(registration.path) === comparable(worktreePath))) {
+        throw new Error(`Worktree remains registered after removal: ${worktreePath}`);
+      }
+    });
+  }
+
+  private assertNoInProgressOperation(gitDir: string, worktreePath: string): void {
+    const activeOperations = [
+      ['merge', path.join(gitDir, 'MERGE_HEAD')],
+      ['rebase', path.join(gitDir, 'rebase-merge')],
+      ['rebase', path.join(gitDir, 'rebase-apply')],
+      ['cherry-pick', path.join(gitDir, 'CHERRY_PICK_HEAD')],
+      ['revert', path.join(gitDir, 'REVERT_HEAD')],
+    ].filter(([, markerPath]) => fs.existsSync(markerPath));
+    if (activeOperations.length > 0) {
+      const names = [...new Set(activeOperations.map(([name]) => name))];
+      throw new Error(
+        `Worktree has an in-progress Git operation (${names.join(', ')}): ${worktreePath}`,
+      );
+    }
   }
 
   /**

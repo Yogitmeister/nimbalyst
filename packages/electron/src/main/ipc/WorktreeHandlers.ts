@@ -11,17 +11,14 @@ import simpleGit from 'simple-git';
 import { FeatureUsageService, FEATURES } from '../services/FeatureUsageService';
 import { GitWorktreeService } from '../services/GitWorktreeService';
 import { WorktreeStore, createWorktreeStore } from '../services/WorktreeStore';
-import { createSuperLoopStore } from '../services/SuperLoopStore';
 import { getDatabase } from '../database/initialize';
 import { archiveProgressManager } from '../services/ArchiveProgressManager';
-import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
-import { getTerminalSessionManager } from '../services/TerminalSessionManager';
-import { getTerminalsByWorktreeId, deleteTerminalInstance } from '../utils/terminalStore';
 import { gitRefWatcher } from '../file/GitRefWatcher';
 import type { WorktreeCreateResult } from '../../shared/ipc/types';
 import { gitOperationLock } from '../services/GitOperationLock';
-import fs from 'node:fs';
+import { createWorktreeLifecycleService } from '../services/WorktreeLifecycleService';
+import { createRuntimeWorktreeLifecycleService } from '../services/WorktreeLifecycleRuntime';
 
 const logger = log.scope('WorktreeHandlers');
 
@@ -72,25 +69,6 @@ function emitTerminalListChanged(workspacePath: string): void {
   }
 }
 
-async function archiveSessionsForWorktree(
-  worktreeId: string,
-  sessionIds: string[],
-  archiveLogger: ReturnType<typeof log.scope>
-): Promise<number> {
-  let failedSessions = 0;
-
-  for (const sessionId of sessionIds) {
-    try {
-      await AISessionsRepository.updateMetadata(sessionId, { isArchived: true });
-    } catch (err) {
-      failedSessions++;
-      archiveLogger.error('Failed to archive session', { sessionId, worktreeId, error: err });
-    }
-  }
-
-  return failedSessions;
-}
-
 /**
  * Archive a single worktree and its sessions.
  *
@@ -112,165 +90,47 @@ export async function archiveWorktree(worktreeId: string, workspacePath: string)
       throw new Error('workspacePath is required');
     }
 
-    archiveLogger.info('Archiving worktree', { worktreeId, workspacePath });
-
-    // Get worktree from database
     const db = getDatabase();
     if (!db) {
       throw new Error('Database not initialized');
     }
-
     const worktreeStore = createWorktreeStore(db);
-    const superLoopStore = createSuperLoopStore(db);
     const worktree = await worktreeStore.get(worktreeId);
-
     if (!worktree) {
       throw new Error(`Worktree not found: ${worktreeId}`);
     }
-
-    // Security: Verify that the worktree belongs to the specified workspace
     if (worktree.projectPath !== workspacePath) {
       throw new Error(
         `Security violation: Worktree project path (${worktree.projectPath}) does not match workspace path (${workspacePath})`
       );
     }
-
-    const sessionIds = await worktreeStore.getWorktreeSessions(worktreeId);
-
-    // Already archived - but only skip if the directory is actually gone.
-    // We still reconcile linked sessions because older partial failures could
-    // leave the worktree archived while one or more sessions remain visible.
-    if (worktree.isArchived) {
-      if (!fs.existsSync(worktree.path)) {
-        const failedSessions = await archiveSessionsForWorktree(worktreeId, sessionIds, archiveLogger);
-        if (failedSessions > 0) {
-          throw new Error(`Failed to archive ${failedSessions} lingering session(s) for archived worktree ${worktreeId}`);
-        }
-        const existingLoop = await superLoopStore.getLoopByWorktreeId(worktreeId);
-        if (existingLoop && !existingLoop.isArchived) {
-          await superLoopStore.updateLoop(existingLoop.id, { isArchived: true });
-        }
-        archiveLogger.info('Worktree already archived and directory removed, skipping', { worktreeId });
-        return { success: true };
-      }
-      // Directory still exists despite being marked archived - re-run cleanup
-      archiveLogger.info('Worktree marked as archived but directory still exists, re-running cleanup', { worktreeId, path: worktree.path });
-      // Reset the archived flag so the cleanup flow can set it properly after disk deletion
-      await worktreeStore.updateArchived(worktreeId, false);
-    }
-
-    const gitWorktreeService = new GitWorktreeService();
-
-    // Step 1: Get all sessions for this worktree
-    archiveLogger.info('Found sessions for worktree', { worktreeId, sessionCount: sessionIds.length });
-
-    // Get worktree git status for analytics (before archiving)
-    let hasUncommittedChanges = false;
-    let hasUnmergedChanges = false;
-    try {
-      const gitStatus = await gitWorktreeService.getWorktreeStatus(worktree.path, worktree.baseBranch);
-      hasUncommittedChanges = gitStatus.hasUncommittedChanges;
-      hasUnmergedChanges = !gitStatus.isMerged;
-    } catch (statusError) {
-      archiveLogger.warn('Failed to get worktree status for analytics', { worktreeId, error: statusError });
-    }
-
-    // Step 2: Kill any running terminal processes for these sessions
-    const terminalManager = getTerminalSessionManager();
-    await terminalManager.destroyTerminalsForSessions(sessionIds);
-    archiveLogger.info('Destroyed terminal processes for worktree sessions', { worktreeId });
-
-    // Stop the git ref watcher for this worktree (it's being archived/deleted)
-    await gitRefWatcher.stop(worktree.path);
-
-    // Step 2b: Delete terminals associated with this worktree
-    // Terminals have a worktreeId field that links them to the worktree.
-    // When the worktree is archived, these terminals become orphaned and will
-    // fail to start (cwd doesn't exist), so we clean them up here.
-    const worktreeTerminalIds = getTerminalsByWorktreeId(workspacePath, worktreeId);
-    if (worktreeTerminalIds.length > 0) {
-      archiveLogger.info('Deleting terminals associated with worktree', { worktreeId, terminalCount: worktreeTerminalIds.length });
-      for (const terminalId of worktreeTerminalIds) {
-        try {
-          // Kill the terminal process if it's running
-          await terminalManager.destroyTerminal(terminalId);
-          // Delete from the terminal store
-          deleteTerminalInstance(workspacePath, terminalId);
-        } catch (err) {
-          archiveLogger.warn('Failed to delete worktree terminal', { terminalId, worktreeId, error: err });
-        }
-      }
-      archiveLogger.info('Deleted terminals for worktree', { worktreeId, deletedCount: worktreeTerminalIds.length });
-
-      // Notify renderer to refresh terminal list
-      emitTerminalListChanged(workspacePath);
-    }
-
-    // Step 3: Archive all sessions for this worktree immediately (fast feedback)
-    archiveLogger.info('Archiving sessions for worktree', { worktreeId, sessionCount: sessionIds.length });
-
-    const failedSessions = await archiveSessionsForWorktree(worktreeId, sessionIds, archiveLogger);
-
-    if (failedSessions > 0) {
-      archiveLogger.warn('Some sessions failed to archive', { worktreeId, failedCount: failedSessions, totalCount: sessionIds.length });
-    }
-
-    // NOTE: We do NOT mark the worktree as archived here.
-    // The worktree is only marked as archived AFTER the disk deletion succeeds.
-    // This ensures we never have a worktree marked as archived that still exists on disk.
-
-    // Calculate worktree age for analytics
+    const lifecycleService = createRuntimeWorktreeLifecycleService(db);
+    const preflight = await lifecycleService.validateCleanup(worktreeId, workspacePath);
     const worktreeAgeDays = Math.floor((Date.now() - worktree.createdAt) / (1000 * 60 * 60 * 24));
     const archiveStartTime = Date.now();
-
-    // Track archive initiation
     const analyticsService = AnalyticsService.getInstance();
     analyticsService.sendEvent('worktree_archived', {
-      session_count: sessionIds.length,
+      session_count: preflight.sessions.length,
       worktree_age_days: worktreeAgeDays,
-      failed_sessions: failedSessions,
-      has_uncommitted_changes: hasUncommittedChanges,
-      has_unmerged_changes: hasUnmergedChanges,
+      failed_sessions: 0,
+      has_uncommitted_changes: false,
+      has_unmerged_changes: false,
     });
 
-    // Step 4: Queue the slow cleanup work
+    // The queue carries no early session mutation. The lifecycle service repeats
+    // the complete guard inside Git's removal lock immediately before deletion.
     const cleanupCallback = async () => {
       try {
-        // Update status to show we're removing the worktree
         archiveProgressManager.updateTaskStatus(worktreeId, 'removing-worktree');
-
-        // Remove the git worktree from disk (throws if directory still exists after cleanup)
-        await gitWorktreeService.deleteWorktree(worktree.path, workspacePath);
-
-        archiveLogger.info('Worktree cleanup completed, now marking as archived in database', { worktreeId });
-
-        // Only mark as archived AFTER disk deletion is confirmed
-        await worktreeStore.updateArchived(worktreeId, true);
-        const existingLoop = await superLoopStore.getLoopByWorktreeId(worktreeId);
-        if (existingLoop && !existingLoop.isArchived) {
-          await superLoopStore.updateLoop(existingLoop.id, { isArchived: true });
-        }
-
-        archiveLogger.info('Worktree marked as archived in database', { worktreeId });
-
-        // Track successful completion
+        const result = await lifecycleService.cleanupWorktree(worktreeId, workspacePath, 'archive');
+        emitTerminalListChanged(workspacePath);
+        emitGitStatusChanged(workspacePath);
         const durationMs = Date.now() - archiveStartTime;
         analyticsService.sendEvent('worktree_archive_completed', {
-          session_count: sessionIds.length,
+          session_count: result.sessionIds.length,
           duration_ms: durationMs,
         });
       } catch (error) {
-        // Unarchive the sessions since the cleanup failed
-        archiveLogger.warn('Cleanup failed, unarchiving sessions', { worktreeId, error });
-        for (const sessionId of sessionIds) {
-          try {
-            await AISessionsRepository.updateMetadata(sessionId, { isArchived: false });
-          } catch (unarchiveErr) {
-            archiveLogger.error('Failed to unarchive session after cleanup failure', { sessionId, worktreeId, error: unarchiveErr });
-          }
-        }
-
-        // Track failure
         analyticsService.sendEvent('worktree_archive_failed', {
           error_type: error instanceof Error ? error.constructor.name : 'Unknown',
           stage: 'removing-worktree',
@@ -284,8 +144,6 @@ export async function archiveWorktree(worktreeId: string, workspacePath: string)
       worktree.displayName || worktree.name,
       cleanupCallback
     );
-
-    archiveLogger.info('Worktree archive initiated', { worktreeId });
 
     return { success: true };
   } catch (error) {
@@ -567,30 +425,14 @@ export function registerWorktreeHandlers(): void {
         throw new Error('workspacePath is required');
       }
 
-      logger.info('Deleting worktree', { worktreeId, workspacePath });
-
-      // Get worktree from database to find its path
       const db = getDatabase();
       if (!db) {
         throw new Error('Database not initialized');
       }
-
-      const worktreeStore = createWorktreeStore(db);
-      const worktree = await worktreeStore.get(worktreeId);
-
-      if (!worktree) {
-        throw new Error(`Worktree not found: ${worktreeId}`);
-      }
-
-      // Stop the git ref watcher for this worktree
-      await gitRefWatcher.stop(worktree.path);
-
-      // Delete the git worktree
-      await gitWorktreeService.deleteWorktree(worktree.path, workspacePath);
-
-      // Delete the database record
-      await worktreeStore.delete(worktreeId);
-
+      const lifecycleService = createRuntimeWorktreeLifecycleService(db);
+      await lifecycleService.cleanupWorktree(worktreeId, workspacePath, 'delete');
+      emitTerminalListChanged(workspacePath);
+      emitGitStatusChanged(workspacePath);
       logger.info('Worktree deleted successfully', { worktreeId });
 
       return {
@@ -624,10 +466,10 @@ export function registerWorktreeHandlers(): void {
         throw new Error('Database not initialized');
       }
 
-      const worktreeStore = createWorktreeStore(db);
-      const worktrees = await worktreeStore.list(workspacePath);
+      const lifecycleService = createWorktreeLifecycleService(db);
+      const { usable: worktrees, reconciledIds } = await lifecycleService.reconcileWorkspace(workspacePath);
 
-      logger.info('Found worktrees', { count: worktrees.length });
+      logger.info('Found usable worktrees', { count: worktrees.length, reconciledIds });
 
       // Start git ref watchers for all non-archived worktrees on first list call.
       // This ensures commit detection works for worktrees loaded on app restart.
@@ -687,7 +529,15 @@ export function registerWorktreeHandlers(): void {
       }
 
       const worktreeStore = createWorktreeStore(db);
-      const worktree = await worktreeStore.get(worktreeId);
+      let worktree = await worktreeStore.get(worktreeId);
+
+      if (worktree?.isArchived) {
+        worktree = null;
+      } else if (worktree) {
+        const { usable } = await createWorktreeLifecycleService(db)
+          .reconcileWorkspace(worktree.projectPath);
+        worktree = usable.find((candidate) => candidate.id === worktreeId) ?? null;
+      }
 
       if (!worktree) {
         logger.info('Worktree not found', { worktreeId });
@@ -731,7 +581,16 @@ export function registerWorktreeHandlers(): void {
       }
 
       const worktreeStore = createWorktreeStore(db);
-      const worktree = await worktreeStore.getByPath(worktreePath);
+      let worktree = await worktreeStore.getByPath(worktreePath);
+
+      if (worktree?.isArchived) {
+        worktree = null;
+      } else if (worktree) {
+        const worktreeId = worktree.id;
+        const { usable } = await createWorktreeLifecycleService(db)
+          .reconcileWorkspace(worktree.projectPath);
+        worktree = usable.find((candidate) => candidate.id === worktreeId) ?? null;
+      }
 
       if (!worktree) {
         logger.info('Worktree not found', { worktreePath });
@@ -808,8 +667,17 @@ export function registerWorktreeHandlers(): void {
       // With 270+ non-archived worktrees, fetching git status here would spawn
       // ~800+ git processes at startup.
       const worktreeMap = await worktreeStore.getByIds(worktreeIds);
+      const usableIds = new Set<string>();
+      const workspacePaths = new Set(
+        Array.from(worktreeMap.values()).map((worktree) => worktree.projectPath),
+      );
+      for (const workspacePath of workspacePaths) {
+        const { usable } = await createWorktreeLifecycleService(db)
+          .reconcileWorkspace(workspacePath);
+        for (const worktree of usable) usableIds.add(worktree.id);
+      }
       for (const [worktreeId, worktree] of worktreeMap) {
-        results[worktreeId] = { ...worktree };
+        if (usableIds.has(worktreeId)) results[worktreeId] = { ...worktree };
       }
 
       // logger.info('Batch fetch completed', { requested: worktreeIds.length, fetched: Object.keys(results).length });
