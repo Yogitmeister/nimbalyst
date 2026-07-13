@@ -13,6 +13,7 @@ import {
 import { getDatabase } from '../database/initialize';
 import { createWorktreeStore } from './WorktreeStore';
 import { getPreferredAgentLanguage } from '../utils/store';
+import { recordWorktreeCompletionArtifact } from './worktreeSessionLifecycle';
 
 /**
  * Service to manage the session naming MCP server
@@ -76,6 +77,11 @@ export class SessionNamingService {
           // SyncedSessionStore.updateMetadata is the single source of truth for
           // what reaches other devices; phase/tags forwarding lives there now.
           await AISessionsRepository.updateMetadata(sessionId, { metadata });
+          if (metadata.phase === 'complete') {
+            // An explicit phase transition is the durable completion-report
+            // boundary. Ordinary provider output cannot create this evidence.
+            await recordWorktreeCompletionArtifact(sessionId, 'completion-report');
+          }
 
           // Notify renderer windows so UI updates in real time
           const windows = BrowserWindow.getAllWindows();

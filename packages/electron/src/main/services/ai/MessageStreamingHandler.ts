@@ -111,6 +111,7 @@ import {
 } from './aiServiceUtils';
 import { disableParentNotificationsAfterDirectTakeover } from './childSessionTakeover';
 import { installScopedProviderListener } from './providerListenerRegistry';
+import { loadPromptTargetSession } from '../WorktreePromptTargetService';
 import type Store from 'electron-store';
 import type { AIService } from './AIService';
 import type { HooklessAgentFileWatcher } from './HooklessAgentFileWatcher';
@@ -417,19 +418,14 @@ export class MessageStreamingHandler {
     }
 
     const loadStartTime = Date.now();
-    const session = await this.svc.sessionManager.loadSession(sessionId, workspacePath);
+    const resolvedTarget = await loadPromptTargetSession(
+      this.svc.sessionManager,
+      sessionId,
+      workspacePath,
+    );
+    const session = resolvedTarget.session;
+    sessionId = session.id;
     perfLog.sessionLoadTime = Date.now() - loadStartTime;
-
-    if (!session) {
-      throw new Error(`Session ${sessionId} not found`);
-    }
-
-
-    // Verify we got the right session
-    if (session.id !== sessionId) {
-      console.error(`[AIService] CRITICAL ERROR: Requested session ${sessionId} but got session ${session.id}!`);
-      throw new Error(`Session mismatch: requested ${sessionId} but got ${session.id}`);
-    }
 
     const inputType = (documentContext as any)?.inputType as string | undefined;
     if (inputType === 'user' && !queuedPromptId) {

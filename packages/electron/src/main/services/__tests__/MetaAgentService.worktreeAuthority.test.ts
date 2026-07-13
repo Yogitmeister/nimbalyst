@@ -16,6 +16,11 @@ const gitWorktreeMocks = vi.hoisted(() => ({
   verifyWorktreeBinding: vi.fn(),
 }));
 
+const lifecycleEvidenceMocks = vi.hoisted(() => ({
+  recordWorktreeSessionResult: vi.fn().mockResolvedValue(undefined),
+  recordWorktreeCompletionArtifact: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('@nimbalyst/runtime', () => ({
   AISessionsRepository: {
     create: vi.fn(),
@@ -101,6 +106,7 @@ vi.mock('../metaAgentMessageText', () => ({
 vi.mock('../ai/claudeCliLauncherSingleton', () => ({
   ClaudeCliLauncherConfig: { setMetaAgentServerPort: vi.fn() },
 }));
+vi.mock('../worktreeSessionLifecycle', () => lifecycleEvidenceMocks);
 
 import { AISessionsRepository, AgentMessagesRepository } from '@nimbalyst/runtime';
 import { database as databaseWorker } from '../../database/PGLiteDatabaseWorker';
@@ -376,6 +382,17 @@ describe('MetaAgentService worktree authority', () => {
         updatedAt: Date.now(),
       };
     });
+    vi.mocked(AISessionsRepository.updateMetadata).mockImplementation(async (
+      sessionId: string,
+      update: any,
+    ) => {
+      if (sessionId === retiredSession.id && update.metadata?.worktreeLifecycle) {
+        retiredSession.metadata.worktreeLifecycle = {
+          ...retiredSession.metadata.worktreeLifecycle,
+          ...update.metadata.worktreeLifecycle,
+        };
+      }
+    });
 
     const result = JSON.parse(await service.sendPromptToSession(
       retiredSession.id,
@@ -416,5 +433,44 @@ describe('MetaAgentService worktree authority', () => {
         }),
       }),
     );
+
+    const repeated = JSON.parse(await service.sendPromptToSession(
+      retiredSession.id,
+      WORKSPACE,
+      'follow up again',
+    ));
+    expect(repeated.sessionId).toBe(continuation.id);
+    expect(AISessionsRepository.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('labels get_session_result as an audit only when the caller is the real parent', async () => {
+    const child = {
+      ...PARENT,
+      id: 'audited-child',
+      worktreeId: 'wt-1',
+      createdBySessionId: PARENT.id,
+      parentSessionId: null,
+    };
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(child as any);
+    service.buildSessionResultData = vi.fn().mockResolvedValue({
+      sessionId: child.id,
+      fullResponse: 'durable child result',
+      lastResponse: 'durable child result',
+    });
+
+    await service.getSessionResultJson(PARENT.id, child.id, WORKSPACE);
+
+    expect(lifecycleEvidenceMocks.recordWorktreeSessionResult).toHaveBeenCalledWith(child.id);
+    expect(lifecycleEvidenceMocks.recordWorktreeCompletionArtifact).toHaveBeenCalledWith(
+      child.id,
+      'parent-audit',
+    );
+
+    vi.clearAllMocks();
+    vi.mocked(AISessionsRepository.get).mockResolvedValue(child as any);
+    await service.getSessionResultJson('unrelated-session', child.id, WORKSPACE);
+
+    expect(lifecycleEvidenceMocks.recordWorktreeSessionResult).toHaveBeenCalledWith(child.id);
+    expect(lifecycleEvidenceMocks.recordWorktreeCompletionArtifact).not.toHaveBeenCalled();
   });
 });

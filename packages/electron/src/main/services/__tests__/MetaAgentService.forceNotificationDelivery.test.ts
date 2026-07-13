@@ -9,6 +9,11 @@ const notificationMocks = vi.hoisted(() => ({
   showNotificationWithResult: vi.fn(),
 }));
 
+const lifecycleEvidenceMocks = vi.hoisted(() => ({
+  recordWorktreeSessionResult: vi.fn().mockResolvedValue(undefined),
+  recordWorktreeCompletionArtifact: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('@nimbalyst/runtime', () => ({
   AISessionsRepository: {
     get: vi.fn(),
@@ -67,6 +72,7 @@ vi.mock('./ai/AIService', () => ({ AIService: class {} }));
 vi.mock('../../mcp/metaAgentServer', () => ({
   setMetaAgentToolFns: vi.fn(),
 }));
+vi.mock('../worktreeSessionLifecycle', () => lifecycleEvidenceMocks);
 
 import { AISessionsRepository, AgentMessagesRepository } from '@nimbalyst/runtime';
 import { database as databaseWorker } from '../../database/PGLiteDatabaseWorker';
@@ -177,6 +183,8 @@ describe('MetaAgentService child notification force delivery', () => {
     );
     expect(aiService.interruptCurrentTurnForSession).toHaveBeenCalledWith('parent-1');
     expect(aiService.triggerQueuedPromptProcessingForSession).toHaveBeenCalledWith('parent-1', WORKSPACE);
+    expect(lifecycleEvidenceMocks.recordWorktreeSessionResult).toHaveBeenCalledWith('child-1');
+    expect(lifecycleEvidenceMocks.recordWorktreeCompletionArtifact).not.toHaveBeenCalled();
   });
 
   it('keeps child error notifications queue-only to avoid error-loop churn', async () => {

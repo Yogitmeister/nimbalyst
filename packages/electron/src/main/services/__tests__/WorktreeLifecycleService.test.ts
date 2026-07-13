@@ -103,18 +103,22 @@ function createHarness(options: {
     listWorktrees: vi.fn().mockResolvedValue(registrations),
   };
   const startWatcher = vi.fn().mockResolvedValue(undefined);
+  const stopWatcher = vi.fn().mockResolvedValue(undefined);
+  const destroySessionTerminals = vi.fn().mockResolvedValue(undefined);
+  const destroyTerminal = vi.fn().mockResolvedValue(undefined);
+  const deleteStoredTerminal = vi.fn();
   const updateSessionRepository = vi.fn().mockResolvedValue(undefined);
   const service = new WorktreeLifecycleService(db as any, {
     gitService: gitService as any,
     worktreeStore,
     pathExists: () => options.pathExists !== false,
     getLiveSessionState: () => options.liveState ?? null,
-    stopWatcher: vi.fn().mockResolvedValue(undefined),
+    stopWatcher,
     startWatcher,
-    destroySessionTerminals: vi.fn().mockResolvedValue(undefined),
-    getWorktreeTerminalIds: () => [],
-    destroyTerminal: vi.fn().mockResolvedValue(undefined),
-    deleteStoredTerminal: vi.fn(),
+    destroySessionTerminals,
+    getWorktreeTerminalIds: () => ['terminal-1'],
+    destroyTerminal,
+    deleteStoredTerminal,
     updateSessionRepository,
     now: () => 100,
   });
@@ -125,7 +129,11 @@ function createHarness(options: {
     db,
     gitService,
     worktreeStore,
+    stopWatcher,
     startWatcher,
+    destroySessionTerminals,
+    destroyTerminal,
+    deleteStoredTerminal,
     updateSessionRepository,
     get archived() { return archived; },
   };
@@ -245,6 +253,9 @@ describe('WorktreeLifecycleService cleanup gate', () => {
       false,
       originalMetadata,
     );
+    expect(harness.destroySessionTerminals).not.toHaveBeenCalled();
+    expect(harness.destroyTerminal).not.toHaveBeenCalled();
+    expect(harness.deleteStoredTerminal).not.toHaveBeenCalled();
     expect(harness.worktreeStore.updateArchived).not.toHaveBeenCalled();
   });
 

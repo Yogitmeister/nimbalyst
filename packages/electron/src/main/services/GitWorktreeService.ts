@@ -276,8 +276,8 @@ export class GitWorktreeService {
   /**
    * Fail closed unless the registered checkout is clean, its exact HEAD is
    * merged into the recorded base branch, and that commit is reachable from a
-   * remote-tracking ref. This is intentionally stricter than the status UI:
-   * cleanup must never depend on a best-effort/defaulted comparison.
+   * freshly fetched remote-tracking ref. This is intentionally stricter than
+   * the status UI: cleanup must never depend on stale local remote evidence.
    */
   async verifyWorktreeRemovalReadiness(
     projectPath: string,
@@ -305,6 +305,25 @@ export class GitWorktreeService {
     if (!Number.isFinite(unmergedCommitCount) || unmergedCommitCount > 0) {
       throw new Error(
         `Worktree HEAD ${identity.head} is not merged into ${worktree.baseBranch}`,
+      );
+    }
+
+    const remotes = (await git.raw(['remote']))
+      .split(/\r?\n/)
+      .map((remote) => remote.trim())
+      .filter(Boolean);
+    if (remotes.length === 0) {
+      throw new Error('Worktree remote durability cannot be verified: no Git remotes configured');
+    }
+    try {
+      // Prune is part of the proof: a deleted upstream branch must not survive
+      // locally and satisfy durability through a stale remote-tracking ref.
+      for (const remote of remotes) {
+        await git.raw(['fetch', '--prune', '--no-tags', remote]);
+      }
+    } catch (error) {
+      throw new Error(
+        `Worktree remote durability refresh failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
 

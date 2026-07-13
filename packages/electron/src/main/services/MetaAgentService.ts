@@ -12,7 +12,7 @@ import {
   type ReasoningSelection,
   type NormalizedReasoningSelection,
 } from '@nimbalyst/runtime/ai/server/providers/claudeCode/reasoning';
-import type { AIProviderType, SessionData } from '@nimbalyst/runtime/ai/server/types';
+import type { AIProviderType } from '@nimbalyst/runtime/ai/server/types';
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
 import { AISessionsRepository, AgentMessagesRepository, SessionFilesRepository } from '@nimbalyst/runtime';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
@@ -22,9 +22,12 @@ import { createWorktreeStore } from './WorktreeStore';
 import { GitWorktreeService } from './GitWorktreeService';
 import {
   createWorktreeLifecycleService,
-  type WorktreeLifecycleMetadata,
 } from './WorktreeLifecycleService';
-import { recordWorktreeSessionResult } from './worktreeSessionLifecycle';
+import {
+  recordWorktreeCompletionArtifact,
+  recordWorktreeSessionResult,
+} from './worktreeSessionLifecycle';
+import { resolvePromptTargetSession } from './WorktreePromptTargetService';
 import { database as databaseWorker } from '../database/PGLiteDatabaseWorker';
 import { getDatabase } from '../database/initialize';
 import { gitRefWatcher } from '../file/GitRefWatcher';
@@ -257,7 +260,6 @@ export class MetaAgentService {
   private sessionManager: SessionManager | null = null;
   private unsubscribeStateListener: (() => void) | null = null;
   private notificationSignatures = new Map<string, string>();
-  private retiredContinuationPromises = new Map<string, Promise<SessionData>>();
   private ipcHandlersRegistered = false;
 
   private constructor() {}
@@ -318,8 +320,8 @@ export class MetaAgentService {
           this.setModelControl(callerSessionId, workspaceId, args),
         getSessionStatus: (_metaSessionId, workspaceId, targetSessionId) =>
           this.getSessionStatusJson(targetSessionId, workspaceId),
-        getSessionResult: (_metaSessionId, workspaceId, targetSessionId) =>
-          this.getSessionResultJson(targetSessionId, workspaceId),
+        getSessionResult: (metaSessionId, workspaceId, targetSessionId) =>
+          this.getSessionResultJson(metaSessionId, targetSessionId, workspaceId),
         listQueuedPrompts: (_metaSessionId, workspaceId, targetSessionId, options) =>
           this.listQueuedPromptsJson(targetSessionId, workspaceId, options),
         sendPrompt: (_metaSessionId, workspaceId, targetSessionId, prompt, options) =>
@@ -1170,10 +1172,25 @@ export class MetaAgentService {
     return JSON.stringify(result, null, 2);
   }
 
-  private async getSessionResultJson(sessionId: string, workspaceId: string): Promise<string> {
+  private async getSessionResultJson(
+    callerSessionId: string,
+    sessionId: string,
+    workspaceId: string,
+  ): Promise<string> {
     const data = await this.buildSessionResultData(sessionId, workspaceId);
     if (data.fullResponse?.trim() || data.lastResponse?.trim()) {
       await recordWorktreeSessionResult(sessionId);
+      const inspectedSession = await AISessionsRepository.get(sessionId);
+      if (
+        inspectedSession
+        && callerSessionId !== sessionId
+        && (
+          inspectedSession.createdBySessionId === callerSessionId
+          || inspectedSession.parentSessionId === callerSessionId
+        )
+      ) {
+        await recordWorktreeCompletionArtifact(sessionId, 'parent-audit');
+      }
     }
     return JSON.stringify(data, null, 2);
   }
@@ -1217,148 +1234,6 @@ export class MetaAgentService {
     }, null, 2);
   }
 
-  private getWorktreeLifecycleMetadata(session: SessionData): WorktreeLifecycleMetadata {
-    const metadata = (session.metadata as Record<string, unknown> | undefined) ?? {};
-    const lifecycle = metadata.worktreeLifecycle;
-    return lifecycle && typeof lifecycle === 'object' && !Array.isArray(lifecycle)
-      ? lifecycle as WorktreeLifecycleMetadata
-      : {};
-  }
-
-  private async resolvePromptTargetSession(
-    session: SessionData,
-    workspaceId: string,
-  ): Promise<{ session: SessionData; continuedFromSessionId: string | null }> {
-    const lifecycle = this.getWorktreeLifecycleMetadata(session);
-    let requiresContinuation = lifecycle.resumable === false || session.isArchived === true;
-
-    if (!requiresContinuation && session.worktreeId) {
-      const db = getDatabase();
-      if (!db) throw new Error('Database not initialized');
-      const worktreeStore = createWorktreeStore(db);
-      const worktree = await worktreeStore.get(session.worktreeId);
-      if (!worktree || worktree.isArchived) {
-        requiresContinuation = true;
-      } else {
-        try {
-          await new GitWorktreeService().verifyWorktreeBinding(workspaceId, worktree);
-        } catch {
-          requiresContinuation = true;
-          await createWorktreeLifecycleService(db).reconcileWorkspace(workspaceId).catch(() => {
-            // The prompt still routes away from the unverifiable cwd even if
-            // reconciliation cannot persist its archive marker right now.
-          });
-        }
-      }
-    }
-
-    if (!requiresContinuation) {
-      return { session, continuedFromSessionId: null };
-    }
-
-    const continuation = await this.getOrCreateRetiredContinuation(session, workspaceId);
-    return { session: continuation, continuedFromSessionId: session.id };
-  }
-
-  private async getOrCreateRetiredContinuation(
-    source: SessionData,
-    workspaceId: string,
-  ): Promise<SessionData> {
-    const lifecycle = this.getWorktreeLifecycleMetadata(source);
-    if (lifecycle.continuationSessionId) {
-      const existing = await AISessionsRepository.get(lifecycle.continuationSessionId);
-      if (
-        existing?.workspacePath === workspaceId
-        && !existing.worktreeId
-        && existing.isArchived !== true
-        && this.getWorktreeLifecycleMetadata(existing).resumable !== false
-      ) {
-        return existing;
-      }
-    }
-
-    const inFlight = this.retiredContinuationPromises.get(source.id);
-    if (inFlight) return inFlight;
-
-    const creation = (async (): Promise<SessionData> => {
-      const continuationId = randomUUID();
-      const sourceMetadata = (source.metadata as Record<string, unknown> | undefined) ?? {};
-      const continuationMetadata: Record<string, unknown> = {
-        continuedFromRetiredSessionId: source.id,
-      };
-      if (sourceMetadata.notifyParent !== undefined) {
-        continuationMetadata.notifyParent = sourceMetadata.notifyParent;
-      }
-      if (sourceMetadata.toolScope !== undefined) {
-        continuationMetadata.toolScope = sourceMetadata.toolScope;
-      }
-
-      await AISessionsRepository.create({
-        id: continuationId,
-        provider: source.provider,
-        model: source.model,
-        title: `${source.title || 'Session'} (continuation)`,
-        workspaceId,
-        sessionType: 'session',
-        mode: source.mode,
-        providerConfig: source.providerConfig as Record<string, unknown> | undefined,
-        agentRole: source.agentRole ?? 'standard',
-        createdBySessionId: source.createdBySessionId ?? null,
-        parentSessionId: source.parentSessionId ?? null,
-        branchedFromSessionId: source.id,
-        branchedAt: Date.now(),
-        hasBeenNamed: true,
-        metadata: continuationMetadata,
-      } as any);
-
-      try {
-        await AISessionsRepository.updateMetadata(source.id, {
-          isArchived: true,
-          metadata: {
-            worktreeLifecycle: {
-              ...lifecycle,
-              terminalDisposition: 'retired',
-              resumable: false,
-              continuationSessionId: continuationId,
-            } satisfies WorktreeLifecycleMetadata,
-          },
-        });
-      } catch (error) {
-        await AISessionsRepository.delete(continuationId).catch(() => undefined);
-        throw error;
-      }
-
-      const continuation = await AISessionsRepository.get(continuationId);
-      if (!continuation) {
-        throw new Error(`Continuation session ${continuationId} was not persisted`);
-      }
-
-      for (const window of BrowserWindow.getAllWindows()) {
-        if (!window.isDestroyed()) {
-          window.webContents.send('sessions:refresh-list', {
-            workspacePath: workspaceId,
-            sessionId: continuationId,
-          });
-          if (continuation.parentSessionId) {
-            window.webContents.send('sessions:child-added', {
-              workspacePath: workspaceId,
-              parentSessionId: continuation.parentSessionId,
-              childSessionId: continuationId,
-            });
-          }
-        }
-      }
-      return continuation;
-    })();
-
-    this.retiredContinuationPromises.set(source.id, creation);
-    try {
-      return await creation;
-    } finally {
-      this.retiredContinuationPromises.delete(source.id);
-    }
-  }
-
   private async sendPromptToSession(
     sessionId: string,
     workspaceId: string,
@@ -1377,7 +1252,7 @@ export class MetaAgentService {
     if (!requestedSession || requestedSession.workspacePath !== workspaceId) {
       throw new Error(`Session ${sessionId} not found`);
     }
-    const resolvedTarget = await this.resolvePromptTargetSession(requestedSession, workspaceId);
+    const resolvedTarget = await resolvePromptTargetSession(requestedSession, workspaceId);
     const session = resolvedTarget.session;
     sessionId = session.id;
 
@@ -1711,7 +1586,7 @@ export class MetaAgentService {
           false,
         );
         if (completedResult.lastResponse?.trim()) {
-          await recordWorktreeSessionResult(sessionId, 'completion-report');
+          await recordWorktreeSessionResult(sessionId);
         }
       }
 
@@ -1805,9 +1680,6 @@ export class MetaAgentService {
         } catch (parseError) {
           console.warn('[MetaAgentService] failed to parse child notification delivery result:', parseError);
         }
-      }
-      if (eventType === 'session:completed') {
-        await recordWorktreeSessionResult(sessionId, 'parent-audit');
       }
     } catch (error) {
       console.error(`[MetaAgentService] handleChildSessionEvent failed for session ${sessionId} (${eventType}):`, error);

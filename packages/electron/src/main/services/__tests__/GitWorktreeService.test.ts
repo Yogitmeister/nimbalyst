@@ -116,7 +116,7 @@ describe('GitWorktreeService.verifyWorktreeBinding', () => {
     ).rejects.toThrow(/branch mismatch/);
   });
 
-  async function configureOrigin(): Promise<void> {
+  async function configureOrigin(): Promise<string> {
     const remotePath = path.join(tmpDir, 'origin.git');
     fs.mkdirSync(remotePath);
     await simpleGit(remotePath).init(true);
@@ -124,6 +124,7 @@ describe('GitWorktreeService.verifyWorktreeBinding', () => {
     await git.addRemote('origin', remotePath);
     const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
     await git.push(['-u', 'origin', branch]);
+    return remotePath;
   }
 
   it('proves clean, merged, and pushed durability before removal', async () => {
@@ -185,6 +186,26 @@ describe('GitWorktreeService.verifyWorktreeBinding', () => {
     await expect(
       service.verifyWorktreeRemovalReadiness(projectPath, worktree),
     ).rejects.toThrow(/not present on any remote-tracking ref/);
+  });
+
+  it('prunes a deleted remote branch instead of trusting its stale tracking ref', async () => {
+    const remotePath = await configureOrigin();
+    const worktree = await service.createWorktree(projectPath, { name: 'stale-remote-child' });
+    const worktreeGit = simpleGit(worktree.path);
+    fs.writeFileSync(path.join(worktree.path, 'stale-remote.txt'), 'durability proof');
+    await worktreeGit.add('stale-remote.txt');
+    await worktreeGit.commit('stale remote proof');
+    await worktreeGit.push(['-u', 'origin', worktree.branch]);
+    await simpleGit(projectPath).merge([worktree.branch, '--ff-only']);
+
+    const staleRef = `refs/remotes/origin/${worktree.branch}`;
+    expect((await simpleGit(projectPath).raw(['show-ref', '--verify', staleRef])).trim()).not.toBe('');
+    await simpleGit(remotePath).raw(['update-ref', '-d', `refs/heads/${worktree.branch}`]);
+
+    await expect(
+      service.verifyWorktreeRemovalReadiness(projectPath, worktree),
+    ).rejects.toThrow(/not present on any remote-tracking ref/);
+    await expect(simpleGit(projectPath).raw(['show-ref', '--verify', staleRef])).rejects.toThrow();
   });
 
   it('removes only after revalidation and retains the committed branch', async () => {

@@ -19,6 +19,10 @@ import { SQLiteBackupService } from '../services/database/SQLiteBackupService';
 import { checkWorktreeArchiveConsistency, createWorktreeStore } from '../services/WorktreeStore';
 import { archiveProgressManager } from '../services/ArchiveProgressManager';
 import { createWorktreeLifecycleService } from '../services/WorktreeLifecycleService';
+import {
+  deleteTerminalInstance,
+  getTerminalsByWorktreeId,
+} from '../utils/terminalStore';
 import { timeStartupPhase } from '../utils/startupTiming';
 
 // Backup service instance — only used by the PGLite path now. The SQLite
@@ -268,11 +272,14 @@ export async function initializeDatabase(): Promise<SessionStore> {
     // Load persisted archive queue tasks
     // This handles cases where the app crashed while processing archive cleanup
     try {
-      const { createRuntimeWorktreeLifecycleService } = await import(
-        '../services/WorktreeLifecycleRuntime'
-      );
       const worktreeStore = createWorktreeStore(database);
-      const lifecycleService = createRuntimeWorktreeLifecycleService(database);
+      // A restarted process has no surviving PTYs or active worktree watchers.
+      // Persisted cleanup still removes terminal-store rows without eagerly
+      // loading the native node-pty runtime during database initialization.
+      const lifecycleService = createWorktreeLifecycleService(database, {
+        getWorktreeTerminalIds: getTerminalsByWorktreeId,
+        deleteStoredTerminal: deleteTerminalInstance,
+      });
 
       const { recovered, failed } = await archiveProgressManager.loadPersistedTasks(
         async (worktreeId: string, worktreeName: string) => {

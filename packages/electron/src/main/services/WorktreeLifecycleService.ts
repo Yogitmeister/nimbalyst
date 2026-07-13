@@ -220,11 +220,7 @@ export class WorktreeLifecycleService {
           snapshots = validated.sessions;
 
           await this.retireLinkedSessions(validated.worktree, validated.sessions, 'worktree-cleanup');
-          await this.destroySessionTerminals(validated.sessions.map((session) => session.id));
           terminalIds = this.getWorktreeTerminalIds(workspacePath, worktreeId);
-          for (const terminalId of terminalIds) {
-            await this.destroyTerminal(terminalId);
-          }
           watcherStopped = true;
           await this.stopWatcher(validated.worktree.path);
 
@@ -258,11 +254,47 @@ export class WorktreeLifecycleService {
       throw error;
     }
 
-    if (!worktree || !snapshots) {
+    // TypeScript does not follow assignments made inside deleteWorktreeSafely's
+    // callback, so make the postcondition explicit after that callback returns.
+    const completedSnapshots = snapshots as LinkedSessionSnapshot[] | null;
+    if (!worktree || !completedSnapshots) {
       throw new Error(`Worktree cleanup did not capture lifecycle state: ${worktreeId}`);
     }
 
+    // Terminal/process destruction cannot be rolled back, so it starts only
+    // after Git removal and its absence/registration checks have succeeded.
+    // From this point cleanup is best-effort: stale runtime state must not keep
+    // the database advertising a cwd that no longer exists.
+    try {
+      terminalIds = [...new Set([
+        ...terminalIds,
+        ...this.getWorktreeTerminalIds(workspacePath, worktreeId),
+      ])];
+    } catch (error) {
+      logger.warn('Failed to refresh worktree terminal list after worktree cleanup', {
+        worktreeId,
+        error,
+      });
+    }
+    try {
+      await this.destroySessionTerminals(completedSnapshots.map((session) => session.id));
+    } catch (error) {
+      logger.warn('Failed to destroy linked session terminals after worktree cleanup', {
+        worktreeId,
+        error,
+      });
+    }
+
     for (const terminalId of terminalIds) {
+      try {
+        await this.destroyTerminal(terminalId);
+      } catch (error) {
+        logger.warn('Failed to destroy worktree terminal after worktree cleanup', {
+          worktreeId,
+          terminalId,
+          error,
+        });
+      }
       try {
         this.deleteStoredTerminal(workspacePath, terminalId);
       } catch (error) {
@@ -291,7 +323,7 @@ export class WorktreeLifecycleService {
     return {
       worktreeId,
       mode,
-      sessionIds: snapshots.map((session) => session.id),
+      sessionIds: completedSnapshots.map((session) => session.id),
     };
   }
 
