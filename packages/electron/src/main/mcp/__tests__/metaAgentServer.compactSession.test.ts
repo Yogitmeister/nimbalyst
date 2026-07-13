@@ -20,6 +20,7 @@ describe('compact_session meta-agent registration', () => {
       spawnSession: vi.fn(),
       getSessionStatus: vi.fn(),
       getSessionResult: vi.fn(),
+      listQueuedPrompts: vi.fn(),
       sendPrompt: vi.fn(),
       compactSession,
       respondToPrompt: vi.fn(),
