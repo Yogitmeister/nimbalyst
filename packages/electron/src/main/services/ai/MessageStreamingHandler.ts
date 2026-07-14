@@ -112,6 +112,7 @@ import {
 } from './aiServiceUtils';
 import { disableParentNotificationsAfterDirectTakeover } from './childSessionTakeover';
 import { installScopedProviderListener } from './providerListenerRegistry';
+import { createProviderSessionPersistenceHandler } from './providerSessionPersistence';
 import { loadPromptTargetSession } from '../WorktreePromptTargetService';
 import type Store from 'electron-store';
 import type { AIService } from './AIService';
@@ -1105,13 +1106,13 @@ export class MessageStreamingHandler {
 
     // Listen for provider session ID received and persist immediately
     // This ensures session can be resumed even if interrupted/cancelled
-    const onProviderSessionReceived = async (data: { sessionId: string; providerSessionId: string }) => {
-      try {
-        await this.svc.sessionManager.updateProviderSessionData(data.sessionId, data.providerSessionId);
-      } catch (error) {
+    const onProviderSessionReceived = createProviderSessionPersistenceHandler(
+      (sessionId, providerSessionId) =>
+        this.svc.sessionManager.updateProviderSessionData(sessionId, providerSessionId),
+      (error) => {
         logger.main.error('[AIService] Failed to persist providerSessionId:', error);
-      }
-    };
+      },
+    );
     this.installListener(provider, 'session:providerSessionReceived', onProviderSessionReceived);
 
     // Listen for teammate messages when the lead is idle (no active query).

@@ -21,6 +21,11 @@ describe('SyncedSessionStore', () => {
       search: vi.fn().mockResolvedValue([]),
       delete: vi.fn().mockResolvedValue(undefined),
       updateTitleIfNotNamed: vi.fn().mockResolvedValue(true),
+      updateTags: vi.fn().mockResolvedValue(['alpha', 'beta']),
+      claimBlitzNameIfChildNotNamed: vi.fn().mockResolvedValue({
+        childClaimed: true,
+        parentNamed: true,
+      }),
     };
 
     mockSyncProvider = {
@@ -286,6 +291,117 @@ describe('SyncedSessionStore', () => {
       expect(m.hasBeenNamed).toBe(true);
       // create() always carries a fresh updatedAt so iOS sorts the new session.
       expect(typeof m.updatedAt).toBe('number');
+    }
+  });
+
+  it('syncs the write-once marker with an atomic first title', async () => {
+    const syncedStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider, {
+      autoConnect: true,
+    });
+
+    const updated = await syncedStore.updateTitleIfNotNamed!('s-first-name', 'First title');
+
+    expect(updated).toBe(true);
+    const change = capturedChanges.find(c => c.sessionId === 's-first-name');
+    expect(change?.change.type).toBe('metadata_updated');
+    if (change?.change.type === 'metadata_updated') {
+      expect(change.change.metadata).toMatchObject({
+        title: 'First title',
+        hasBeenNamed: true,
+      });
+    }
+  });
+
+  it('sets hasBeenNamed in the non-atomic compatibility fallback', async () => {
+    delete mockBaseStore.updateTitleIfNotNamed;
+    mockBaseStore.get = vi.fn().mockResolvedValue({ hasBeenNamed: false });
+    const syncedStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider, {
+      autoConnect: true,
+    });
+
+    const updated = await syncedStore.updateTitleIfNotNamed!('s-fallback', 'Fallback title');
+
+    expect(updated).toBe(true);
+    expect(mockBaseStore.updateMetadata).toHaveBeenCalledWith('s-fallback', {
+      title: 'Fallback title',
+      hasBeenNamed: true,
+    });
+  });
+
+  it('converges a second peer on both title and write-once state', async () => {
+    const source = createSyncedSessionStore(mockBaseStore, mockSyncProvider, {
+      autoConnect: true,
+    });
+    await source.updateTitleIfNotNamed!('s-two-peer', 'Source winner');
+    const outbound = capturedChanges.find(c => c.sessionId === 's-two-peer');
+    expect(outbound?.change.type).toBe('metadata_updated');
+
+    const peerState = { title: 'Untitled', hasBeenNamed: false };
+    if (outbound?.change.type === 'metadata_updated') {
+      Object.assign(peerState, outbound.change.metadata);
+    }
+    const peerStore: SessionStore = {
+      ...mockBaseStore,
+      get: vi.fn().mockImplementation(async () => ({ ...peerState })),
+      updateMetadata: vi.fn().mockImplementation(async (_id, patch) => Object.assign(peerState, patch)),
+      updateTitleIfNotNamed: vi.fn().mockImplementation(async (_id, title) => {
+        if (peerState.hasBeenNamed) return false;
+        peerState.title = title;
+        peerState.hasBeenNamed = true;
+        return true;
+      }),
+    };
+
+    expect(await peerStore.updateTitleIfNotNamed!('s-two-peer', 'Losing title')).toBe(false);
+    expect(peerState).toMatchObject({ title: 'Source winner', hasBeenNamed: true });
+  });
+
+  it('syncs the complete store-resolved tag set after a delta', async () => {
+    const syncedStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider, {
+      autoConnect: true,
+    });
+
+    const tags = await syncedStore.updateTags!('s-tags', {
+      add: ['beta'],
+      remove: ['old'],
+    });
+
+    expect(tags).toEqual(['alpha', 'beta']);
+    expect(mockBaseStore.updateTags).toHaveBeenCalledWith('s-tags', {
+      add: ['beta'],
+      remove: ['old'],
+    });
+    const change = capturedChanges.find(c => c.sessionId === 's-tags');
+    expect(change?.change.type).toBe('metadata_updated');
+    if (change?.change.type === 'metadata_updated') {
+      expect(change.change.metadata.tags).toEqual(['alpha', 'beta']);
+    }
+  });
+
+  it('syncs both sides of an atomic Blitz first-name claim', async () => {
+    const syncedStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider, {
+      autoConnect: true,
+    });
+
+    const result = await syncedStore.claimBlitzNameIfChildNotNamed!(
+      'child-1',
+      'blitz-1',
+      'Blitz winner',
+    );
+
+    expect(result).toEqual({ childClaimed: true, parentNamed: true });
+    const child = capturedChanges.find(c => c.sessionId === 'child-1');
+    const parent = capturedChanges.find(c => c.sessionId === 'blitz-1');
+    expect(child?.change.type).toBe('metadata_updated');
+    expect(parent?.change.type).toBe('metadata_updated');
+    if (child?.change.type === 'metadata_updated') {
+      expect(child.change.metadata.hasBeenNamed).toBe(true);
+    }
+    if (parent?.change.type === 'metadata_updated') {
+      expect(parent.change.metadata).toMatchObject({
+        title: 'Blitz winner',
+        hasBeenNamed: true,
+      });
     }
   });
 });

@@ -11,8 +11,8 @@
  * agent hasn't named the session itself, derive a title from the first user
  * prompt. Deliberately heuristic — NO model call: CLI users may be
  * subscription-only with no API key configured, and reading keys from
- * process.env is forbidden (repo rule). The agent nudge stays in place and a
- * later agent rename still wins (renames are allowed via update_session_meta).
+ * process.env is forbidden (repo rule). The final write is still a compare-and-
+ * set, so an agent or user title that wins after the initial read is preserved.
  */
 
 const MAX_TITLE_CHARS = 48;
@@ -48,8 +48,8 @@ export interface AutoNameDeps {
   isAlreadyNamed: (sessionId: string) => Promise<boolean>;
   /** The CLEAN text of the session's first user prompt (null when none). */
   getFirstUserPrompt: (sessionId: string) => Promise<string | null>;
-  /** Write the title through the naming pipeline (broadcast + propagation). */
-  applyTitle: (sessionId: string, title: string) => Promise<void>;
+  /** Atomically write the title; false means another first-name writer won. */
+  applyTitle: (sessionId: string, title: string) => Promise<boolean | void>;
 }
 
 export async function maybeAutoNameClaudeCliSession(
@@ -63,6 +63,6 @@ export async function maybeAutoNameClaudeCliSession(
   if (!title) {
     return 'no-usable-prompt';
   }
-  await deps.applyTitle(sessionId, title);
-  return 'named';
+  const applied = await deps.applyTitle(sessionId, title);
+  return applied === false ? 'already-named' : 'named';
 }

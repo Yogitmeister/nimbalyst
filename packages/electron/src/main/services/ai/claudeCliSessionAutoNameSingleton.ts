@@ -4,14 +4,14 @@
  * Invoked from the launcher's PID `idle` transition (the first completed turn
  * boundary). Once-per-session guarded; a failed attempt may retry on the next
  * idle. The title writer is registered by SessionNamingService at startup
- * (same applySessionTitle path the naming MCP server uses) — registration
+ * (the same atomic first-name path the naming MCP server uses) — registration
  * indirection avoids a services → launcher import cycle.
  */
 
 import { AISessionsRepository, AgentMessagesRepository } from '@nimbalyst/runtime';
 import { maybeAutoNameClaudeCliSession } from './claudeCliSessionAutoName';
 
-type ApplyTitleFn = (sessionId: string, title: string) => Promise<void>;
+type ApplyTitleFn = (sessionId: string, title: string) => Promise<boolean | void>;
 
 let applyTitleFn: ApplyTitleFn | null = null;
 

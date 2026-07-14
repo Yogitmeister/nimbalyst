@@ -7,6 +7,12 @@ import type { CreateAgentMessageInput } from '../../types';
 describe('OpenAICodexProvider persistence', () => {
   const createdMessages: CreateAgentMessageInput[] = [];
 
+  const registerResolvedPersistenceOwner = (provider: OpenAICodexProvider) => {
+    provider.on('session:providerSessionReceived', (data: any) => {
+      data.waitUntil?.(Promise.resolve());
+    });
+  };
+
   beforeEach(() => {
     createdMessages.length = 0;
 
@@ -31,6 +37,65 @@ describe('OpenAICodexProvider persistence', () => {
   afterEach(() => {
     configureMcpServers({ mcpServerPort: null });
     AgentMessagesRepository.clearStore();
+  });
+
+  it('does not start a fresh MCP-capable turn before provider-thread persistence settles', async () => {
+    let releasePersistence!: () => void;
+    const persistence = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    const protocolSendMessage = vi.fn(async function* () {
+      yield {
+        type: 'complete',
+        content: '',
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      };
+    });
+    const protocol = {
+      platform: 'codex-sdk',
+      async createSession() {
+        return { id: 'thread-persistence-fence', platform: 'codex-sdk', raw: {} };
+      },
+      async resumeSession() { throw new Error('not used'); },
+      async forkSession() { throw new Error('not used'); },
+      sendMessage: protocolSendMessage,
+      abortSession: vi.fn(),
+      cleanupSession: vi.fn(),
+    } as any;
+    const provider = new OpenAICodexProvider(
+      { apiKey: 'test-key' },
+      {
+        protocol,
+        permissionService: {
+          resolvePermission: vi.fn(),
+          rejectAllPending: vi.fn(),
+          clearSessionCache: vi.fn(),
+        } as any,
+      },
+    );
+    provider.on('session:providerSessionReceived', (data: any) => {
+      data.waitUntil?.(persistence);
+    });
+    await provider.initialize({
+      apiKey: 'test-key',
+      model: 'openai-codex:gpt-5',
+    });
+
+    const iterator = provider.sendMessage(
+      'test',
+      undefined,
+      'session-persistence-fence',
+      [],
+      process.cwd(),
+    );
+    const firstChunk = iterator.next();
+    for (let index = 0; index < 8; index += 1) await Promise.resolve();
+
+    expect(protocolSendMessage).not.toHaveBeenCalled();
+
+    releasePersistence();
+    await firstChunk;
+    expect(protocolSendMessage).toHaveBeenCalledOnce();
   });
 
   it('persists each raw_event output as an agent message row', async () => {
@@ -91,6 +156,7 @@ describe('OpenAICodexProvider persistence', () => {
       { apiKey: 'test-key' },
       { protocol, permissionService }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',
@@ -265,6 +331,7 @@ describe('OpenAICodexProvider persistence', () => {
       { apiKey: 'test-key' },
       { protocol, permissionService }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',
@@ -372,6 +439,7 @@ describe('OpenAICodexProvider persistence', () => {
       { apiKey: 'test-key' },
       { protocol, permissionService }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',
@@ -439,6 +507,7 @@ describe('OpenAICodexProvider persistence', () => {
       { apiKey: 'test-key' },
       { protocol, permissionService }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',
@@ -524,6 +593,7 @@ describe('OpenAICodexProvider persistence', () => {
       { apiKey: 'test-key' },
       { protocol, permissionService }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',
@@ -619,6 +689,7 @@ describe('OpenAICodexProvider persistence', () => {
       { apiKey: 'test-key' },
       { protocol, permissionService }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',
@@ -699,6 +770,7 @@ describe('OpenAICodexProvider persistence', () => {
       { apiKey: 'test-key' },
       { protocol, permissionService }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',

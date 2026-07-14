@@ -10,9 +10,10 @@
 
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 
-// Store reference to the session manager functions (set once at startup)
-let updateSessionTitleFn:
-  | ((sessionId: string, title: string) => Promise<void>)
+import { extractCodexTurnMetadataFromRequest } from "./tools/mcpRequestMetadata";
+
+let updateSessionTitleIfNotNamedFn:
+  | ((sessionId: string, title: string) => Promise<boolean>)
   | null = null;
 
 let updateSessionMetadataFn:
@@ -35,13 +36,27 @@ let getSessionPhaseFn:
   | ((sessionId: string) => Promise<string | null>)
   | null = null;
 
-/**
- * Set the update function for session titles (called once at startup)
- */
-export function setUpdateSessionTitleFn(
-  updateTitleFn: (sessionId: string, title: string) => Promise<void>
+let updateSessionTagsFn:
+  | ((sessionId: string, add: string[], remove: string[]) => Promise<string[]>)
+  | null = null;
+
+interface SessionMetaAuthorityContext {
+  provider: string;
+  providerSessionId?: string;
+  hasBeenNamed?: boolean;
+}
+
+let getSessionMetaAuthorityContextFn:
+  | ((sessionId: string) => Promise<SessionMetaAuthorityContext | null>)
+  | null = null;
+
+const sessionMetaMutationTails = new Map<string, Promise<void>>();
+
+/** Set the atomic first-name function used by the metadata tool. */
+export function setUpdateSessionTitleIfNotNamedFn(
+  updateTitleFn: (sessionId: string, title: string) => Promise<boolean>
 ) {
-  updateSessionTitleFn = updateTitleFn;
+  updateSessionTitleIfNotNamedFn = updateTitleFn;
 }
 
 /**
@@ -51,6 +66,13 @@ export function setUpdateSessionMetadataFn(
   updateMetadataFn: (sessionId: string, metadata: Record<string, unknown>) => Promise<void>
 ) {
   updateSessionMetadataFn = updateMetadataFn;
+}
+
+/** Set the authoritative store-level tag delta function. */
+export function setUpdateSessionTagsFn(
+  updateTagsFn: (sessionId: string, add: string[], remove: string[]) => Promise<string[]>
+) {
+  updateSessionTagsFn = updateTagsFn;
 }
 
 /**
@@ -89,6 +111,13 @@ export function setGetSessionPhaseFn(
   getSessionPhaseFn = getPhaseFn;
 }
 
+/** Set the provider identity lookup used to fence mutating metadata calls. */
+export function setGetSessionMetaAuthorityContextFn(
+  getContextFn: (sessionId: string) => Promise<SessionMetaAuthorityContext | null>
+) {
+  getSessionMetaAuthorityContextFn = getContextFn;
+}
+
 // ─── Shared tool surface (served by the unified MCP server) ─────────
 //
 // `update_session_meta` rides on the eager core (`nimbalyst`) served by the
@@ -119,14 +148,14 @@ export async function buildSessionMetaToolSchemas(aiSessionId: string): Promise<
     {
       name: "update_session_meta",
       description:
-        "Update session metadata. Set name, tags, and phase on the first call; update tags/phase on later calls. Do not rename an already-named session unless the user asks. Returns the full current metadata.",
+        "Update session metadata. Set a write-once name, tags, and phase on the first call; update tags/phase on later calls. Agent calls cannot rename an already-named session. Returns the full current metadata.",
       inputSchema: {
         type: "object",
         properties: {
           name: {
             type: "string",
             description:
-              'Concise session name (2-5 words), descriptive part first (e.g. "Dark mode implementation"). Set on the first call only, unless the user asks for a rename.',
+              'Concise session name (2-5 words), descriptive part first (e.g. "Dark mode implementation"). This field is write-once on the agent tool surface; use the host UI for a later rename.',
           },
           add: {
             type: "array",
@@ -178,207 +207,299 @@ function buildSessionMetaResponse(
   return JSON.stringify({ summary, before, after });
 }
 
+type SessionMetaToolResult = {
+  content: Array<{ type: string; text: string }>;
+  isError: boolean;
+};
+
+function sessionMetaError(message: string): SessionMetaToolResult {
+  return {
+    content: [{ type: "text", text: `Error: ${message}` }],
+    isError: true,
+  };
+}
+
+async function withSessionMetaMutationLock<T>(
+  sessionId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = sessionMetaMutationTails.get(sessionId) ?? Promise.resolve();
+  let release!: () => void;
+  const tail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  sessionMetaMutationTails.set(sessionId, tail);
+
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (sessionMetaMutationTails.get(sessionId) === tail) {
+      sessionMetaMutationTails.delete(sessionId);
+    }
+  }
+}
+
+async function verifySessionMetaAuthority(
+  aiSessionId: string,
+  request: unknown,
+): Promise<SessionMetaAuthorityContext | SessionMetaToolResult> {
+  if (!aiSessionId) {
+    return sessionMetaError("Session identity is missing; metadata mutation denied.");
+  }
+  if (!getSessionMetaAuthorityContextFn) {
+    return sessionMetaError("Session authority verification is unavailable.");
+  }
+
+  const context = await getSessionMetaAuthorityContextFn(aiSessionId);
+  if (!context) {
+    return sessionMetaError("Bound session was not found; metadata mutation denied.");
+  }
+
+  if (context.provider === "openai-codex-acp") {
+    return sessionMetaError(
+      "Codex ACP does not expose a verified provider-thread identity to MCP; metadata mutation is disabled for this provider.",
+    );
+  }
+
+  if (context.provider === "openai-codex") {
+    const expectedThreadId = context.providerSessionId;
+    const caller = extractCodexTurnMetadataFromRequest(request);
+    if (!expectedThreadId) {
+      return sessionMetaError("Codex session authority is not ready; retry after the provider thread is persisted.");
+    }
+    if (!caller?.turnId || !caller.threadId || !caller.sessionId) {
+      return sessionMetaError("Codex caller identity is incomplete; metadata mutation denied.");
+    }
+    if (caller.threadId !== expectedThreadId || caller.sessionId !== expectedThreadId) {
+      return sessionMetaError("Codex caller does not own the bound Nimbalyst session.");
+    }
+  }
+
+  return context;
+}
+
+const MAX_TAG_PATCH_ITEMS = 32;
+const MAX_SESSION_TAGS = 64;
+const MAX_TAG_LENGTH = 64;
+const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
+
+function parseTagList(value: unknown, field: "add" | "remove"): string[] | SessionMetaToolResult {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    return sessionMetaError(`"${field}" must be an array of strings.`);
+  }
+  if (value.length > MAX_TAG_PATCH_ITEMS) {
+    return sessionMetaError(`"${field}" accepts at most ${MAX_TAG_PATCH_ITEMS} tags per call.`);
+  }
+
+  const normalized: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      return sessionMetaError(`Every "${field}" tag must be a string.`);
+    }
+    const tag = item.trim();
+    if (!tag || tag.length > MAX_TAG_LENGTH || CONTROL_CHAR_RE.test(tag)) {
+      return sessionMetaError(
+        `Every "${field}" tag must be a non-empty string of at most ${MAX_TAG_LENGTH} characters without control characters.`,
+      );
+    }
+    if (!normalized.includes(tag)) normalized.push(tag);
+  }
+  return normalized;
+}
+
+async function dispatchUpdateSessionMeta(
+  args: Record<string, any> | undefined,
+  aiSessionId: string,
+  request: unknown,
+): Promise<SessionMetaToolResult> {
+  const authority = await verifySessionMetaAuthority(aiSessionId, request);
+  if ("isError" in authority) return authority;
+
+  let sessionName: string | undefined;
+  if (args?.name !== undefined) {
+    if (typeof args.name !== "string") {
+      return sessionMetaError('"name" must be a string.');
+    }
+    sessionName = args.name.trim();
+    if (!sessionName || CONTROL_CHAR_RE.test(sessionName)) {
+      return sessionMetaError(
+        '"name" must be a non-empty string without control characters.',
+      );
+    }
+    if (sessionName.length > 100) {
+      return sessionMetaError(`Session name too long (${sessionName.length} chars, max 100)`);
+    }
+  }
+  if (args?.rename !== undefined) {
+    return sessionMetaError(
+      '"rename" is not available to agents. Rename an already-named session through a user-driven host/UI action.',
+    );
+  }
+  const parsedAddTags = parseTagList(args?.add, "add");
+  if (!Array.isArray(parsedAddTags)) return parsedAddTags;
+  const parsedRemoveTags = parseTagList(args?.remove, "remove");
+  if (!Array.isArray(parsedRemoveTags)) return parsedRemoveTags;
+  const addTags = parsedAddTags;
+  const removeTags = parsedRemoveTags;
+  const overlappingTags = addTags.filter((tag) => removeTags.includes(tag));
+  if (overlappingTags.length > 0) {
+    return sessionMetaError('The same normalized tag cannot appear in both "add" and "remove".');
+  }
+  const phase = args?.phase as string | undefined;
+  const rawWorkflowPreset = args?.workflowPreset;
+  const workflowPreset =
+    rawWorkflowPreset === "default" ||
+    rawWorkflowPreset === "implement-review-test" ||
+    rawWorkflowPreset === "research"
+      ? rawWorkflowPreset as string
+      : undefined;
+
+  if (rawWorkflowPreset !== undefined && workflowPreset === undefined) {
+    return sessionMetaError('"workflowPreset" must be one of "default", "implement-review-test", "research".');
+  }
+  if (
+    phase !== undefined &&
+    !["backlog", "planning", "implementing", "validating", "complete"].includes(phase)
+  ) {
+    return sessionMetaError('"phase" must be one of "backlog", "planning", "implementing", "validating", "complete".');
+  }
+  if (!sessionName && !addTags.length && !removeTags.length && !phase && !workflowPreset) {
+    return sessionMetaError('At least one of "name", "add", "remove", "phase", or "workflowPreset" must be provided.');
+  }
+
+  const before = await snapshotSessionMeta(aiSessionId);
+  const notes: string[] = [];
+
+  if (sessionName) {
+    try {
+      if (authority.hasBeenNamed === true) {
+        if (before.name === sessionName) {
+          notes.push(`Name already set to "${sessionName}"`);
+        } else {
+          return sessionMetaError(
+            "Session is already named. Agent-driven rename is disabled; use a user-driven host/UI action.",
+          );
+        }
+      } else {
+        if (!updateSessionTitleIfNotNamedFn) {
+          return sessionMetaError("Atomic session naming is unavailable.");
+        }
+        const updated = await updateSessionTitleIfNotNamedFn(aiSessionId, sessionName);
+        if (updated) {
+          notes.push(`Set name: "${sessionName}"`);
+        } else {
+          const current = await snapshotSessionMeta(aiSessionId);
+          if (current.name === sessionName) {
+            notes.push(`Name already set to "${sessionName}"`);
+          } else {
+            return sessionMetaError("Session was named concurrently; refusing to overwrite it.");
+          }
+        }
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Unknown error";
+      console.error("[Session Naming MCP] Failed to update session title:", error);
+      return sessionMetaError(`Error updating session title: ${errorMessage}`);
+    }
+  }
+
+  if (addTags.length || removeTags.length) {
+    if (!updateSessionTagsFn) {
+      return sessionMetaError("Atomic session tag updates are unavailable.");
+    }
+
+    try {
+      const tags = await updateSessionTagsFn(aiSessionId, addTags, removeTags);
+      if (tags.length > MAX_SESSION_TAGS) {
+        throw new Error(`Persisted session tag count exceeds ${MAX_SESSION_TAGS}`);
+      }
+      if (addTags.length) notes.push(`Added tags: ${addTags.map((tag) => `#${tag}`).join(", ")}`);
+      if (removeTags.length) notes.push(`Removed tags: ${removeTags.map((tag) => `#${tag}`).join(", ")}`);
+    } catch (error) {
+      console.error("[Session Naming MCP] Failed to update tags:", error);
+      return sessionMetaError(`Error updating tags: ${error instanceof Error ? error.message : "Unknown error"}`);
+    }
+  }
+
+  if (phase || workflowPreset) {
+    if (!updateSessionMetadataFn) {
+      return sessionMetaError("Session metadata update not available.");
+    }
+
+    try {
+      const metadataUpdate: Record<string, unknown> = {};
+      if (phase) metadataUpdate.phase = phase;
+      if (workflowPreset) metadataUpdate.workflowPreset = workflowPreset;
+      await updateSessionMetadataFn(aiSessionId, metadataUpdate);
+      if (phase) notes.push(`Set phase: ${phase}`);
+      if (workflowPreset) notes.push(`Set workflow preset: ${workflowPreset}`);
+    } catch (error) {
+      console.error("[Session Naming MCP] Failed to update session metadata:", error);
+      return sessionMetaError(
+        `Error updating session metadata: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    }
+  }
+
+  const after = await snapshotSessionMeta(aiSessionId);
+  return {
+    content: [{ type: "text", text: buildSessionMetaResponse(notes, before, after) }],
+    isError: false,
+  };
+}
+
+/** Route the complete MCP request so provider-authored request metadata cannot be dropped. */
+export async function dispatchSessionMetaMcpRequest(
+  request: unknown,
+  aiSessionId: string,
+): Promise<SessionMetaToolResult> {
+  if (!request || typeof request !== "object") {
+    return sessionMetaError("Malformed MCP request.");
+  }
+  const params = (request as { params?: unknown }).params;
+  if (!params || typeof params !== "object") {
+    return sessionMetaError("Malformed MCP request parameters.");
+  }
+  const name = (params as { name?: unknown }).name;
+  const args = (params as { arguments?: unknown }).arguments;
+  if (typeof name !== "string") {
+    return sessionMetaError("MCP tool name is missing.");
+  }
+  if (args !== undefined && (typeof args !== "object" || args === null || Array.isArray(args))) {
+    return sessionMetaError("MCP tool arguments must be an object.");
+  }
+  return dispatchSessionMetaTool(name, args as Record<string, unknown> | undefined, aiSessionId, request);
+}
+
 /**
  * Dispatch `update_session_meta` and return the MCP `{content, isError}` shape.
- * `name` may carry the `mcp__nimbalyst__` prefix; it is stripped. The injected
- * fns perform the DB writes + IPC broadcasts (session-updated / title-updated),
- * so the kanban/UI still updates.
+ * Mutations are fenced to the provider thread bound to the Nimbalyst session
+ * and serialized per session so concurrent tag patches cannot lose updates.
  */
 export async function dispatchSessionMetaTool(
   name: string,
   args: Record<string, any> | undefined,
   aiSessionId: string,
-): Promise<{ content: Array<{ type: string; text: string }>; isError: boolean }> {
+  request?: unknown,
+): Promise<SessionMetaToolResult> {
   const toolName = name.replace(/^mcp__nimbalyst(-session-naming)?__/, "");
 
   try {
-    if (toolName === "update_session_meta") {
-      const sessionName = args?.name as string | undefined;
-      const addTags = Array.isArray(args?.add) ? args.add as string[] : typeof args?.add === 'string' ? [args.add] : undefined;
-      const removeTags = Array.isArray(args?.remove) ? args.remove as string[] : typeof args?.remove === 'string' ? [args.remove] : undefined;
-      const phase = args?.phase as string | undefined;
-      const rawWorkflowPreset = args?.workflowPreset;
-      const workflowPreset =
-        rawWorkflowPreset === 'default' ||
-        rawWorkflowPreset === 'implement-review-test' ||
-        rawWorkflowPreset === 'research'
-          ? (rawWorkflowPreset as string)
-          : undefined;
-      if (rawWorkflowPreset !== undefined && workflowPreset === undefined) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: 'Error: "workflowPreset" must be one of "default", "implement-review-test", "research".',
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // Require at least one parameter
-      if (!sessionName && !addTags?.length && !removeTags?.length && !phase && !workflowPreset) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: 'Error: At least one of "name", "add", "remove", "phase", or "workflowPreset" must be provided.',
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // Capture state before changes for the widget transition display
-      const before = await snapshotSessionMeta(aiSessionId);
-      const notes: string[] = [];
-
-      // Handle name (write-once)
-      if (sessionName) {
-        if (typeof sessionName !== "string") {
-          return {
-            content: [
-              {
-                type: "text",
-                text: 'Error: "name" must be a string.',
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        if (sessionName.length > 100) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error: Session name too long (${sessionName.length} chars, max 100)`,
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        try {
-          await updateSessionTitleFn!(aiSessionId, sessionName);
-          notes.push(`Set name: "${sessionName}"`);
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : "Unknown error";
-          console.error("[Session Naming MCP] Failed to update session title:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error updating session title: ${errorMessage}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      }
-
-      // Handle tags (add/remove)
-      if (addTags?.length || removeTags?.length) {
-        if (!updateSessionMetadataFn) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: "Error: Session metadata update not available.",
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        try {
-          const currentTags: string[] = getSessionTagsFn
-            ? await getSessionTagsFn(aiSessionId)
-            : [];
-
-          let newTags = [...currentTags];
-          if (removeTags?.length) {
-            const removeSet = new Set(removeTags);
-            newTags = newTags.filter(t => !removeSet.has(t));
-          }
-          if (addTags?.length) {
-            for (const tag of addTags) {
-              if (!newTags.includes(tag)) {
-                newTags.push(tag);
-              }
-            }
-          }
-
-          const metadataUpdate: Record<string, unknown> = { tags: newTags };
-          if (phase) metadataUpdate.phase = phase;
-          if (workflowPreset) metadataUpdate.workflowPreset = workflowPreset;
-
-          await updateSessionMetadataFn(aiSessionId, metadataUpdate);
-
-          if (addTags?.length) notes.push(`Added tags: ${addTags.map(t => `#${t}`).join(', ')}`);
-          if (removeTags?.length) notes.push(`Removed tags: ${removeTags.map(t => `#${t}`).join(', ')}`);
-          if (phase) notes.push(`Set phase: ${phase}`);
-        } catch (error) {
-          console.error("[Session Naming MCP] Failed to update tags:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error updating tags: ${error instanceof Error ? error.message : "Unknown error"}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      } else if (phase || workflowPreset) {
-        // Metadata-only update (no tag changes): phase and/or workflowPreset
-        if (!updateSessionMetadataFn) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: "Error: Session metadata update not available.",
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        try {
-          const metadataUpdate: Record<string, unknown> = {};
-          if (phase) metadataUpdate.phase = phase;
-          if (workflowPreset) metadataUpdate.workflowPreset = workflowPreset;
-          await updateSessionMetadataFn(aiSessionId, metadataUpdate);
-          if (phase) notes.push(`Set phase: ${phase}`);
-          if (workflowPreset) notes.push(`Set workflow preset: ${workflowPreset}`);
-        } catch (error) {
-          console.error("[Session Naming MCP] Failed to update session metadata:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error updating session metadata: ${error instanceof Error ? error.message : "Unknown error"}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      }
-
-      // Build structured response with before/after for widget
-      const after = await snapshotSessionMeta(aiSessionId);
-      const response = buildSessionMetaResponse(notes, before, after);
-      return {
-        content: [{ type: "text", text: response }],
-        isError: false,
-      };
-    } else {
+    if (toolName !== "update_session_meta") {
       throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     }
+    if (!aiSessionId) {
+      return sessionMetaError("Session identity is missing; metadata mutation denied.");
+    }
+    return withSessionMetaMutationLock(aiSessionId, () =>
+      dispatchUpdateSessionMeta(args, aiSessionId, request)
+    );
   } catch (error) {
     if (error instanceof McpError) throw error;
     console.error(`[SessionMeta MCP] Tool "${name}" failed:`, error);
-    console.error(`[SessionMeta MCP] Tool args:`, JSON.stringify(args).slice(0, 500));
     throw error;
   }
 }

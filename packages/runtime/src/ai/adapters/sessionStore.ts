@@ -109,6 +109,16 @@ export interface SessionSearchOptions extends SessionListOptions {
   direction?: 'all' | 'input' | 'output';
 }
 
+export interface SessionTagPatch {
+  add: string[];
+  remove: string[];
+}
+
+export interface BlitzNameClaimResult {
+  childClaimed: boolean;
+  parentNamed: boolean;
+}
+
 export interface SessionStore {
   ensureReady(): Promise<void>;
   create(payload: CreateSessionPayload): Promise<void>;
@@ -128,6 +138,20 @@ export interface SessionStore {
    * Returns true if the update succeeded, false if the session was already named.
    */
   updateTitleIfNotNamed?(sessionId: string, title: string): Promise<boolean>;
+  /**
+   * Apply tag deltas inside the store's authoritative metadata mutation
+   * boundary and return the complete persisted tag set.
+   */
+  updateTags?(sessionId: string, patch: SessionTagPatch): Promise<string[]>;
+  /**
+   * Atomically consume a Blitz child's first-name claim and, when the parent
+   * is still unnamed, assign the parent's first display name.
+   */
+  claimBlitzNameIfChildNotNamed?(
+    childSessionId: string,
+    parentSessionId: string,
+    title: string,
+  ): Promise<BlitzNameClaimResult>;
   /**
    * Get all branches for a given session.
    * Returns sessions that have this session as their parent.

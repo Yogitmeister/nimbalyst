@@ -63,6 +63,13 @@ describe('maybeAutoNameClaudeCliSession', () => {
     expect(d.applyTitle).not.toHaveBeenCalled();
   });
 
+  it('reports the concurrent first-name winner when the atomic write loses', async () => {
+    const d = deps({ applyTitle: vi.fn(async () => false) });
+    const result = await maybeAutoNameClaudeCliSession('s1', d);
+    expect(result).toBe('already-named');
+    expect(d.applyTitle).toHaveBeenCalledOnce();
+  });
+
   it('skips when there is no usable first prompt', async () => {
     const d = deps({ getFirstUserPrompt: vi.fn(async () => '/clear') });
     const result = await maybeAutoNameClaudeCliSession('s1', d);

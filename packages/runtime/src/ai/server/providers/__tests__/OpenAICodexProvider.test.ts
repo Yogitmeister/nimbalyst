@@ -18,6 +18,12 @@ function createAsyncEventStream(events: any[]): AsyncIterable<any> {
   };
 }
 
+function registerResolvedPersistenceOwner(provider: OpenAICodexProvider): void {
+  provider.on('session:providerSessionReceived', (data: any) => {
+    data.waitUntil?.(Promise.resolve());
+  });
+}
+
 describe('OpenAICodexProvider', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -341,6 +347,7 @@ describe('OpenAICodexProvider', () => {
           }) as any,
       }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',
@@ -401,6 +408,7 @@ describe('OpenAICodexProvider', () => {
         protocol,
       }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',
@@ -546,6 +554,7 @@ describe('OpenAICodexProvider', () => {
         protocol,
       }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',
@@ -634,6 +643,7 @@ describe('OpenAICodexProvider', () => {
           }) as any,
       }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',
@@ -758,6 +768,7 @@ describe('OpenAICodexProvider', () => {
           }) as any,
       }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',
@@ -1007,6 +1018,7 @@ describe('OpenAICodexProvider', () => {
           }) as any,
       }
     );
+    registerResolvedPersistenceOwner(provider);
 
     await provider.initialize({
       apiKey: 'test-key',
@@ -1244,6 +1256,7 @@ describe('OpenAICodexProvider', () => {
       { apiKey: 'test-key' },
       { protocol },
     );
+    registerResolvedPersistenceOwner(provider);
     await provider.initialize({ apiKey: 'test-key', model: 'openai-codex:gpt-5' });
 
     const providerSessionReceived = vi.fn();
@@ -1268,10 +1281,11 @@ describe('OpenAICodexProvider', () => {
       providerSessionId: 'thread-blocked',
       codexThreadId: 'thread-blocked',
     });
-    expect(providerSessionReceived).toHaveBeenCalledWith({
+    expect(providerSessionReceived).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: 'session-blocked',
       providerSessionId: 'thread-blocked',
-    });
+      waitUntil: expect.any(Function),
+    }));
   });
 
   it('reuses the same live ProtocolSession across consecutive turns on one Nimbalyst session', async () => {
@@ -1309,6 +1323,7 @@ describe('OpenAICodexProvider', () => {
       { apiKey: 'test-key' },
       { protocol },
     );
+    registerResolvedPersistenceOwner(provider);
     await provider.initialize({ apiKey: 'test-key', model: 'openai-codex:gpt-5' });
 
     // Turn 1.

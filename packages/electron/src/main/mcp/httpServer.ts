@@ -94,7 +94,7 @@ import {
 import { META_AGENT_TOOL_DEFS, dispatchMetaAgentTool } from "./metaAgentServer";
 import {
   buildSessionMetaToolSchemas,
-  dispatchSessionMetaTool,
+  dispatchSessionMetaMcpRequest,
 } from "./sessionNamingServer";
 import {
   McpEndpointSelection,
@@ -365,7 +365,7 @@ const META_AGENT_TOOL_NAMES = new Set(META_AGENT_TOOL_DEFS.map((t) => t.name));
 
 // ---- MCP Server Factory ----
 
-function createSharedMcpServer(
+export function createSharedMcpServer(
   workspacePath: string | undefined,
   sessionId: string | undefined,
   endpoint: McpEndpointSelection = { kind: "legacy" },
@@ -476,10 +476,7 @@ function createSharedMcpServer(
   server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
     const { name, arguments: args } = request.params;
     if (request.params._meta) {
-      console.log(
-        `[MCP Server] Tool called: ${name}, _meta:`,
-        JSON.stringify(request.params._meta)
-      );
+      console.log(`[MCP Server] Tool called: ${name}, request metadata present`);
     }
 
     // Strip MCP server prefix if present
@@ -625,7 +622,7 @@ function createSharedMcpServer(
             return { content: [{ type: "text", text }], isError: false };
           }
           if (toolName === "update_session_meta") {
-            return dispatchSessionMetaTool(name, args, sessionId ?? "");
+            return dispatchSessionMetaMcpRequest(request, sessionId ?? "");
           }
           // Backend-module tools execute IN the module (main↔backend RPC),
           // unlike renderer extension tools. Route them before the renderer

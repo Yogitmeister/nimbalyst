@@ -40,12 +40,23 @@ export interface ProviderSessionData {
   codexThreadId?: string;
 }
 
+export interface ProviderSessionReceivedEvent {
+  sessionId: string;
+  providerSessionId: string;
+  /** Register the durable persistence promise that must settle before use. */
+  waitUntil?: (persistence: Promise<void>) => void;
+}
+
 // ---------------------------------------------------------------------------
 // Class
 // ---------------------------------------------------------------------------
 
 export class ProviderSessionManager {
   private readonly sessionIds: Map<string, string> = new Map();
+  private readonly pendingPersistence = new Map<
+    string,
+    { providerSessionId: string; promise: Promise<void> }
+  >();
   private readonly emitEvent: (event: string, data: unknown) => boolean;
 
   constructor(options: ProviderSessionManagerOptions) {
@@ -68,6 +79,62 @@ export class ProviderSessionManager {
       sessionId,
       providerSessionId,
     });
+  }
+
+  /**
+   * Capture a provider session ID and wait for the owning host to durably
+   * persist it before the provider starts a turn that can call MCP tools.
+   */
+  async captureSessionIdAndWait(sessionId: string, providerSessionId: string): Promise<void> {
+    const pending = this.pendingPersistence.get(sessionId);
+    if (pending) {
+      if (pending.providerSessionId === providerSessionId) {
+        await pending.promise;
+        return;
+      }
+      throw new Error('A different provider session durability write is already in progress');
+    }
+
+    const previous = this.sessionIds.get(sessionId);
+    if (previous === providerSessionId) {
+      return;
+    }
+
+    let persistence: Promise<void> | null = null;
+    const waitUntil = (candidate: Promise<void>) => {
+      if (persistence) {
+        throw new Error('Provider session persistence was registered more than once');
+      }
+      persistence = Promise.resolve(candidate);
+    };
+
+    this.sessionIds.set(sessionId, providerSessionId);
+    const operation = (async () => {
+      this.emitEvent('session:providerSessionReceived', {
+        sessionId,
+        providerSessionId,
+        waitUntil,
+      } satisfies ProviderSessionReceivedEvent);
+      if (!persistence) {
+        throw new Error('Provider session durability barrier was not registered');
+      }
+      await persistence;
+    })();
+    const pendingEntry = { providerSessionId, promise: operation };
+    this.pendingPersistence.set(sessionId, pendingEntry);
+    try {
+      await operation;
+    } catch (error) {
+      if (this.sessionIds.get(sessionId) === providerSessionId) {
+        if (previous === undefined) this.sessionIds.delete(sessionId);
+        else this.sessionIds.set(sessionId, previous);
+      }
+      throw error;
+    } finally {
+      if (this.pendingPersistence.get(sessionId) === pendingEntry) {
+        this.pendingPersistence.delete(sessionId);
+      }
+    }
   }
 
   /**
@@ -142,6 +209,7 @@ export class ProviderSessionManager {
    */
   clear(): void {
     this.sessionIds.clear();
+    this.pendingPersistence.clear();
   }
 
   /**

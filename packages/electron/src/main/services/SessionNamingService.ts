@@ -3,12 +3,14 @@ import { SessionManager, setPreferredAgentLanguage as setRuntimePreferredAgentLa
 import { AISessionsRepository } from '@nimbalyst/runtime';
 import { setClaudeCliAutoNameApplyTitleFn } from './ai/claudeCliSessionAutoNameSingleton';
 import {
-  setUpdateSessionTitleFn,
+  setUpdateSessionTitleIfNotNamedFn,
   setUpdateSessionMetadataFn,
+  setUpdateSessionTagsFn,
   setGetWorkspaceTagsFn,
   setGetSessionTagsFn,
   setGetSessionTitleFn,
   setGetSessionPhaseFn,
+  setGetSessionMetaAuthorityContextFn,
 } from '../mcp/sessionNamingServer';
 import { getDatabase } from '../database/initialize';
 import { createWorktreeStore } from './WorktreeStore';
@@ -63,13 +65,13 @@ export class SessionNamingService {
         setRuntimePreferredAgentLanguage(getPreferredAgentLanguage());
 
         // Set the update function that will be called by the MCP server.
-        // The body lives in applySessionTitle so the CLI auto-namer (NIM-822)
-        // can reuse the exact same broadcast/propagation path.
-        setUpdateSessionTitleFn((sessionId: string, title: string) =>
-          this.applySessionTitle(sessionId, title)
+        // Both agent naming and the CLI auto-namer use the atomic first-name
+        // path so a stale auto-name read can never overwrite a concurrent winner.
+        setUpdateSessionTitleIfNotNamedFn((sessionId: string, title: string) =>
+          this.applySessionTitleIfNotNamed(sessionId, title)
         );
         setClaudeCliAutoNameApplyTitleFn((sessionId: string, title: string) =>
-          this.applySessionTitle(sessionId, title)
+          this.applySessionTitleIfNotNamed(sessionId, title)
         );
 
         // Set the metadata update function (for tags, phase, etc.)
@@ -158,6 +160,20 @@ export class SessionNamingService {
           return (session?.metadata as any)?.phase || null;
         });
 
+        setUpdateSessionTagsFn((sessionId: string, add: string[], remove: string[]) =>
+          AISessionsRepository.updateTags(sessionId, { add, remove })
+        );
+
+        setGetSessionMetaAuthorityContextFn(async (sessionId: string) => {
+          const session = await AISessionsRepository.get(sessionId);
+          if (!session) return null;
+          return {
+            provider: session.provider,
+            providerSessionId: session.providerSessionId,
+            hasBeenNamed: session.hasBeenNamed,
+          };
+        });
+
         // MCP consolidation Phase 7: `update_session_meta` is served by the
         // unified server's eager core (`/mcp/core`) via the dispatch fn in
         // sessionNamingServer.ts; this service no longer starts a standalone
@@ -177,16 +193,35 @@ export class SessionNamingService {
 
   /**
    * Apply a session title with full propagation: blitz-parent first-wins
-   * naming, worktree display name, and renderer broadcasts. Called by the
-   * naming MCP server (agent-chosen titles) and by the claude-code-cli
-   * auto-namer (NIM-822). Renames are allowed; the agent prompt instructs the
-   * agent not to rename a named session unless the user asks.
+   * naming, worktree display name, and renderer broadcasts. The force path is
+   * reserved for an explicit host-owned rename; automated and MCP callers use
+   * applySessionTitleIfNotNamed().
    */
   public async applySessionTitle(sessionId: string, title: string): Promise<void> {
+    await this.applySessionTitleWithMode(sessionId, title, true);
+  }
+
+  /** Atomically apply the first agent-chosen title without overwriting a winner. */
+  public async applySessionTitleIfNotNamed(sessionId: string, title: string): Promise<boolean> {
+    return this.applySessionTitleWithMode(sessionId, title, false);
+  }
+
+  private async tryApplyFirstSessionTitle(
+    sessionId: string,
+    title: string,
+  ): Promise<boolean> {
+    return AISessionsRepository.updateTitleIfNotNamed(sessionId, title);
+  }
+
+  private async applySessionTitleWithMode(
+    sessionId: string,
+    title: string,
+    force: boolean,
+  ): Promise<boolean> {
     const sessionManager = this.sessionManager;
     if (!sessionManager) {
       console.warn('[SessionNamingService] applySessionTitle before start(); skipping');
-      return;
+      return false;
     }
     const windows = BrowserWindow.getAllWindows();
 
@@ -194,26 +229,35 @@ export class SessionNamingService {
     let parentBlitzId: string | undefined;
     let worktreeId: string | undefined;
 
-    try {
-      const session = await AISessionsRepository.get(sessionId);
-      worktreeId = session?.worktreeId;
+    const session = await AISessionsRepository.get(sessionId);
+    worktreeId = session?.worktreeId;
 
-      if (session?.parentSessionId) {
-        const parent = await AISessionsRepository.get(session.parentSessionId);
-        if (parent?.sessionType === 'blitz') {
-          parentBlitzId = parent.id;
-        }
+    if (session?.parentSessionId) {
+      const parent = await AISessionsRepository.get(session.parentSessionId);
+      if (!parent) {
+        throw new Error('Session parent could not be resolved before naming');
       }
-    } catch (error) {
-      console.error('[SessionNamingService] Failed to check blitz membership:', error);
+      if (parent.sessionType === 'blitz') {
+        parentBlitzId = parent.id;
+      }
     }
 
     if (parentBlitzId) {
       // Blitz child session: propagate AI-chosen name to blitz parent (first-wins),
       // but keep the child's model-based title unchanged
       try {
-        const updated = await AISessionsRepository.updateTitleIfNotNamed(parentBlitzId, title);
-        if (updated) {
+        const result = force
+          ? {
+              childClaimed: true,
+              parentNamed: await AISessionsRepository.updateTitleIfNotNamed(parentBlitzId, title),
+            }
+          : await AISessionsRepository.claimBlitzNameIfChildNotNamed(
+              sessionId,
+              parentBlitzId,
+              title,
+            );
+        if (!result.childClaimed) return false;
+        if (result.parentNamed) {
           console.log(`[SessionNamingService] Updated blitz ${parentBlitzId} display name to: "${title}"`);
           for (const window of windows) {
             window.webContents.send('blitz:display-name-updated', {
@@ -223,16 +267,27 @@ export class SessionNamingService {
           }
         }
       } catch (error) {
+        // Do not consume the child's write-once claim on failure. The atomic
+        // store operation either commits both required state changes or none.
         console.error('[SessionNamingService] Failed to update blitz display name:', error);
+        throw error;
       }
 
       // Mark child as named so update_session_meta won't set name again, but keep model-based title
-      await AISessionsRepository.updateMetadata(sessionId, { hasBeenNamed: true } as any);
-      return;
+      if (force) {
+        await AISessionsRepository.updateMetadata(sessionId, { hasBeenNamed: true } as any);
+      }
+      return true;
     }
 
-    // Normal (non-blitz) session: update title and propagate to worktree.
-    await sessionManager.updateSessionTitle(sessionId, title, { force: true, markAsNamed: true });
+    // Normal (non-blitz) session: first naming is compare-and-set; only a
+    // host-owned caller can enter the force path.
+    if (force) {
+      await sessionManager.updateSessionTitle(sessionId, title, { force: true, markAsNamed: true });
+    } else {
+      const updated = await this.tryApplyFirstSessionTitle(sessionId, title);
+      if (!updated) return false;
+    }
     for (const window of windows) {
       window.webContents.send('session:title-updated', { sessionId, title });
     }
@@ -258,6 +313,7 @@ export class SessionNamingService {
         console.error('[SessionNamingService] Failed to update worktree display name:', error);
       }
     }
+    return true;
   }
 
   /**

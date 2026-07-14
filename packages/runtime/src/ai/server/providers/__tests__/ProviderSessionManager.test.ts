@@ -45,6 +45,100 @@ describe('ProviderSessionManager', () => {
         providerSessionId: 'provider-xyz',
       });
     });
+
+    it('waits for durable host persistence before resolving the fenced capture', async () => {
+      let release!: () => void;
+      const persistence = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      emit.mockImplementation((_event, data: any) => {
+        data.waitUntil?.(persistence);
+        return true;
+      });
+
+      let settled = false;
+      const capture = manager.captureSessionIdAndWait('session-1', 'provider-abc')
+        .then(() => { settled = true; });
+      await Promise.resolve();
+
+      expect(settled).toBe(false);
+      expect(manager.getSessionId('session-1')).toBe('provider-abc');
+
+      release();
+      await capture;
+      expect(settled).toBe(true);
+    });
+
+    it('rolls back the in-memory mapping when durable persistence fails', async () => {
+      emit.mockImplementation((_event, data: any) => {
+        data.waitUntil?.(Promise.reject(new Error('database unavailable')));
+        return true;
+      });
+
+      await expect(
+        manager.captureSessionIdAndWait('session-1', 'provider-abc'),
+      ).rejects.toThrow('database unavailable');
+      expect(manager.getSessionId('session-1')).toBeUndefined();
+    });
+
+    it('fails closed when the host does not register a durability barrier', async () => {
+      emit.mockReturnValue(false);
+
+      await expect(
+        manager.captureSessionIdAndWait('session-1', 'provider-abc'),
+      ).rejects.toThrow('Provider session durability barrier was not registered');
+      expect(manager.getSessionId('session-1')).toBeUndefined();
+    });
+
+    it('makes a concurrent same-thread capture share the pending durability barrier', async () => {
+      let release!: () => void;
+      const persistence = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      emit.mockImplementation((_event, data: any) => {
+        data.waitUntil?.(persistence);
+        return true;
+      });
+
+      let firstSettled = false;
+      let secondSettled = false;
+      const first = manager.captureSessionIdAndWait('session-1', 'provider-abc')
+        .then(() => { firstSettled = true; });
+      const second = manager.captureSessionIdAndWait('session-1', 'provider-abc')
+        .then(() => { secondSettled = true; });
+      await Promise.resolve();
+
+      expect(firstSettled).toBe(false);
+      expect(secondSettled).toBe(false);
+      expect(emit).toHaveBeenCalledOnce();
+
+      release();
+      await Promise.all([first, second]);
+      expect(firstSettled).toBe(true);
+      expect(secondSettled).toBe(true);
+    });
+
+    it('rejects a different thread while persistence is pending and rolls back cleanly on failure', async () => {
+      let rejectPersistence!: (error: Error) => void;
+      const persistence = new Promise<void>((_resolve, reject) => {
+        rejectPersistence = reject;
+      });
+      emit.mockImplementation((_event, data: any) => {
+        data.waitUntil?.(persistence);
+        return true;
+      });
+
+      const first = manager.captureSessionIdAndWait('session-1', 'provider-a');
+      await expect(
+        manager.captureSessionIdAndWait('session-1', 'provider-b'),
+      ).rejects.toThrow('A different provider session durability write is already in progress');
+      expect(emit).toHaveBeenCalledOnce();
+      expect(manager.getSessionId('session-1')).toBe('provider-a');
+
+      rejectPersistence(new Error('database unavailable'));
+      await expect(first).rejects.toThrow('database unavailable');
+      expect(manager.getSessionId('session-1')).toBeUndefined();
+    });
   });
 
   describe('getSessionId', () => {

@@ -19,6 +19,8 @@ import type {
   SessionMeta,
   SessionListOptions,
   ChatSession,
+  SessionTagPatch,
+  BlitzNameClaimResult,
 } from '../ai/adapters/sessionStore';
 import type { AgentMessage } from '../ai/server/types';
 import type { SyncProvider, SessionChange, SyncedSessionMetadata } from './types';
@@ -242,7 +244,7 @@ export function createSyncedSessionStore(
         // Fallback implementation
         const session = await baseStore.get(sessionId);
         if (session?.hasBeenNamed) return false;
-        await baseStore.updateMetadata(sessionId, { title });
+        await baseStore.updateMetadata(sessionId, { title, hasBeenNamed: true } as any);
         return true;
       }
 
@@ -254,10 +256,50 @@ export function createSyncedSessionStore(
         await ensureSyncConnected(sessionId);
         pushToSync(sessionId, {
           type: 'metadata_updated',
-          metadata: { title, updatedAt: Date.now() },
+          metadata: { title, hasBeenNamed: true, updatedAt: Date.now() },
         });
       }
 
+      return result;
+    },
+
+    async updateTags(sessionId: string, patch: SessionTagPatch): Promise<string[]> {
+      if (!baseStore.updateTags) {
+        throw new Error('Base session store does not support atomic tag patches');
+      }
+      const tags = await baseStore.updateTags(sessionId, patch);
+      pushToSync(sessionId, {
+        type: 'metadata_updated',
+        metadata: { tags },
+      });
+      return tags;
+    },
+
+    async claimBlitzNameIfChildNotNamed(
+      childSessionId: string,
+      parentSessionId: string,
+      title: string,
+    ): Promise<BlitzNameClaimResult> {
+      if (!baseStore.claimBlitzNameIfChildNotNamed) {
+        throw new Error('Base session store does not support atomic Blitz naming');
+      }
+      const result = await baseStore.claimBlitzNameIfChildNotNamed(
+        childSessionId,
+        parentSessionId,
+        title,
+      );
+      if (result.childClaimed) {
+        pushToSync(childSessionId, {
+          type: 'metadata_updated',
+          metadata: { hasBeenNamed: true },
+        });
+      }
+      if (result.parentNamed) {
+        pushToSync(parentSessionId, {
+          type: 'metadata_updated',
+          metadata: { title, hasBeenNamed: true, updatedAt: Date.now() },
+        });
+      }
       return result;
     },
   };

@@ -302,3 +302,74 @@ describe('PGLiteSessionStore.updateMetadata defense-in-depth', () => {
     });
   });
 });
+
+describe('PGLiteSessionStore metadata authority operations', () => {
+  it('serializes tag deltas across store wrappers without losing additions', async () => {
+    let storedMetadata = JSON.stringify({ tags: ['alpha'], phase: 'implementing' });
+    const db = {
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        if (/SELECT\s+metadata\s+FROM\s+ai_sessions/i.test(sql)) {
+          return { rows: [{ metadata: storedMetadata }] };
+        }
+        if (/UPDATE\s+ai_sessions\s+SET\s+metadata\s*=/i.test(sql)) {
+          storedMetadata = String(params[1]);
+          await Promise.resolve();
+          return { rows: [] };
+        }
+        return { rows: [] };
+      }),
+    };
+    const firstStore = createPGLiteSessionStore(db as any);
+    const secondStore = createPGLiteSessionStore(db as any);
+
+    await Promise.all([
+      firstStore.updateTags!('s1', { add: ['beta'], remove: [] }),
+      secondStore.updateTags!('s1', { add: ['gamma'], remove: [] }),
+    ]);
+
+    expect(JSON.parse(storedMetadata)).toEqual({
+      tags: ['alpha', 'beta', 'gamma'],
+      phase: 'implementing',
+    });
+  });
+
+  it('claims a Blitz child and parent in one atomic SQL statement', async () => {
+    const db = {
+      query: vi.fn(async (sql: string) => {
+        if (/UPDATE\s+ai_sessions/i.test(sql) && /RETURNING\s+id/i.test(sql)) {
+          return { rows: [{ id: 'child-1' }, { id: 'blitz-1' }] };
+        }
+        return { rows: [] };
+      }),
+    };
+    const store = createPGLiteSessionStore(db as any);
+
+    const result = await store.claimBlitzNameIfChildNotNamed!(
+      'child-1',
+      'blitz-1',
+      'Atomic Blitz title',
+    );
+
+    expect(result).toEqual({ childClaimed: true, parentNamed: true });
+    const mutationCalls = db.query.mock.calls.filter((call: any[]) =>
+      typeof call[0] === 'string' && /UPDATE\s+ai_sessions/i.test(call[0])
+    );
+    expect(mutationCalls).toHaveLength(1);
+    expect(mutationCalls[0][0]).toContain('EXISTS');
+  });
+
+  it('does not report a child claim when the atomic Blitz statement fails', async () => {
+    const db = {
+      query: vi.fn(async (sql: string) => {
+        if (/UPDATE\s+ai_sessions/i.test(sql)) throw new Error('store unavailable');
+        return { rows: [] };
+      }),
+    };
+    const store = createPGLiteSessionStore(db as any);
+
+    await expect(
+      store.claimBlitzNameIfChildNotNamed!('child-1', 'blitz-1', 'Retry me'),
+    ).rejects.toThrow('store unavailable');
+    expect(db.query).toHaveBeenCalledTimes(1);
+  });
+});

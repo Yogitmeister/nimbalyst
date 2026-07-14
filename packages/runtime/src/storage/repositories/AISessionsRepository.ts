@@ -4,6 +4,8 @@ import {
   type SessionMeta,
   type SessionListOptions,
   type SessionStore,
+  type SessionTagPatch,
+  type BlitzNameClaimResult,
   type UpdateSessionMetadataPayload,
   getSessionStore,
   hasSessionStore,
@@ -88,6 +90,26 @@ export const AISessionsRepository = {
     return true;
   },
 
+  async updateTags(sessionId: string, patch: SessionTagPatch): Promise<string[]> {
+    const store = requireStore();
+    if (!store.updateTags) {
+      throw new Error('Session store does not support atomic tag patches');
+    }
+    return await store.updateTags(sessionId, patch);
+  },
+
+  async claimBlitzNameIfChildNotNamed(
+    childSessionId: string,
+    parentSessionId: string,
+    title: string,
+  ): Promise<BlitzNameClaimResult> {
+    const store = requireStore();
+    if (!store.claimBlitzNameIfChildNotNamed) {
+      throw new Error('Session store does not support atomic Blitz naming');
+    }
+    return await store.claimBlitzNameIfChildNotNamed(childSessionId, parentSessionId, title);
+  },
+
   async getBranches(sessionId: string): Promise<SessionMeta[]> {
     const store = requireStore();
     if (store.getBranches) {
@@ -101,5 +123,7 @@ export const AISessionsRepository = {
 export type {
   CreateSessionPayload,
   SessionMeta,
+  SessionTagPatch,
+  BlitzNameClaimResult,
   UpdateSessionMetadataPayload,
 };

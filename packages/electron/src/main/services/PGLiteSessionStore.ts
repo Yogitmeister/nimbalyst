@@ -13,6 +13,8 @@ import type {
   SessionSearchOptions,
   CreateSessionPayload,
   UpdateSessionMetadataPayload,
+  SessionTagPatch,
+  BlitzNameClaimResult,
   ChatSession,
   AgentMessage
 } from '@nimbalyst/runtime';
@@ -1080,6 +1082,88 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
         [sessionId, title]
       );
       return rows.length > 0;
+    },
+
+    async updateTags(sessionId: string, patch: SessionTagPatch): Promise<string[]> {
+      await ensureReady();
+      return withSessionMetadataMutationLock(db, sessionId, async () => {
+        const { rows } = await db.query<{ metadata: unknown }>(
+          `SELECT metadata FROM ai_sessions WHERE id = $1`,
+          [sessionId],
+        );
+        if (rows.length === 0) {
+          throw new Error('Session not found');
+        }
+
+        const existingMetadata = normalizeJsonObject(rows[0]?.metadata);
+        const existingTags = Array.isArray(existingMetadata.tags)
+          ? existingMetadata.tags.filter((tag): tag is string => typeof tag === 'string')
+          : [];
+        const remove = new Set(patch.remove);
+        const nextTags = existingTags.filter((tag) => !remove.has(tag));
+        for (const tag of patch.add) {
+          if (!nextTags.includes(tag)) nextTags.push(tag);
+        }
+        if (nextTags.length > 64) {
+          throw new Error('A session cannot have more than 64 tags');
+        }
+
+        await db.query(
+          `UPDATE ai_sessions SET metadata = $2 WHERE id = $1`,
+          [sessionId, JSON.stringify({ ...existingMetadata, tags: nextTags })],
+        );
+        return nextTags;
+      });
+    },
+
+    async claimBlitzNameIfChildNotNamed(
+      childSessionId: string,
+      parentSessionId: string,
+      title: string,
+    ): Promise<BlitzNameClaimResult> {
+      await ensureReady();
+      if (childSessionId === parentSessionId) {
+        throw new Error('Blitz child and parent session IDs must differ');
+      }
+
+      // One statement keeps the child claim and optional parent first-name
+      // assignment atomic on both PostgreSQL/PGLite and SQLite. The correlated
+      // subquery observes the child's pre-update state, so a previously claimed
+      // child can never rename an unnamed parent on a retry.
+      const { rows } = await db.query<{ id: string }>(
+        `UPDATE ai_sessions
+         SET title = CASE
+               WHEN id = $2 AND (has_been_named = false OR has_been_named IS NULL)
+                 THEN $3
+               ELSE title
+             END,
+             has_been_named = CASE
+               WHEN id = $1 THEN true
+               WHEN id = $2 AND (has_been_named = false OR has_been_named IS NULL)
+                 THEN true
+               ELSE has_been_named
+             END
+         WHERE (
+           id = $1
+           AND (has_been_named = false OR has_been_named IS NULL)
+         ) OR (
+           id = $2
+           AND (has_been_named = false OR has_been_named IS NULL)
+           AND EXISTS (
+             SELECT 1
+             FROM ai_sessions child
+             WHERE child.id = $1
+               AND (child.has_been_named = false OR child.has_been_named IS NULL)
+           )
+         )
+         RETURNING id`,
+        [childSessionId, parentSessionId, title],
+      );
+      const updatedIds = new Set(rows.map((row) => row.id));
+      return {
+        childClaimed: updatedIds.has(childSessionId),
+        parentNamed: updatedIds.has(parentSessionId),
+      };
     },
 
     // Note: claimQueuedPrompt has been moved to the new queued_prompts table

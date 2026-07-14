@@ -1146,7 +1146,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
           );
         }
         if (!existingSessionId) {
-          this.sessions.captureSessionId(sessionId, session.id);
+          await this.sessions.captureSessionIdAndWait(sessionId, session.id);
         }
       }
 
@@ -1322,7 +1322,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
           //   nimbalystSessionId: sessionId,
           //   codexThreadId: session.id
           // });
-          this.sessions.captureSessionId(sessionId, session.id);
+          await this.sessions.captureSessionIdAndWait(sessionId, session.id);
         } else {
           // console.log('[CODEX] Thread ID unchanged:', session.id);
         }
