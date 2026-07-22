@@ -16,6 +16,22 @@ on:
     paths:
       - 'packages/ios/**'
       - '.github/workflows/ios-transcript-tests.yml'
+  workflow_dispatch:
+    inputs:
+      repair_sha:
+        description: Exact NIM-367 repair commit; must equal the locked SHA
+        required: true
+        type: string
+      production_stress_iterations:
+        description: Seeded production URLSession/WebSocket schedules per test
+        required: true
+        default: '40'
+        type: string
+      production_stress_seed:
+        description: Unsigned 32-bit decimal seed recorded in receipts
+        required: true
+        default: '3670421'
+        type: string
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -29,6 +45,7 @@ env:
 jobs:
   ios-build-and-test:
     name: iOS Build and Test
+    if: github.event_name != 'workflow_dispatch'
     runs-on: macos-15
     defaults:
       run:
@@ -242,3 +259,834 @@ jobs:
 
           echo "Transcript bundle successfully included in app"
           ls -la "$APP_PATH/transcript-dist"
+
+  # ---------------------------------------------------------------------
+  # NIM-367 manual acceptance gate. Every job below runs only on an explicit
+  # workflow_dispatch and reads its OWNER-FILLED IMMUTABLE identity values
+  # (approved gate ref/commit/tree/blobs, approved scheme, approved Xcode
+  # build, pinned action commits, TSan fallback mode/allowlist) from the
+  # `nim367-apple-gate-approval` protected GitHub Environment. Those values
+  # are populated by a separate owner-authority Phase D record, never by
+  # this workflow file itself -- see
+  # D:/!! CLAUDE/_pending/v12_nim367_apple_ci_gate_implementation_brief.md,
+  # "Independent gate-revision trust anchor". A `uses:` ref written here as
+  # `<OWNER-FILLED-40HEX-COMMIT>` is a literal placeholder (not a fabricated
+  # SHA) and is intentionally not a runnable ref until Phase D fills it.
+  #
+  # This job set intentionally does not claim GATE_EVIDENCE_PASS or
+  # APPLE_ACCEPTED anywhere -- those verdicts require real Apple runtime
+  # evidence that only exists after an authorized dispatch executes these
+  # steps on real hosted-macOS hardware.
+
+  nim367-identity-compile-focused:
+    name: 'NIM-367 Gate 1: identity + strict compile + focused'
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    environment: nim367-apple-gate-approval
+    permissions:
+      contents: read
+    env:
+      NIM367_REPAIR_SHA: ${{ inputs.repair_sha }}
+    steps:
+      - name: Verify exact-SHA and identity-lock inputs
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.repair_sha }}" != "cd87e6047b30da9e166d9b2350726ad1d8554009" ]; then
+            echo "::error::repair_sha does not equal the locked NIM-367 repair commit"
+            exit 1
+          fi
+          case "${{ inputs.production_stress_iterations }}" in
+            2[0-9]|3[0-9]|40) ;;
+            *) echo "::error::production_stress_iterations out of canonical range 20..40"; exit 1 ;;
+          esac
+          if [ "${{ inputs.production_stress_seed }}" -lt 0 ] 2>/dev/null || [ "${{ inputs.production_stress_seed }}" -gt 4294967295 ] 2>/dev/null; then
+            echo "::error::production_stress_seed out of canonical unsigned 32-bit range"
+            exit 1
+          fi
+          if [ -z "${{ vars.APPROVED_GATE_REF }}" ] || [ -z "${{ vars.APPROVED_GATE_COMMIT }}" ]; then
+            echo "::error::protected environment nim367-apple-gate-approval is missing OWNER-FILLED IMMUTABLE values; Phase D has not populated this record"
+            exit 1
+          fi
+          if [ "${{ github.ref }}" != "${{ vars.APPROVED_GATE_REF }}" ]; then
+            echo "::error::github.ref does not equal APPROVED_GATE_REF"
+            exit 1
+          fi
+          if [ "${{ github.workflow_ref }}" != "${{ vars.APPROVED_WORKFLOW_REF }}" ]; then
+            echo "::error::github.workflow_ref does not equal APPROVED_WORKFLOW_REF"
+            exit 1
+          fi
+          if [ "${{ github.workflow_sha }}" != "${{ vars.APPROVED_GATE_COMMIT }}" ] || [ "${{ github.sha }}" != "${{ vars.APPROVED_GATE_COMMIT }}" ]; then
+            echo "::error::github.workflow_sha/github.sha does not equal APPROVED_GATE_COMMIT"
+            exit 1
+          fi
+
+      - name: Checkout gate (sealed, workflow_sha)
+        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: gate
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout SUT (sealed, exact repair SHA)
+        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        with:
+          ref: ${{ inputs.repair_sha }}
+          path: sut
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify sealed-checkout identity and clean status
+        run: |
+          set -euo pipefail
+          GATE_HEAD=$(git -C gate rev-parse HEAD)
+          GATE_TREE=$(git -C gate rev-parse HEAD^{tree})
+          if [ "$GATE_HEAD" != "${{ vars.APPROVED_GATE_COMMIT }}" ] || [ "$GATE_TREE" != "${{ vars.APPROVED_GATE_TREE }}" ]; then
+            echo "::error::gate checkout HEAD/tree does not match the approved record"
+            exit 1
+          fi
+          SUT_HEAD=$(git -C sut rev-parse HEAD)
+          SUT_PARENT=$(git -C sut rev-parse HEAD^)
+          SUT_TREE=$(git -C sut rev-parse HEAD^{tree})
+          if [ "$SUT_HEAD" != "cd87e6047b30da9e166d9b2350726ad1d8554009" ] || \
+             [ "$SUT_PARENT" != "7ec725a456c230751c70a3d7269fc89fd6ce55ca" ] || \
+             [ "$SUT_TREE" != "f9767e7febafee27347b55ab9a6eee6595d4dbe4" ]; then
+            echo "::error::SUT checkout HEAD/parent/tree does not match the locked repair identity"
+            exit 1
+          fi
+          DIFF_PATHS=$(git -C sut diff-tree --no-commit-id --name-status -r HEAD | sort)
+          EXPECTED_PATHS=$(printf 'M\tpackages/ios/NimbalystNative/Sources/Sync/DocumentSyncManager.swift\nM\tpackages/ios/NimbalystNative/Sources/Sync/SyncManager.swift\nM\tpackages/ios/NimbalystNative/Sources/Sync/WebSocketClient.swift\nM\tpackages/ios/NimbalystNative/Tests/SessionFeedContinuityTests.swift\n' | sort)
+          if [ "$DIFF_PATHS" != "$EXPECTED_PATHS" ]; then
+            echo "::error::SUT diff-tree does not equal exactly the four recorded repair paths"
+            exit 1
+          fi
+          for repo in gate sut; do
+            git -C "$repo" status --porcelain=v1 --untracked-files=all > "$repo-status-untracked.txt"
+            git -C "$repo" status --ignored=matching --porcelain=v1 > "$repo-status-ignored.txt"
+            if [ -s "$repo-status-untracked.txt" ] || [ -s "$repo-status-ignored.txt" ]; then
+              echo "::error::$repo checkout is not clean (untracked or ignored-matching entries present)"
+              exit 1
+            fi
+          done
+
+      - name: Setup Xcode (approved build)
+        uses: maxim-lobanov/setup-xcode@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v1
+        with:
+          xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
+
+      - name: Materialize watchdog wrapper
+        run: |
+          mkdir -p "$RUNNER_TEMP/nim367"
+          cat > "$RUNNER_TEMP/nim367/watchdog.py" <<'PYEOF'
+          import argparse, json, os, signal, subprocess, sys, time
+
+          def main():
+              p = argparse.ArgumentParser()
+              p.add_argument("--timeout-seconds", type=int, required=True)
+              p.add_argument("--term-grace-seconds", type=int, default=15)
+              p.add_argument("--stdout", required=True)
+              p.add_argument("--stderr", required=True)
+              p.add_argument("--combined-log", required=True)
+              p.add_argument("--status", required=True)
+              p.add_argument("cmd", nargs=argparse.REMAINDER)
+              args = p.parse_args()
+              cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else args.cmd
+
+              start = time.time()
+              start_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+              with open(args.stdout, "wb") as out_f, open(args.stderr, "wb") as err_f:
+                  proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f, start_new_session=True)
+                  timed_out = False
+                  try:
+                      proc.wait(timeout=args.timeout_seconds)
+                  except subprocess.TimeoutExpired:
+                      timed_out = True
+                      os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                      try:
+                          proc.wait(timeout=args.term_grace_seconds)
+                      except subprocess.TimeoutExpired:
+                          os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                          proc.wait()
+              end = time.time()
+              end_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+              exit_code = 124 if timed_out else proc.returncode
+
+              with open(args.stdout, "rb") as out_f, open(args.stderr, "rb") as err_f, open(args.combined_log, "wb") as combined:
+                  combined.write(b"--- stdout ---\n")
+                  combined.write(out_f.read())
+                  combined.write(b"--- stderr ---\n")
+                  combined.write(err_f.read())
+
+              status = {
+                  "startUtc": start_utc,
+                  "endUtc": end_utc,
+                  "elapsedSeconds": end - start,
+                  "pid": proc.pid,
+                  "command": cmd,
+                  "exitCode": exit_code,
+                  "timedOut": timed_out,
+              }
+              with open(args.status, "w") as status_f:
+                  json.dump(status, status_f)
+
+              sys.exit(exit_code)
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+      - name: Mechanical dependency-equivalence gate
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys
+
+          def load(path):
+              with open(path) as f:
+                  return json.load(f)
+
+          sut_pins = load("sut/packages/ios/NimbalystNative/Package.resolved")["pins"]
+          gate_pins = load("gate/packages/ios/NimbalystAppleGate/Package.resolved")["pins"]
+
+          def canon(pins):
+              out = []
+              for pin in pins:
+                  state = pin["state"]
+                  out.append((pin["identity"], pin["kind"], pin["location"], state.get("revision"), state.get("version")))
+              return sorted(out)
+
+          required = {
+              "grdb.swift": "aa0079aeb82a4bf00324561a40bffe68c6fe1c26",
+              "posthog-ios": "1ba3e8636d4f1ad9f18f5a4273e88d39a162466b",
+          }
+          gate_by_id = {pin["identity"]: pin for pin in gate_pins}
+          for identity, revision in required.items():
+              if identity not in gate_by_id:
+                  print(f"::error::missing required dependency {identity}", file=sys.stderr)
+                  sys.exit(1)
+              if gate_by_id[identity]["state"].get("revision") != revision:
+                  print(f"::error::{identity} revision does not equal the locked immutable revision", file=sys.stderr)
+                  sys.exit(1)
+          if len(gate_pins) != len(required):
+              print("::error::gate Package.resolved declares an unapproved additional dependency", file=sys.stderr)
+              sys.exit(1)
+          print("Mechanical dependency-equivalence gate: OK")
+          PYEOF
+
+      - name: Gate 1 -- scheme preflight, strict compile, focused execution
+        env:
+          RESOLVER_ROOT: ${{ runner.temp }}/nim367/resolver
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESOLVER_ROOT"/{cache,configuration,security,scratch,clones,receipts}
+          SWIFT_EXEC=$(xcrun --find swift)
+          SWIFTC_EXEC=$(xcrun --find swiftc)
+          echo "SWIFT_EXEC=$SWIFT_EXEC" >> "$GITHUB_ENV"
+          echo "SWIFTC_EXEC=$SWIFTC_EXEC" >> "$GITHUB_ENV"
+          "$SWIFT_EXEC" --version
+          "$SWIFTC_EXEC" --version
+          xcode-select -p
+          xcodebuild -version
+
+          cd gate/packages/ios/NimbalystAppleGate
+          python3 "$RUNNER_TEMP/nim367/watchdog.py" \
+            --timeout-seconds 300 --term-grace-seconds 15 \
+            --stdout "$RUNNER_TEMP/nim367/dump-package.stdout" \
+            --stderr "$RUNNER_TEMP/nim367/dump-package.stderr" \
+            --combined-log "$RUNNER_TEMP/nim367/dump-package.log" \
+            --status "$RUNNER_TEMP/nim367/dump-package.watchdog.json" \
+            -- "$SWIFT_EXEC" package \
+              --package-path "$GITHUB_WORKSPACE/gate/packages/ios/NimbalystAppleGate" \
+              --cache-path "$RESOLVER_ROOT/cache" \
+              --config-path "$RESOLVER_ROOT/configuration" \
+              --security-path "$RESOLVER_ROOT/security" \
+              --scratch-path "$RESOLVER_ROOT/scratch" \
+              dump-package
+
+          python3 "$RUNNER_TEMP/nim367/watchdog.py" \
+            --timeout-seconds 120 --term-grace-seconds 15 \
+            --stdout "$RUNNER_TEMP/nim367/scheme-list.stdout" \
+            --stderr "$RUNNER_TEMP/nim367/scheme-list.stderr" \
+            --combined-log "$RUNNER_TEMP/nim367/scheme-list.log" \
+            --status "$RUNNER_TEMP/nim367/scheme-list.watchdog.json" \
+            -- xcodebuild -list -json \
+              -disableAutomaticPackageResolution \
+              -onlyUsePackageVersionsFromResolvedFile \
+              -clonedSourcePackagesDirPath "$RESOLVER_ROOT/clones"
+
+          if ! grep -q "${{ vars.APPROVED_GATE_SCHEME }}" "$RUNNER_TEMP/nim367/scheme-list.stdout"; then
+            echo "::error::approved test-bearing scheme not present in observed scheme list"
+            exit 1
+          fi
+
+          cd "$GITHUB_WORKSPACE/sut/packages/ios/NimbalystNative"
+          python3 "$RUNNER_TEMP/nim367/watchdog.py" \
+            --timeout-seconds 900 --term-grace-seconds 15 \
+            --stdout "$RUNNER_TEMP/nim367/swift-focused.stdout" \
+            --stderr "$RUNNER_TEMP/nim367/swift-focused.stderr" \
+            --combined-log "$RUNNER_TEMP/nim367/swift-focused.log" \
+            --status "$RUNNER_TEMP/nim367/swift-focused.watchdog.json" \
+            -- "$SWIFT_EXEC" test \
+              --package-path "$GITHUB_WORKSPACE/sut/packages/ios/NimbalystNative" \
+              --cache-path "$RESOLVER_ROOT/cache" \
+              --config-path "$RESOLVER_ROOT/configuration" \
+              --security-path "$RESOLVER_ROOT/security" \
+              --disable-automatic-resolution \
+              --scratch-path "$RESOLVER_ROOT/scratch" \
+              --filter SessionFeedContinuityTests \
+              -Xswiftc -swift-version -Xswiftc 6 \
+              -Xswiftc -strict-concurrency=complete
+
+      - name: Prepare iOS simulator
+        run: |
+          set -euo pipefail
+          SIMULATOR_UDID=$(xcrun simctl list -j devices available | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data['devices'].items():
+              for device in devices:
+                  if device.get('isAvailable') and 'iPhone' in device.get('name', ''):
+                      print(device['udid'])
+                      sys.exit(0)
+          sys.exit(1)
+          ")
+          xcrun simctl boot "$SIMULATOR_UDID" || true
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+          echo "IOS_SIMULATOR_DESTINATION=platform=iOS Simulator,id=$SIMULATOR_UDID" >> "$GITHUB_ENV"
+
+      - name: Gate 1 -- strict build and focused xctest
+        env:
+          RESOLVER_ROOT: ${{ runner.temp }}/nim367/resolver
+        run: |
+          set -euo pipefail
+          cd sut/packages/ios/NimbalystNative
+          python3 "$RUNNER_TEMP/nim367/watchdog.py" \
+            --timeout-seconds 900 --term-grace-seconds 15 \
+            --stdout "$RUNNER_TEMP/nim367/strict-build.stdout" \
+            --stderr "$RUNNER_TEMP/nim367/strict-build.stderr" \
+            --combined-log "$RUNNER_TEMP/nim367/strict-build.log" \
+            --status "$RUNNER_TEMP/nim367/strict-build.watchdog.json" \
+            -- xcodebuild build \
+              -scheme NimbalystNative \
+              -destination "$IOS_SIMULATOR_DESTINATION" \
+              -skipPackagePluginValidation \
+              -disableAutomaticPackageResolution \
+              -onlyUsePackageVersionsFromResolvedFile \
+              -clonedSourcePackagesDirPath "$RESOLVER_ROOT/clones" \
+              -derivedDataPath "$RUNNER_TEMP/nim367/DerivedData/strict-build" \
+              SWIFT_VERSION=6 \
+              SWIFT_STRICT_CONCURRENCY=complete \
+              -resultBundlePath "$RUNNER_TEMP/nim367/compile/strict-build.xcresult"
+
+          python3 "$RUNNER_TEMP/nim367/watchdog.py" \
+            --timeout-seconds 900 --term-grace-seconds 15 \
+            --stdout "$RUNNER_TEMP/nim367/focused.stdout" \
+            --stderr "$RUNNER_TEMP/nim367/focused.stderr" \
+            --combined-log "$RUNNER_TEMP/nim367/focused.log" \
+            --status "$RUNNER_TEMP/nim367/focused.watchdog.json" \
+            -- xcodebuild test \
+              -scheme NimbalystNative \
+              -destination "$IOS_SIMULATOR_DESTINATION" \
+              -skipPackagePluginValidation \
+              -disableAutomaticPackageResolution \
+              -onlyUsePackageVersionsFromResolvedFile \
+              -clonedSourcePackagesDirPath "$RESOLVER_ROOT/clones" \
+              -only-testing:NimbalystNativeTests/SessionFeedContinuityTests \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 30 \
+              -maximum-test-execution-time-allowance 60 \
+              -derivedDataPath "$RUNNER_TEMP/nim367/DerivedData/focused" \
+              SWIFT_VERSION=6 \
+              SWIFT_STRICT_CONCURRENCY=complete \
+              -resultBundlePath "$RUNNER_TEMP/nim367/focused/focused-tests.xcresult"
+
+      - name: Credential and retained-text scan
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import re, sys, pathlib
+
+          SYNTHETIC_TOKEN = "nim367-loopback-public-token-v1"
+          PATTERNS = [
+              re.compile(r"[Bb]earer\s+[A-Za-z0-9\-._~+/]+=*"),
+              re.compile(r"[Aa]uthorization:\s*[Bb]asic\s+[A-Za-z0-9+/=]+"),
+              re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+              re.compile(r"[?&](token|jwt|auth|key|secret)=([^&\s]+)"),
+          ]
+
+          root = pathlib.Path("${{ runner.temp }}/nim367")
+          findings = []
+          for path in root.glob("*.log"):
+              text = path.read_text(errors="replace")
+              for pattern in PATTERNS:
+                  for match in pattern.finditer(text):
+                      value = match.group(0)
+                      if SYNTHETIC_TOKEN in value:
+                          continue
+                      findings.append((str(path), pattern.pattern))
+          if findings:
+              print("::error::retained-text scan found unexpected credential-shaped content")
+              for path, pattern in findings:
+                  print(f"  {path}: {pattern}")
+              sys.exit(1)
+          print("Credential and retained-text scan: OK (no unexpected matches)")
+          PYEOF
+
+      - name: Package and hash evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          PKG="$RUNNER_TEMP/nim367-package/payload"
+          mkdir -p "$PKG"
+          cp "$RUNNER_TEMP"/nim367/*.log "$PKG"/ 2>/dev/null || true
+          cp "$RUNNER_TEMP"/nim367/*.watchdog.json "$PKG"/ 2>/dev/null || true
+          find "$RUNNER_TEMP/nim367" -name '*.xcresult' -exec cp -R {} "$PKG"/ \; 2>/dev/null || true
+          (cd "$RUNNER_TEMP/nim367-package" && find payload -type f | sort | xargs -I{} shasum -a 256 {} > SHA256SUMS)
+          (cd "$RUNNER_TEMP/nim367-package" && shasum -a 256 SHA256SUMS > SHA256SUMS.sha256)
+
+      - name: Upload gate 1 evidence
+        if: always()
+        uses: actions/upload-artifact@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: owner-selected
+        with:
+          name: nim367-compile-focused-${{ inputs.repair_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nim367-package
+          overwrite: false
+          retention-days: 90
+
+  nim367-deterministic-stress:
+    name: 'NIM-367 Gate 2: deterministic 20x stress'
+    if: github.event_name == 'workflow_dispatch'
+    needs: nim367-identity-compile-focused
+    runs-on: macos-15
+    environment: nim367-apple-gate-approval
+    steps:
+      - name: Checkout SUT (sealed, exact repair SHA)
+        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        with:
+          ref: ${{ inputs.repair_sha }}
+          path: sut
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Setup Xcode (approved build)
+        uses: maxim-lobanov/setup-xcode@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v1
+        with:
+          xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
+
+      - name: Prepare iOS simulator
+        run: |
+          set -euo pipefail
+          SIMULATOR_UDID=$(xcrun simctl list -j devices available | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data['devices'].items():
+              for device in devices:
+                  if device.get('isAvailable') and 'iPhone' in device.get('name', ''):
+                      print(device['udid'])
+                      sys.exit(0)
+          sys.exit(1)
+          ")
+          xcrun simctl boot "$SIMULATOR_UDID" || true
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+          echo "IOS_SIMULATOR_DESTINATION=platform=iOS Simulator,id=$SIMULATOR_UDID" >> "$GITHUB_ENV"
+
+      - name: Gate 2 -- deterministic 20x repetition
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nim367"
+          cd sut/packages/ios/NimbalystNative
+          xcodebuild test \
+            -scheme NimbalystNative \
+            -destination "$IOS_SIMULATOR_DESTINATION" \
+            -skipPackagePluginValidation \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -only-testing:NimbalystNativeTests/SessionFeedContinuityTests \
+            -test-iterations 20 \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 30 \
+            -maximum-test-execution-time-allowance 60 \
+            -derivedDataPath "$RUNNER_TEMP/nim367/DerivedData/deterministic-stress" \
+            SWIFT_VERSION=6 \
+            SWIFT_STRICT_CONCURRENCY=complete \
+            -resultBundlePath "$RUNNER_TEMP/nim367/stress/deterministic-20x.xcresult" \
+            2>&1 | tee "$RUNNER_TEMP/nim367/deterministic-stress.log"
+
+      - name: Package and hash evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          PKG="$RUNNER_TEMP/nim367-package/payload"
+          mkdir -p "$PKG"
+          cp "$RUNNER_TEMP"/nim367/*.log "$PKG"/ 2>/dev/null || true
+          find "$RUNNER_TEMP/nim367" -name '*.xcresult' -exec cp -R {} "$PKG"/ \; 2>/dev/null || true
+          (cd "$RUNNER_TEMP/nim367-package" && find payload -type f | sort | xargs -I{} shasum -a 256 {} > SHA256SUMS)
+          (cd "$RUNNER_TEMP/nim367-package" && shasum -a 256 SHA256SUMS > SHA256SUMS.sha256)
+
+      - name: Upload gate 2 evidence
+        if: always()
+        uses: actions/upload-artifact@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: owner-selected
+        with:
+          name: nim367-deterministic-stress-${{ inputs.repair_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nim367-package
+          overwrite: false
+          retention-days: 90
+
+  nim367-production-urlsession-stress:
+    name: 'NIM-367 Gate 3: production URLSession/WebSocket seeded stress'
+    if: github.event_name == 'workflow_dispatch'
+    needs: nim367-identity-compile-focused
+    runs-on: macos-15
+    environment: nim367-apple-gate-approval
+    steps:
+      - name: Checkout gate (sealed, workflow_sha)
+        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: gate
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout SUT (sealed, exact repair SHA)
+        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        with:
+          ref: ${{ inputs.repair_sha }}
+          path: sut
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Setup Xcode (approved build)
+        uses: maxim-lobanov/setup-xcode@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v1
+        with:
+          xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
+
+      - name: Prepare iOS simulator
+        run: |
+          set -euo pipefail
+          SIMULATOR_UDID=$(xcrun simctl list -j devices available | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data['devices'].items():
+              for device in devices:
+                  if device.get('isAvailable') and 'iPhone' in device.get('name', ''):
+                      print(device['udid'])
+                      sys.exit(0)
+          sys.exit(1)
+          ")
+          xcrun simctl boot "$SIMULATOR_UDID" || true
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+          echo "IOS_SIMULATOR_DESTINATION=platform=iOS Simulator,id=$SIMULATOR_UDID" >> "$GITHUB_ENV"
+
+      - name: Gate 3 -- production seeded stress (up to 40 iterations)
+        env:
+          NIM367_STRESS_ITERATIONS: ${{ inputs.production_stress_iterations }}
+          NIM367_STRESS_SEED: ${{ inputs.production_stress_seed }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nim367"
+          cd gate/packages/ios/NimbalystAppleGate
+          xcodebuild test \
+            -scheme "${{ vars.APPROVED_GATE_SCHEME }}" \
+            -destination "$IOS_SIMULATOR_DESTINATION" \
+            -skipPackagePluginValidation \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -only-testing:NIM367AppleGateTests/NIM367URLSessionStressTests \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 900 \
+            -maximum-test-execution-time-allowance 1200 \
+            -derivedDataPath "$RUNNER_TEMP/nim367/DerivedData/production-stress" \
+            SWIFT_VERSION=6 \
+            SWIFT_STRICT_CONCURRENCY=complete \
+            -resultBundlePath "$RUNNER_TEMP/nim367/stress/production-urlsession.xcresult" \
+            2>&1 | tee "$RUNNER_TEMP/nim367/production-urlsession-stress.log"
+
+      - name: Package and hash evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          PKG="$RUNNER_TEMP/nim367-package/payload"
+          mkdir -p "$PKG"
+          cp "$RUNNER_TEMP"/nim367/*.log "$PKG"/ 2>/dev/null || true
+          find "$RUNNER_TEMP/nim367" -name '*.xcresult' -exec cp -R {} "$PKG"/ \; 2>/dev/null || true
+          (cd "$RUNNER_TEMP/nim367-package" && find payload -type f | sort | xargs -I{} shasum -a 256 {} > SHA256SUMS)
+          (cd "$RUNNER_TEMP/nim367-package" && shasum -a 256 SHA256SUMS > SHA256SUMS.sha256)
+
+      - name: Upload gate 3 evidence
+        if: always()
+        uses: actions/upload-artifact@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: owner-selected
+        with:
+          name: nim367-production-urlsession-stress-${{ inputs.repair_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nim367-package
+          overwrite: false
+          retention-days: 90
+
+  nim367-tsan-focused:
+    name: 'NIM-367 Gate 4a: TSan focused'
+    if: github.event_name == 'workflow_dispatch'
+    needs: nim367-identity-compile-focused
+    runs-on: macos-15
+    environment: nim367-apple-gate-approval
+    steps:
+      - name: Checkout SUT (sealed, exact repair SHA)
+        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        with:
+          ref: ${{ inputs.repair_sha }}
+          path: sut
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Setup Xcode (approved build)
+        uses: maxim-lobanov/setup-xcode@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v1
+        with:
+          xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
+
+      - name: Prepare iOS simulator
+        run: |
+          set -euo pipefail
+          SIMULATOR_UDID=$(xcrun simctl list -j devices available | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data['devices'].items():
+              for device in devices:
+                  if device.get('isAvailable') and 'iPhone' in device.get('name', ''):
+                      print(device['udid'])
+                      sys.exit(0)
+          sys.exit(1)
+          ")
+          xcrun simctl boot "$SIMULATOR_UDID" || true
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+          echo "IOS_SIMULATOR_DESTINATION=platform=iOS Simulator,id=$SIMULATOR_UDID" >> "$GITHUB_ENV"
+
+      - name: Gate 4a -- iOS TSan focused
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nim367"
+          cd sut/packages/ios/NimbalystNative
+          set +e
+          xcodebuild test \
+            -scheme NimbalystNative \
+            -destination "$IOS_SIMULATOR_DESTINATION" \
+            -skipPackagePluginValidation \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -only-testing:NimbalystNativeTests/SessionFeedContinuityTests \
+            -enableThreadSanitizer YES \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 60 \
+            -maximum-test-execution-time-allowance 120 \
+            -derivedDataPath "$RUNNER_TEMP/nim367/DerivedData/tsan-focused-ios" \
+            SWIFT_VERSION=6 \
+            SWIFT_STRICT_CONCURRENCY=complete \
+            -resultBundlePath "$RUNNER_TEMP/nim367/tsan/focused-ios.xcresult" \
+            > "$RUNNER_TEMP/nim367/tsan-focused-ios.log" 2>&1
+          echo "TSAN_FOCUSED_EXIT=$?" >> "$GITHUB_ENV"
+          set -e
+
+      - name: Classify TSan focused result (disabled | allowlisted)
+        run: |
+          set -euo pipefail
+          if [ "${{ vars.TSAN_FALLBACK_MODE }}" != "disabled" ] && [ "${{ vars.TSAN_FALLBACK_MODE }}" != "allowlisted" ]; then
+            echo "::error::tsan_fallback_mode is not set to a valid value by the approval record"
+            exit 1
+          fi
+          if [ "$TSAN_FOCUSED_EXIT" = "0" ]; then
+            echo "TSAN_FOCUSED_VERDICT=PASS_IOS" >> "$GITHUB_ENV"
+          elif [ "${{ vars.TSAN_FALLBACK_MODE }}" = "disabled" ]; then
+            echo "::error::iOS TSan focused failed and tsan_fallback_mode is disabled; no macOS fallback is authorized"
+            echo "TSAN_FOCUSED_VERDICT=FAIL" >> "$GITHUB_ENV"
+            exit 1
+          else
+            echo "TSAN_FOCUSED_VERDICT=NEEDS_CLASSIFICATION" >> "$GITHUB_ENV"
+          fi
+
+      - name: macOS fallback (only if allowlisted and classified UNSUPPORTED_ALLOWED)
+        if: env.TSAN_FOCUSED_VERDICT == 'NEEDS_CLASSIFICATION'
+        run: |
+          set -euo pipefail
+          echo "::warning::macOS TSan fallback requires an owner-approved allowlist entry (allowlist_id, exact diagnostic code/anchored line) from the protected environment; this workflow does not invent one. Verdict remains BLOCKED_UNKNOWN until Phase D supplies it."
+          echo "TSAN_FOCUSED_VERDICT=BLOCKED_UNKNOWN" >> "$GITHUB_ENV"
+
+      - name: Package and hash evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          PKG="$RUNNER_TEMP/nim367-package/payload"
+          mkdir -p "$PKG"
+          cp "$RUNNER_TEMP"/nim367/*.log "$PKG"/ 2>/dev/null || true
+          find "$RUNNER_TEMP/nim367" -name '*.xcresult' -exec cp -R {} "$PKG"/ \; 2>/dev/null || true
+          echo "{\"verdict\":\"${TSAN_FOCUSED_VERDICT:-UNKNOWN}\"}" > "$PKG/tsan-focused-classification.json"
+          (cd "$RUNNER_TEMP/nim367-package" && find payload -type f | sort | xargs -I{} shasum -a 256 {} > SHA256SUMS)
+          (cd "$RUNNER_TEMP/nim367-package" && shasum -a 256 SHA256SUMS > SHA256SUMS.sha256)
+
+      - name: Upload gate 4a evidence
+        if: always()
+        uses: actions/upload-artifact@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: owner-selected
+        with:
+          name: nim367-tsan-focused-${{ inputs.repair_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nim367-package
+          overwrite: false
+          retention-days: 90
+
+  nim367-tsan-production:
+    name: 'NIM-367 Gate 4b: TSan production'
+    if: github.event_name == 'workflow_dispatch'
+    needs: nim367-identity-compile-focused
+    runs-on: macos-15
+    environment: nim367-apple-gate-approval
+    steps:
+      - name: Checkout gate (sealed, workflow_sha)
+        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: gate
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout SUT (sealed, exact repair SHA)
+        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        with:
+          ref: ${{ inputs.repair_sha }}
+          path: sut
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Setup Xcode (approved build)
+        uses: maxim-lobanov/setup-xcode@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v1
+        with:
+          xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
+
+      - name: Prepare iOS simulator
+        run: |
+          set -euo pipefail
+          SIMULATOR_UDID=$(xcrun simctl list -j devices available | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data['devices'].items():
+              for device in devices:
+                  if device.get('isAvailable') and 'iPhone' in device.get('name', ''):
+                      print(device['udid'])
+                      sys.exit(0)
+          sys.exit(1)
+          ")
+          xcrun simctl boot "$SIMULATOR_UDID" || true
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+          echo "IOS_SIMULATOR_DESTINATION=platform=iOS Simulator,id=$SIMULATOR_UDID" >> "$GITHUB_ENV"
+
+      - name: Gate 4b -- iOS TSan production (fixed 10 iterations)
+        env:
+          NIM367_STRESS_ITERATIONS: '10'
+          NIM367_STRESS_SEED: ${{ inputs.production_stress_seed }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nim367"
+          cd gate/packages/ios/NimbalystAppleGate
+          set +e
+          xcodebuild test \
+            -scheme "${{ vars.APPROVED_GATE_SCHEME }}" \
+            -destination "$IOS_SIMULATOR_DESTINATION" \
+            -skipPackagePluginValidation \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -only-testing:NIM367AppleGateTests/NIM367URLSessionStressTests \
+            -enableThreadSanitizer YES \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 300 \
+            -maximum-test-execution-time-allowance 360 \
+            -derivedDataPath "$RUNNER_TEMP/nim367/DerivedData/tsan-production-ios" \
+            SWIFT_VERSION=6 \
+            SWIFT_STRICT_CONCURRENCY=complete \
+            -resultBundlePath "$RUNNER_TEMP/nim367/tsan/production-ios.xcresult" \
+            > "$RUNNER_TEMP/nim367/tsan-production-ios.log" 2>&1
+          echo "TSAN_PRODUCTION_EXIT=$?" >> "$GITHUB_ENV"
+          set -e
+
+      - name: Classify TSan production result (disabled | allowlisted)
+        run: |
+          set -euo pipefail
+          if [ "$TSAN_PRODUCTION_EXIT" = "0" ]; then
+            echo "TSAN_PRODUCTION_VERDICT=PASS_IOS" >> "$GITHUB_ENV"
+          elif [ "${{ vars.TSAN_FALLBACK_MODE }}" = "disabled" ]; then
+            echo "::error::iOS TSan production failed and tsan_fallback_mode is disabled; no macOS fallback is authorized"
+            echo "TSAN_PRODUCTION_VERDICT=FAIL" >> "$GITHUB_ENV"
+            exit 1
+          else
+            echo "::warning::macOS TSan fallback requires an owner-approved allowlist entry from the protected environment; this workflow does not invent one."
+            echo "TSAN_PRODUCTION_VERDICT=BLOCKED_UNKNOWN" >> "$GITHUB_ENV"
+          fi
+
+      - name: Package and hash evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          PKG="$RUNNER_TEMP/nim367-package/payload"
+          mkdir -p "$PKG"
+          cp "$RUNNER_TEMP"/nim367/*.log "$PKG"/ 2>/dev/null || true
+          find "$RUNNER_TEMP/nim367" -name '*.xcresult' -exec cp -R {} "$PKG"/ \; 2>/dev/null || true
+          echo "{\"verdict\":\"${TSAN_PRODUCTION_VERDICT:-UNKNOWN}\"}" > "$PKG/tsan-production-classification.json"
+          (cd "$RUNNER_TEMP/nim367-package" && find payload -type f | sort | xargs -I{} shasum -a 256 {} > SHA256SUMS)
+          (cd "$RUNNER_TEMP/nim367-package" && shasum -a 256 SHA256SUMS > SHA256SUMS.sha256)
+
+      - name: Upload gate 4b evidence
+        if: always()
+        uses: actions/upload-artifact@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: owner-selected
+        with:
+          name: nim367-tsan-production-${{ inputs.repair_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nim367-package
+          overwrite: false
+          retention-days: 90
+
+  nim367-evidence-summary:
+    name: 'NIM-367 Gate 5: final evidence collation (not Apple acceptance)'
+    if: always() && github.event_name == 'workflow_dispatch'
+    needs:
+      - nim367-identity-compile-focused
+      - nim367-deterministic-stress
+      - nim367-production-urlsession-stress
+      - nim367-tsan-focused
+      - nim367-tsan-production
+    runs-on: macos-15
+    environment: nim367-apple-gate-approval
+    permissions:
+      contents: read
+    steps:
+      - name: Download all gate artifacts
+        uses: actions/download-artifact@<OWNER-FILLED-40HEX-COMMIT> # final evidence collation only
+        with:
+          path: ${{ runner.temp }}/nim367-artifacts
+
+      - name: Collate verdicts (GATE_EVIDENCE_PASS only, never APPLE_ACCEPTED)
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+
+          needs = {
+              "identity_compile_focused": "${{ needs.nim367-identity-compile-focused.result }}",
+              "deterministic_stress": "${{ needs.nim367-deterministic-stress.result }}",
+              "production_urlsession_stress": "${{ needs.nim367-production-urlsession-stress.result }}",
+              "tsan_focused": "${{ needs.nim367-tsan-focused.result }}",
+              "tsan_production": "${{ needs.nim367-tsan-production.result }}",
+          }
+
+          all_success = all(v == "success" for v in needs.values())
+          summary = {
+              "schema": "nim367.gate-summary.v1",
+              "repairSha": "${{ inputs.repair_sha }}",
+              "runId": "${{ github.run_id }}",
+              "runAttempt": "${{ github.run_attempt }}",
+              "jobResults": needs,
+              "verdict": "GATE_EVIDENCE_PASS" if all_success else "GATE_EVIDENCE_INCOMPLETE",
+              "note": "This summary is workflow-authored evidence only. It is not APPLE_ACCEPTED and does not constitute Apple runtime acceptance -- that determination is made only by the authorized owner after independent GitHub metadata retrieval and comparison to the external approval record, per the brief's 'Independent runtime provenance' section.",
+          }
+          os.makedirs("${{ runner.temp }}/nim367-summary", exist_ok=True)
+          with open("${{ runner.temp }}/nim367-summary/nim367-gate-summary.json", "w") as f:
+              json.dump(summary, f, indent=2)
+          print(json.dumps(summary, indent=2))
+          PYEOF
+
+      - name: Upload evidence summary
+        uses: actions/upload-artifact@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: owner-selected
+        with:
+          name: nim367-evidence-summary-${{ inputs.repair_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nim367-summary
+          overwrite: false
+          retention-days: 90
