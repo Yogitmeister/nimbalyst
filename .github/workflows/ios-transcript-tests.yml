@@ -304,12 +304,16 @@ jobs:
     environment: nim367-apple-gate-approval
     permissions:
       contents: read
+      actions: read
     outputs:
       xcode_build: ${{ steps.attest.outputs.xcode_build }}
       swift_version_hash: ${{ steps.attest.outputs.swift_version_hash }}
       swiftc_version_hash: ${{ steps.attest.outputs.swiftc_version_hash }}
       runner_os: ${{ steps.attest.outputs.runner_os }}
       attestation_manifest_sha256: ${{ steps.attest.outputs.attestation_manifest_sha256 }}
+      complete_tuple_sha256: ${{ steps.attest.outputs.complete_tuple_sha256 }}
+      shared_state_manifest_sha256: ${{ steps.attest.outputs.shared_state_manifest_sha256 }}
+      attest_job_id: ${{ steps.self-lookup.outputs.attest_job_id }}
     steps:
       - name: Attest-only host/tool/server observation (no checkout)
         id: attest
@@ -321,16 +325,55 @@ jobs:
           UNAME_A=$(uname -a)
           XCODE_SELECT_P=$(xcode-select -p)
           XCODEBUILD_VERSION=$(xcodebuild -version)
+          XCODEBUILD_HELP_HASH=$(xcodebuild -help 2>&1 | shasum -a 256 | cut -d' ' -f1)
           SWIFT_EXEC=$(xcrun --find swift)
           SWIFTC_EXEC=$(xcrun --find swiftc)
           SWIFT_VERSION_OUT=$("$SWIFT_EXEC" --version)
           SWIFTC_VERSION_OUT=$("$SWIFTC_EXEC" --version)
           SWIFT_VERSION_HASH=$(echo "$SWIFT_VERSION_OUT" | shasum -a 256 | cut -d' ' -f1)
           SWIFTC_VERSION_HASH=$(echo "$SWIFTC_VERSION_OUT" | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_PACKAGE_HELP_HASH=$("$SWIFT_EXEC" package --help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_TEST_HELP_HASH=$("$SWIFT_EXEC" test --help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SW_VERS_HASH=$(echo "$SW_VERS" | shasum -a 256 | cut -d' ' -f1)
+
+          # Read-only, credential-safe enumeration of the known SwiftPM/Xcode
+          # shared-state roots this contract cares about. A root that does not
+          # exist is recorded as "absent" rather than skipped, per the
+          # normative brief's "approved state of absent or a canonical
+          # path/type/size/content-hash manifest" rule. Only path/type/size
+          # are recorded -- no file content is read or printed.
+          python3 - > "$RUNNER_TEMP/nim367-attest/shared-state-manifest.json" <<'PYEOF'
+          import hashlib, json, os
+
+          roots = [
+              os.path.expanduser("~/Library/Caches/org.swift.swiftpm"),
+              os.path.expanduser("~/Library/org.swift.swiftpm"),
+              os.path.expanduser("~/.swiftpm"),
+              os.path.expanduser("~/Library/Developer/Xcode/DerivedData"),
+          ]
+          manifest = []
+          for root in sorted(roots):
+              if not os.path.exists(root):
+                  manifest.append({"root": root, "state": "absent"})
+                  continue
+              entries = []
+              for dirpath, dirnames, filenames in os.walk(root):
+                  dirnames.sort()
+                  for name in sorted(filenames):
+                      full = os.path.join(dirpath, name)
+                      try:
+                          size = os.path.getsize(full)
+                      except OSError:
+                          size = -1
+                      entries.append({"path": os.path.relpath(full, root), "size": size})
+              manifest.append({"root": root, "state": "present", "entryCount": len(entries), "entries": entries})
+          print(json.dumps(manifest, sort_keys=True))
+          PYEOF
+          SHARED_STATE_MANIFEST_HASH=$(shasum -a 256 "$RUNNER_TEMP/nim367-attest/shared-state-manifest.json" | cut -d' ' -f1)
 
           cat > "$RUNNER_TEMP/nim367-attest/attestation.json" <<EOF
           {
-            "schema": "nim367.attest-only.v1",
+            "schema": "nim367.attest-only.v2",
             "runId": "${{ github.run_id }}",
             "runAttempt": "${{ github.run_attempt }}",
             "job": "${{ github.job }}",
@@ -345,23 +388,95 @@ jobs:
             "runnerName": "${{ runner.name }}",
             "xcodeSelectP": $(echo "$XCODE_SELECT_P" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
             "xcodebuildVersion": $(echo "$XCODEBUILD_VERSION" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "xcodebuildHelpHash": "$XCODEBUILD_HELP_HASH",
             "swiftExecRealpath": "$SWIFT_EXEC",
             "swiftcExecRealpath": "$SWIFTC_EXEC",
             "swiftVersionHash": "$SWIFT_VERSION_HASH",
-            "swiftcVersionHash": "$SWIFTC_VERSION_HASH"
+            "swiftcVersionHash": "$SWIFTC_VERSION_HASH",
+            "swiftPackageHelpHash": "$SWIFT_PACKAGE_HELP_HASH",
+            "swiftTestHelpHash": "$SWIFT_TEST_HELP_HASH",
+            "swVersHash": "$SW_VERS_HASH",
+            "sharedStateManifestSha256": "$SHARED_STATE_MANIFEST_HASH"
           }
           EOF
 
           MANIFEST_HASH=$(shasum -a 256 "$RUNNER_TEMP/nim367-attest/attestation.json" | cut -d' ' -f1)
           XCODE_BUILD=$(echo "$XCODEBUILD_VERSION" | grep -o 'Build version [A-Za-z0-9]*' | sed 's/Build version //')
 
+          # The "complete observed tuple" the H1/J contract requires is this
+          # attestation record's own hash: it already contains every field
+          # (image/macOS/Xcode/Swift/SwiftC/help/shared-state) the contract
+          # names, so hashing it once yields a single byte-for-byte-comparable
+          # value rather than requiring N separate field comparisons.
+          COMPLETE_TUPLE_HASH="$MANIFEST_HASH"
+
           echo "xcode_build=$XCODE_BUILD" >> "$GITHUB_OUTPUT"
           echo "swift_version_hash=$SWIFT_VERSION_HASH" >> "$GITHUB_OUTPUT"
           echo "swiftc_version_hash=$SWIFTC_VERSION_HASH" >> "$GITHUB_OUTPUT"
           echo "runner_os=${{ runner.os }}" >> "$GITHUB_OUTPUT"
           echo "attestation_manifest_sha256=$MANIFEST_HASH" >> "$GITHUB_OUTPUT"
+          echo "complete_tuple_sha256=$COMPLETE_TUPLE_HASH" >> "$GITHUB_OUTPUT"
+          echo "shared_state_manifest_sha256=$SHARED_STATE_MANIFEST_HASH" >> "$GITHUB_OUTPUT"
 
           echo "::notice::This job performed no candidate or SUT checkout. Observed only pre-installed host/tool state. Full H0/H1 signed-record verification remains external owner authority (see v12_nim367_hosted_macos_credit_contract_revision_20260722.md)."
+
+      - name: Independently look up this job's own server-assigned ID (paginated, exactly-one-match)
+        id: self-lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nim367-attest"
+          JOBS_ALL="$RUNNER_TEMP/nim367-attest/jobs-all.json"
+          echo "[]" > "$JOBS_ALL"
+          NEXT_URL="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100"
+          PAGE=1
+          while [ -n "$NEXT_URL" ]; do
+            HEADERS_FILE="$RUNNER_TEMP/nim367-attest/jobs-headers-$PAGE.txt"
+            BODY_FILE="$RUNNER_TEMP/nim367-attest/jobs-body-$PAGE.json"
+            curl -sf -D "$HEADERS_FILE" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$NEXT_URL" -o "$BODY_FILE"
+            python3 - "$JOBS_ALL" "$BODY_FILE" <<'PYEOF'
+          import json, sys
+          all_path, body_path = sys.argv[1], sys.argv[2]
+          with open(all_path) as f:
+              all_jobs = json.load(f)
+          with open(body_path) as f:
+              body = json.load(f)
+          all_jobs.extend(body.get("jobs", []))
+          with open(all_path, "w") as f:
+              json.dump(all_jobs, f)
+          PYEOF
+            NEXT_URL=$(grep -i '^link:' "$HEADERS_FILE" | grep -o '<[^>]*>; rel="next"' | sed -E 's/<(.*)>.*/\1/' || true)
+            PAGE=$((PAGE + 1))
+            if [ "$PAGE" -gt 20 ]; then
+              echo "::error::attest-only: pagination exceeded 20 pages, aborting to avoid unbounded loop"
+              exit 1
+            fi
+          done
+
+          MATCH_RESULT=$(python3 - "$JOBS_ALL" <<'PYEOF'
+          import json, os, sys
+          with open(sys.argv[1]) as f:
+              jobs = json.load(f)
+          runner_name = os.environ.get("RUNNER_NAME", "")
+          matches = [j for j in jobs if j.get("runner_name") == runner_name]
+          if len(matches) == 0:
+              print("NO_MATCH")
+          elif len(matches) > 1:
+              print("AMBIGUOUS_MATCH")
+          else:
+              print(json.dumps({"id": matches[0].get("id"), "status": matches[0].get("status")}))
+          PYEOF
+          )
+
+          if [ "$MATCH_RESULT" = "NO_MATCH" ] || [ "$MATCH_RESULT" = "AMBIGUOUS_MATCH" ]; then
+            echo "::error::attest-only: self job-ID lookup failed ($MATCH_RESULT) after complete pagination -- provider_not_exposed or ambiguous, failing closed rather than guessing"
+            exit 1
+          fi
+
+          ATTEST_JOB_ID=$(echo "$MATCH_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          echo "attest_job_id=$ATTEST_JOB_ID" >> "$GITHUB_OUTPUT"
+          echo "attest-only self job-ID lookup: OK ($ATTEST_JOB_ID)"
 
       - name: Upload attest-only evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # reviewed release: v4
@@ -373,22 +488,28 @@ jobs:
 
   # `nim367-h1-verify` is the fail-closed H1 barrier the credit contract
   # requires (v12_nim367_hosted_macos_credit_contract_revision_20260722.md,
-  # "H1 -- post-dispatch credit-execution lease"). Its `environment:` gate
-  # gives the GitHub-native human-approval pause, but that alone was flagged
-  # as insufficient by v12_nim367_candidate_adversarial_review_20260723.md
-  # (finding 1): this job additionally performs a real cryptographic
-  # signature verification of an owner-published H1 record, checks the
-  # record's bound fields (H0 hash, run ID/attempt, head SHA, workflow ref,
-  # attest-only manifest hash, expiry) against this run's actual values, and
-  # independently queries GitHub's own Actions REST API for the server-side
-  # run record rather than trusting only self-reported `github.*` context.
-  # No candidate or SUT is checked out here. If the owner has not yet
-  # published a signed H1 record (H1_RECORD_JSON/H1_SIGNATURE_BASE64/
-  # H1_PUBLIC_KEY_PEM/H0_RECORD_SHA256 vars), this job fails closed with an
-  # explicit error rather than approximating a pass -- that is the expected,
-  # correct behavior until a real owner-signed H1 exists.
+  # "H1 -- post-dispatch credit-execution lease"), rebuilt to the CLOSED
+  # SCHEMA required by v12_nim367_h1_j_closed_schema_repair_brief_20260723.md:
+  # every downstream approved-* value used by later jobs is sourced from the
+  # verified `nim367.h1.v2` record's own fields (below), never from a
+  # separately mutable `vars.APPROVED_*` variable living alongside it. Only
+  # the H1 record/signature/public-key CARRIER vars remain `vars.*`, since
+  # they are exactly what the signature check verifies; everything the
+  # signature protects is read out of the verified JSON payload, not a
+  # sibling variable an editor could change without forging a signature.
+  #
+  # Honest limit this cannot close: the public key itself
+  # (H1_PUBLIC_KEY_PEM) is still a GitHub Environment variable. Anyone with
+  # write access to that protected environment could substitute both a new
+  # key and a self-signed record. This verification proves internal
+  # consistency (the record matches its signature, and every bound field
+  # matches this exact run) -- it is defense-in-depth on top of, not a
+  # replacement for, who can write to the protected environment. That
+  # boundary cannot be closed by workflow code; only by how tightly the
+  # environment's write access and required reviewers are configured, which
+  # is outside this repository.
   nim367-h1-verify:
-    name: 'NIM-367 Gate 0.5: H1 post-attestation lease verification'
+    name: 'NIM-367 Gate 0.5: H1 post-attestation lease verification (closed schema)'
     if: github.event_name == 'workflow_dispatch'
     needs: nim367-attest-only
     runs-on: macos-15
@@ -400,6 +521,16 @@ jobs:
       h1_verified: ${{ steps.finalize.outputs.h1_verified }}
       h1_record_sha256: ${{ steps.fetch-verify-sig.outputs.h1_record_sha256 }}
       approved_xcode_build: ${{ steps.finalize.outputs.approved_xcode_build }}
+      approved_runner_image_os: ${{ steps.finalize.outputs.approved_runner_image_os }}
+      approved_complete_tuple_sha256: ${{ steps.finalize.outputs.approved_complete_tuple_sha256 }}
+      approved_shared_state_manifest_sha256: ${{ steps.finalize.outputs.approved_shared_state_manifest_sha256 }}
+      approved_gate_ref: ${{ steps.finalize.outputs.approved_gate_ref }}
+      approved_workflow_ref: ${{ steps.finalize.outputs.approved_workflow_ref }}
+      approved_gate_commit: ${{ steps.finalize.outputs.approved_gate_commit }}
+      approved_gate_tree: ${{ steps.finalize.outputs.approved_gate_tree }}
+      approved_gate_scheme: ${{ steps.finalize.outputs.approved_gate_scheme }}
+      approved_command_plan_hash: ${{ steps.finalize.outputs.approved_command_plan_hash }}
+      approved_locked_blobs_json: ${{ steps.finalize.outputs.approved_locked_blobs_json }}
     steps:
       - name: Fetch H1 record and verify signature (fail closed if absent)
         id: fetch-verify-sig
@@ -428,11 +559,21 @@ jobs:
             exit 1
           fi
 
+          # Bind the record to describe the SAME key that signed it (blocks a
+          # key-substitution confusion where the record and the verifying key
+          # were swapped independently without re-signing consistently).
+          PUBKEY_FINGERPRINT=$(shasum -a 256 "$RUNNER_TEMP/nim367-h1/h1-pubkey.pem" | cut -d' ' -f1)
+          RECORD_FINGERPRINT=$(python3 -c "import json; print(json.load(open('$RUNNER_TEMP/nim367-h1/h1-record.json')).get('trustAnchorFingerprint',''))")
+          if [ "$PUBKEY_FINGERPRINT" != "$RECORD_FINGERPRINT" ]; then
+            echo "::error::H1 record's trustAnchorFingerprint does not equal sha256(H1_PUBLIC_KEY_PEM) -- record does not describe the key that signed it"
+            exit 1
+          fi
+
           H1_RECORD_SHA256=$(shasum -a 256 "$RUNNER_TEMP/nim367-h1/h1-record.json" | cut -d' ' -f1)
           echo "h1_record_sha256=$H1_RECORD_SHA256" >> "$GITHUB_OUTPUT"
-          echo "H1 signature verification: OK ($H1_RECORD_SHA256)"
+          echo "H1 signature + trust-anchor verification: OK ($H1_RECORD_SHA256)"
 
-      - name: Verify H1 record fields bind to this exact run (not H0 alone, not self-report alone)
+      - name: Verify every required closed-schema H1 field is present and bound to this exact run
         env:
           EXPECTED_H0_SHA256: ${{ vars.H0_RECORD_SHA256 }}
           EXPECTED_RUN_ID: ${{ github.run_id }}
@@ -440,10 +581,21 @@ jobs:
           EXPECTED_HEAD_SHA: ${{ github.sha }}
           EXPECTED_WORKFLOW_REF: ${{ github.workflow_ref }}
           EXPECTED_ATTEST_MANIFEST_SHA256: ${{ needs.nim367-attest-only.outputs.attestation_manifest_sha256 }}
+          EXPECTED_ATTEST_JOB_ID: ${{ needs.nim367-attest-only.outputs.attest_job_id }}
+          EXPECTED_COMPLETE_TUPLE_SHA256: ${{ needs.nim367-attest-only.outputs.complete_tuple_sha256 }}
+          EXPECTED_SHARED_STATE_MANIFEST_SHA256: ${{ needs.nim367-attest-only.outputs.shared_state_manifest_sha256 }}
         run: |
           set -euo pipefail
+          # H0_RECORD_SHA256 is intentionally still a standalone var, not a
+          # closed-schema field read out of H1 itself: H0 is a separate,
+          # PRIOR immutable record that exists (and is hashed/published)
+          # before H1 is ever signed. H1's own `h0RecordSha256` field must
+          # match this independently published anchor -- if both lived only
+          # inside the same H1 blob, H1 could claim to bind any H0 hash it
+          # likes without that hash corresponding to a real, separately
+          # published H0 record.
           if [ -z "$EXPECTED_H0_SHA256" ]; then
-            echo "::error::H0_RECORD_SHA256 is not published in the protected environment; H1 cannot bind an H0 that does not exist"
+            echo "::error::H0_RECORD_SHA256 is not published in the protected environment; H1 cannot bind an H0 that does not independently exist -- BLOCKED_ATTESTATION"
             exit 1
           fi
           python3 - "$RUNNER_TEMP/nim367-h1/h1-record.json" <<'PYEOF'
@@ -452,36 +604,92 @@ jobs:
           with open(sys.argv[1]) as f:
               record = json.load(f)
 
+          if record.get("schema") != "nim367.h1.v2":
+              print("::error::H1 record schema is not nim367.h1.v2 -- closed schema required")
+              sys.exit(1)
+
+          # Every field the closed schema requires. No defaults: absence of
+          # any one of these is BLOCKED_ATTESTATION, not a warning, per
+          # v12_nim367_h1_j_closed_schema_repair_brief_20260723.md.
+          required_fields = [
+              "trustAnchorFingerprint", "h0RecordSha256", "serverAcknowledgmentHash",
+              "serverQueryHash", "runId", "runAttempt", "attestJobId", "attestationHash",
+              "workflowRef", "headSha", "candidateCommit", "candidateTree", "lockedBlobs",
+              "sutCommit", "sutParent", "sutTree", "commandPlanHash", "actor", "reviewer",
+              "notBeforeUtc", "expiresUtc", "maxLeaseMinutes", "resultDestination",
+              "approvedXcodeBuild", "approvedRunnerImageOS", "approvedCompleteTupleSha256",
+              "approvedSharedStateManifestSha256", "approvedGateRef", "approvedGateCommit",
+              "approvedGateTree", "approvedGateScheme",
+          ]
+          missing = [field for field in required_fields if not record.get(field)]
+          if missing:
+              print(f"::error::H1 record is missing required closed-schema fields: {', '.join(missing)} -- BLOCKED_ATTESTATION")
+              sys.exit(1)
+
+          locked_blobs = record.get("lockedBlobs")
+          expected_paths = {
+              ".github/workflows/ios-transcript-tests.yml",
+              "packages/ios/NimbalystAppleGate/Package.swift",
+              "packages/ios/NimbalystAppleGate/Package.resolved",
+              "packages/ios/NimbalystAppleGate/Tests/NIM367URLSessionStressTests.swift",
+          }
+          if not isinstance(locked_blobs, dict) or set(locked_blobs.keys()) != expected_paths or not all(locked_blobs.values()):
+              print("::error::H1 record's lockedBlobs does not exactly cover the four locked paths with non-empty blob values -- BLOCKED_ATTESTATION")
+              sys.exit(1)
+
           errors = []
           if record.get("h0RecordSha256") != os.environ["EXPECTED_H0_SHA256"]:
-              errors.append("h0RecordSha256 mismatch")
+              errors.append("h0RecordSha256 does not equal the independently published H0_RECORD_SHA256 anchor")
           if str(record.get("runId")) != os.environ["EXPECTED_RUN_ID"]:
               errors.append("runId mismatch")
           if str(record.get("runAttempt")) != os.environ["EXPECTED_RUN_ATTEMPT"]:
               errors.append("runAttempt mismatch")
           if record.get("headSha") != os.environ["EXPECTED_HEAD_SHA"]:
               errors.append("headSha mismatch")
+          if record.get("candidateCommit") != os.environ["EXPECTED_HEAD_SHA"]:
+              errors.append("candidateCommit does not equal this run's head SHA")
           if record.get("workflowRef") != os.environ["EXPECTED_WORKFLOW_REF"]:
               errors.append("workflowRef mismatch")
-          if record.get("attestOnlyManifestSha256") != os.environ["EXPECTED_ATTEST_MANIFEST_SHA256"]:
-              errors.append("attestOnlyManifestSha256 mismatch -- H1 does not bind this run's actual attest-only artifact")
+          if record.get("attestationHash") != os.environ["EXPECTED_ATTEST_MANIFEST_SHA256"]:
+              errors.append("attestationHash mismatch -- H1 does not bind this run's actual attest-only artifact")
+          if str(record.get("attestJobId")) != str(os.environ["EXPECTED_ATTEST_JOB_ID"]):
+              errors.append("attestJobId mismatch -- H1 does not bind this run's actual attest-only server job")
+          if record.get("approvedCompleteTupleSha256") != os.environ["EXPECTED_COMPLETE_TUPLE_SHA256"]:
+              errors.append("approvedCompleteTupleSha256 does not equal the toolchain/image tuple actually observed by attest-only this run")
+          if record.get("approvedSharedStateManifestSha256") != os.environ["EXPECTED_SHARED_STATE_MANIFEST_SHA256"]:
+              errors.append("approvedSharedStateManifestSha256 does not equal the shared-state manifest actually observed by attest-only this run")
+          if record.get("sutCommit") != "cd87e6047b30da9e166d9b2350726ad1d8554009":
+              errors.append("sutCommit does not equal the locked repair identity")
+          if record.get("sutParent") != "7ec725a456c230751c70a3d7269fc89fd6ce55ca":
+              errors.append("sutParent does not equal the locked repair identity")
+          if record.get("sutTree") != "f9767e7febafee27347b55ab9a6eee6595d4dbe4":
+              errors.append("sutTree does not equal the locked repair identity")
 
+          not_before = record.get("notBeforeUtc")
           expires = record.get("expiresUtc")
-          if not expires:
-              errors.append("missing expiresUtc")
-          else:
+          try:
+              not_before_dt = datetime.datetime.fromisoformat(not_before.replace("Z", "+00:00"))
               expires_dt = datetime.datetime.fromisoformat(expires.replace("Z", "+00:00"))
-              if datetime.datetime.now(datetime.timezone.utc) >= expires_dt:
+          except (ValueError, AttributeError):
+              errors.append("notBeforeUtc/expiresUtc are not valid ISO-8601 timestamps")
+          else:
+              now = datetime.datetime.now(datetime.timezone.utc)
+              if now < not_before_dt:
+                  errors.append(f"H1 record not yet valid (notBeforeUtc={not_before})")
+              if now >= expires_dt:
                   errors.append(f"H1 record expired at {expires}")
+              max_lease = record.get("maxLeaseMinutes")
+              if not isinstance(max_lease, (int, float)) or (expires_dt - not_before_dt).total_seconds() > max_lease * 60:
+                  errors.append("expiresUtc - notBeforeUtc exceeds maxLeaseMinutes")
 
           if errors:
               print("::error::H1 record field verification failed: " + "; ".join(errors))
               sys.exit(1)
 
-          print("H1 field verification: OK")
+          print("H1 closed-schema field verification: OK")
           PYEOF
 
-      - name: Independently query GitHub API for this run's server record
+      - name: Independently query GitHub API for this run's server record (actor cross-check included)
         env:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_HEAD_SHA: ${{ github.sha }}
@@ -491,11 +699,13 @@ jobs:
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
           echo "$RESPONSE" > "$RUNNER_TEMP/nim367-h1/server-run-record.json"
 
-          python3 - "$RUNNER_TEMP/nim367-h1/server-run-record.json" <<'PYEOF'
+          python3 - "$RUNNER_TEMP/nim367-h1/server-run-record.json" "$RUNNER_TEMP/nim367-h1/h1-record.json" <<'PYEOF'
           import json, os, sys
 
           with open(sys.argv[1]) as f:
               server = json.load(f)
+          with open(sys.argv[2]) as f:
+              h1 = json.load(f)
 
           errors = []
           if str(server.get("id")) != os.environ["GITHUB_RUN_ID"]:
@@ -506,19 +716,40 @@ jobs:
               errors.append("server head_sha mismatch")
           if server.get("event") != "workflow_dispatch":
               errors.append(f"server event is {server.get('event')!r}, expected workflow_dispatch")
+          server_actor = (server.get("actor") or {}).get("login")
+          if server_actor != h1.get("actor"):
+              errors.append(f"server-recorded actor ({server_actor!r}) does not equal H1 record actor ({h1.get('actor')!r})")
 
           if errors:
-              print("::error::independent server-record query disagrees with context: " + "; ".join(errors))
+              print("::error::independent server-record query disagrees with context/H1: " + "; ".join(errors))
               sys.exit(1)
 
-          print("Independent server-record query: OK (server run id/attempt/head/event confirmed, not self-report alone)")
+          print("Independent server-record query: OK (server run id/attempt/head/event/actor confirmed, not self-report alone)")
           PYEOF
 
-      - name: H1 barrier verified
+      - name: H1 barrier verified -- publish closed-schema downstream values
         id: finalize
         run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/nim367-h1/h1-record.json" >> "$GITHUB_OUTPUT" <<'PYEOF'
+          import json, sys
+
+          with open(sys.argv[1]) as f:
+              record = json.load(f)
+
+          print(f"approved_xcode_build={record['approvedXcodeBuild']}")
+          print(f"approved_runner_image_os={record['approvedRunnerImageOS']}")
+          print(f"approved_complete_tuple_sha256={record['approvedCompleteTupleSha256']}")
+          print(f"approved_shared_state_manifest_sha256={record['approvedSharedStateManifestSha256']}")
+          print(f"approved_gate_ref={record['approvedGateRef']}")
+          print(f"approved_workflow_ref={record['workflowRef']}")
+          print(f"approved_gate_commit={record['approvedGateCommit']}")
+          print(f"approved_gate_tree={record['approvedGateTree']}")
+          print(f"approved_gate_scheme={record['approvedGateScheme']}")
+          print(f"approved_command_plan_hash={record['commandPlanHash']}")
+          print(f"approved_locked_blobs_json={json.dumps(record['lockedBlobs'])}")
+          PYEOF
           echo "h1_verified=true" >> "$GITHUB_OUTPUT"
-          echo "approved_xcode_build=${{ vars.APPROVED_XCODE_BUILD }}" >> "$GITHUB_OUTPUT"
 
       - name: Upload H1 verification evidence
         if: always()
@@ -540,7 +771,7 @@ jobs:
     env:
       NIM367_REPAIR_SHA: ${{ inputs.repair_sha }}
     steps:
-      - name: Verify exact-SHA and identity-lock inputs
+      - name: Verify exact-SHA and identity-lock inputs (closed-schema H1 outputs, not sibling vars)
         run: |
           set -euo pipefail
           if [ "${{ inputs.repair_sha }}" != "cd87e6047b30da9e166d9b2350726ad1d8554009" ]; then
@@ -555,98 +786,219 @@ jobs:
             echo "::error::production_stress_seed out of canonical unsigned 32-bit range"
             exit 1
           fi
-          if [ -z "${{ vars.APPROVED_GATE_REF }}" ] || [ -z "${{ vars.APPROVED_GATE_COMMIT }}" ]; then
-            echo "::error::protected environment nim367-apple-gate-approval is missing OWNER-FILLED IMMUTABLE values; Phase D has not populated this record"
+          if [ -z "${{ needs.nim367-h1-verify.outputs.approved_gate_ref }}" ] || [ -z "${{ needs.nim367-h1-verify.outputs.approved_gate_commit }}" ]; then
+            echo "::error::H1-verified approved_gate_ref/approved_gate_commit are empty -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          if [ "${{ github.ref }}" != "${{ vars.APPROVED_GATE_REF }}" ]; then
-            echo "::error::github.ref does not equal APPROVED_GATE_REF"
+          if [ "${{ github.ref }}" != "${{ needs.nim367-h1-verify.outputs.approved_gate_ref }}" ]; then
+            echo "::error::github.ref does not equal the H1-verified approved gate ref -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          if [ "${{ github.workflow_ref }}" != "${{ vars.APPROVED_WORKFLOW_REF }}" ]; then
-            echo "::error::github.workflow_ref does not equal APPROVED_WORKFLOW_REF"
+          if [ "${{ github.workflow_ref }}" != "${{ needs.nim367-h1-verify.outputs.approved_workflow_ref }}" ]; then
+            echo "::error::github.workflow_ref does not equal the H1-verified approved workflow ref -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          if [ "${{ github.workflow_sha }}" != "${{ vars.APPROVED_GATE_COMMIT }}" ] || [ "${{ github.sha }}" != "${{ vars.APPROVED_GATE_COMMIT }}" ]; then
-            echo "::error::github.workflow_sha/github.sha does not equal APPROVED_GATE_COMMIT"
+          if [ "${{ github.workflow_sha }}" != "${{ needs.nim367-h1-verify.outputs.approved_gate_commit }}" ] || [ "${{ github.sha }}" != "${{ needs.nim367-h1-verify.outputs.approved_gate_commit }}" ]; then
+            echo "::error::github.workflow_sha/github.sha does not equal the H1-verified approved gate commit -- BLOCKED_ATTESTATION"
             exit 1
           fi
 
-      - name: Setup Xcode (approved build)
+      - name: Setup Xcode (H1-approved build)
         uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # reviewed release: v1 (v1.7.0)
         with:
-          xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
+          xcode-version: ${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}
 
-      - name: Verify J per-job attestation barrier (selected toolchain, server job record, clean stage root)
+      - name: Verify + persist J attestation record (selected toolchain byte-for-byte vs H1, paginated server job lookup, clean stage root)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
           if [ -d gate ] || [ -d sut ]; then
-            echo "::error::J barrier: candidate/SUT directories already exist before this job's first checkout -- stage root is not clean"
+            echo "::error::J barrier: candidate/SUT directories already exist before this job's first checkout -- stage root is not clean -- BLOCKED_ATTESTATION"
             exit 1
           fi
 
-          OBSERVED_SWIFT_HASH=$(xcrun swift --version | shasum -a 256 | cut -d' ' -f1)
-          OBSERVED_SWIFTC_HASH=$(xcrun swiftc --version | shasum -a 256 | cut -d' ' -f1)
-          XCODE_BUILD=$(xcodebuild -version | grep -o 'Build version [A-Za-z0-9]*' | sed 's/Build version //')
+          if [ -z "${{ needs.nim367-h1-verify.outputs.approved_runner_image_os }}" ] || \
+             [ -z "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}" ] || \
+             [ -z "${{ needs.nim367-h1-verify.outputs.approved_shared_state_manifest_sha256 }}" ]; then
+            echo "::error::J barrier: H1-verified approved_runner_image_os/approved_complete_tuple_sha256/approved_shared_state_manifest_sha256 are empty -- BLOCKED_ATTESTATION, never a warning/pass approximation"
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/nim367-j"
+
+          # Re-derive the identical "complete observed tuple" attest-only
+          # computed, on THIS job's own runner, so a byte-for-byte string
+          # comparison against H1's approved value is meaningful.
+          XCODEBUILD_VERSION=$(xcodebuild -version)
+          XCODEBUILD_HELP_HASH=$(xcodebuild -help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_EXEC=$(xcrun --find swift)
+          SWIFTC_EXEC=$(xcrun --find swiftc)
+          SWIFT_VERSION_HASH=$("$SWIFT_EXEC" --version | shasum -a 256 | cut -d' ' -f1)
+          SWIFTC_VERSION_HASH=$("$SWIFTC_EXEC" --version | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_PACKAGE_HELP_HASH=$("$SWIFT_EXEC" package --help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_TEST_HELP_HASH=$("$SWIFT_EXEC" test --help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SW_VERS_HASH=$(sw_vers | shasum -a 256 | cut -d' ' -f1)
+          XCODE_BUILD=$(echo "$XCODEBUILD_VERSION" | grep -o 'Build version [A-Za-z0-9]*' | sed 's/Build version //')
+
+          python3 - > "$RUNNER_TEMP/nim367-j/shared-state-manifest.json" <<'PYEOF'
+          import json, os
+          roots = [
+              os.path.expanduser("~/Library/Caches/org.swift.swiftpm"),
+              os.path.expanduser("~/Library/org.swift.swiftpm"),
+              os.path.expanduser("~/.swiftpm"),
+              os.path.expanduser("~/Library/Developer/Xcode/DerivedData"),
+          ]
+          manifest = []
+          for root in sorted(roots):
+              if not os.path.exists(root):
+                  manifest.append({"root": root, "state": "absent"})
+                  continue
+              entries = []
+              for dirpath, dirnames, filenames in os.walk(root):
+                  dirnames.sort()
+                  for name in sorted(filenames):
+                      full = os.path.join(dirpath, name)
+                      try:
+                          size = os.path.getsize(full)
+                      except OSError:
+                          size = -1
+                      entries.append({"path": os.path.relpath(full, root), "size": size})
+              manifest.append({"root": root, "state": "present", "entryCount": len(entries), "entries": entries})
+          print(json.dumps(manifest, sort_keys=True))
+          PYEOF
+          SHARED_STATE_MANIFEST_HASH=$(shasum -a 256 "$RUNNER_TEMP/nim367-j/shared-state-manifest.json" | cut -d' ' -f1)
+
+          cat > "$RUNNER_TEMP/nim367-j/attestation-recompute.json" <<EOF
+          {
+            "schema": "nim367.attest-only.v2",
+            "runId": "${{ github.run_id }}",
+            "runAttempt": "${{ github.run_attempt }}",
+            "job": "${{ github.job }}",
+            "repository": "${{ github.repository }}",
+            "workflowRef": "${{ github.workflow_ref }}",
+            "workflowSha": "${{ github.workflow_sha }}",
+            "headRef": "${{ github.ref }}",
+            "headSha": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "runnerOs": "${{ runner.os }}",
+            "runnerArch": "${{ runner.arch }}",
+            "runnerName": "${{ runner.name }}",
+            "xcodeSelectP": $(xcode-select -p | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "xcodebuildVersion": $(echo "$XCODEBUILD_VERSION" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "xcodebuildHelpHash": "$XCODEBUILD_HELP_HASH",
+            "swiftExecRealpath": "$SWIFT_EXEC",
+            "swiftcExecRealpath": "$SWIFTC_EXEC",
+            "swiftVersionHash": "$SWIFT_VERSION_HASH",
+            "swiftcVersionHash": "$SWIFTC_VERSION_HASH",
+            "swiftPackageHelpHash": "$SWIFT_PACKAGE_HELP_HASH",
+            "swiftTestHelpHash": "$SWIFT_TEST_HELP_HASH",
+            "swVersHash": "$SW_VERS_HASH",
+            "sharedStateManifestSha256": "$SHARED_STATE_MANIFEST_HASH"
+          }
+          EOF
+          OBSERVED_COMPLETE_TUPLE_SHA256=$(shasum -a 256 "$RUNNER_TEMP/nim367-j/attestation-recompute.json" | cut -d' ' -f1)
 
           if [ "$XCODE_BUILD" != "${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}" ]; then
-            echo "::error::J barrier: this job's selected Xcode build ($XCODE_BUILD) does not equal the H1-approved Xcode build"
+            echo "::error::J barrier: this job's selected Xcode build ($XCODE_BUILD) does not equal the H1-approved Xcode build -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          if [ "${{ runner.os }}" != "${{ needs.nim367-attest-only.outputs.runner_os }}" ]; then
-            echo "::error::J barrier: runner.os does not match the attest-only barrier's observation"
+          if [ "${ImageOS:-unset}" != "${{ needs.nim367-h1-verify.outputs.approved_runner_image_os }}" ]; then
+            echo "::error::J barrier: runner image OS (\$ImageOS=${ImageOS:-unset}) does not equal the H1-approved runner image OS -- BLOCKED_ATTESTATION, never a warning"
+            exit 1
+          fi
+          if [ "$SHARED_STATE_MANIFEST_HASH" != "${{ needs.nim367-h1-verify.outputs.approved_shared_state_manifest_sha256 }}" ]; then
+            echo "::error::J barrier: this job's shared-state manifest does not equal the H1-approved manifest byte-for-byte -- BLOCKED_ATTESTATION"
             exit 1
           fi
 
-          # Independently query this job's own server-recorded identity (job
-          # ID, runner name/group/labels) rather than trusting only
-          # self-reported `runner.*` context, per the contract's
-          # "not self-report alone" rule.
-          mkdir -p "$RUNNER_TEMP/nim367-j"
-          curl -sf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
-            > "$RUNNER_TEMP/nim367-j/jobs-response.json"
+          # Independently query this job's own server-recorded identity via a
+          # FULLY PAGINATED Jobs API walk (follows Link: rel="next" until
+          # GitHub reports no further page), requiring EXACTLY ONE
+          # unambiguous match by runner_name -- zero or multiple matches both
+          # fail closed rather than guessing.
+          JOBS_ALL="$RUNNER_TEMP/nim367-j/jobs-all.json"
+          echo "[]" > "$JOBS_ALL"
+          NEXT_URL="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100"
+          PAGE=1
+          while [ -n "$NEXT_URL" ]; do
+            HEADERS_FILE="$RUNNER_TEMP/nim367-j/jobs-headers-$PAGE.txt"
+            BODY_FILE="$RUNNER_TEMP/nim367-j/jobs-body-$PAGE.json"
+            curl -sf -D "$HEADERS_FILE" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$NEXT_URL" -o "$BODY_FILE"
+            python3 - "$JOBS_ALL" "$BODY_FILE" <<'PYEOF'
+          import json, sys
+          all_path, body_path = sys.argv[1], sys.argv[2]
+          with open(all_path) as f:
+              all_jobs = json.load(f)
+          with open(body_path) as f:
+              body = json.load(f)
+          all_jobs.extend(body.get("jobs", []))
+          with open(all_path, "w") as f:
+              json.dump(all_jobs, f)
+          PYEOF
+            NEXT_URL=$(grep -i '^link:' "$HEADERS_FILE" | grep -o '<[^>]*>; rel="next"' | sed -E 's/<(.*)>.*/\1/' || true)
+            PAGE=$((PAGE + 1))
+            if [ "$PAGE" -gt 20 ]; then
+              echo "::error::J barrier: pagination exceeded 20 pages, aborting to avoid unbounded loop"
+              exit 1
+            fi
+          done
 
-          MATCHED_JOB=$(python3 - "$RUNNER_TEMP/nim367-j/jobs-response.json" <<'PYEOF'
+          MATCH_RESULT=$(python3 - "$JOBS_ALL" <<'PYEOF'
           import json, os, sys
-
           with open(sys.argv[1]) as f:
-              data = json.load(f)
+              jobs = json.load(f)
           runner_name = os.environ.get("RUNNER_NAME", "")
-          matches = [j for j in data.get("jobs", []) if j.get("runner_name") == runner_name]
-          if not matches:
+          matches = [j for j in jobs if j.get("runner_name") == runner_name]
+          if len(matches) == 0:
               print("NO_MATCH")
-              sys.exit(0)
-          job = matches[0]
-          print(json.dumps({
-              "id": job.get("id"),
-              "runner_name": job.get("runner_name"),
-              "runner_group_name": job.get("runner_group_name"),
-              "labels": job.get("labels"),
-              "status": job.get("status"),
-          }))
+          elif len(matches) > 1:
+              print("AMBIGUOUS_MATCH")
+          else:
+              m = matches[0]
+              print(json.dumps({
+                  "id": m.get("id"), "runner_name": m.get("runner_name"),
+                  "runner_group_name": m.get("runner_group_name"),
+                  "labels": m.get("labels"), "status": m.get("status"),
+              }))
           PYEOF
           )
 
-          if [ "$MATCHED_JOB" = "NO_MATCH" ]; then
-            echo "::error::J barrier: could not independently locate this job's server-side record via the Actions API by runner_name -- provider_not_exposed for this field on this run; failing closed rather than guessing"
+          if [ "$MATCH_RESULT" = "NO_MATCH" ] || [ "$MATCH_RESULT" = "AMBIGUOUS_MATCH" ]; then
+            echo "::error::J barrier: server job-ID lookup failed ($MATCH_RESULT) after complete pagination -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          echo "J barrier server job record: $MATCHED_JOB"
 
-          if [ -n "${{ vars.APPROVED_RUNNER_IMAGE_OS }}" ]; then
-            if [ "${ImageOS:-unset}" != "${{ vars.APPROVED_RUNNER_IMAGE_OS }}" ]; then
-              echo "::error::J barrier: runner image OS (\$ImageOS=${ImageOS:-unset}) does not equal APPROVED_RUNNER_IMAGE_OS"
-              exit 1
-            fi
-          else
-            echo "::warning::J barrier: APPROVED_RUNNER_IMAGE_OS is not yet published; runner image identity is observed (\$ImageOS=${ImageOS:-unset}, \$ImageVersion=${ImageVersion:-unset}) but not yet bound to an approved value"
+          # Persist the J record before checkout, binding H0/H1/run/attempt,
+          # the server job identity, the observed complete tuple, and the
+          # clean-stage-root proof, per the closed-schema repair brief.
+          python3 - "$RUNNER_TEMP/nim367-j/j-record.json" <<PYEOF
+          import json
+          record = {
+              "schema": "nim367.j.v1",
+              "runId": "${{ github.run_id }}",
+              "runAttempt": "${{ github.run_attempt }}",
+              "job": "${{ github.job }}",
+              "h1RecordSha256": "${{ needs.nim367-h1-verify.outputs.h1_record_sha256 }}",
+              "serverJobRecord": json.loads('''$MATCH_RESULT'''),
+              "selectedXcodeBuild": "$XCODE_BUILD",
+              "observedCompleteTupleSha256": "$OBSERVED_COMPLETE_TUPLE_SHA256",
+              "approvedCompleteTupleSha256Expected": "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}",
+              "sharedStateManifestSha256": "$SHARED_STATE_MANIFEST_HASH",
+              "cleanStageRootVerified": True,
+          }
+          with open("$RUNNER_TEMP/nim367-j/j-record.json", "w") as f:
+              json.dump(record, f, indent=2)
+          PYEOF
+          echo "J barrier server job record: $MATCH_RESULT"
+
+          if [ "$OBSERVED_COMPLETE_TUPLE_SHA256" != "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}" ]; then
+            echo "::error::J barrier: this job's selected-toolchain complete tuple does not equal H1's approved complete tuple byte-for-byte -- BLOCKED_ATTESTATION"
+            exit 1
           fi
 
-          echo "J attestation barrier: OK -- selected toolchain ($XCODE_BUILD), server job record, and clean stage root all verified before checkout"
+          echo "J attestation barrier: OK and persisted -- selected toolchain ($XCODE_BUILD), byte-for-byte tuple match, server job record, shared-state manifest, and clean stage root all verified before checkout"
 
       - name: Checkout gate (sealed, workflow_sha)
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
@@ -664,13 +1016,13 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
-      - name: Verify sealed-checkout identity and clean status
+      - name: Verify sealed-checkout identity, locked-blob tuple, command-plan hash, and clean status
         run: |
           set -euo pipefail
           GATE_HEAD=$(git -C gate rev-parse HEAD)
           GATE_TREE=$(git -C gate rev-parse HEAD^{tree})
-          if [ "$GATE_HEAD" != "${{ vars.APPROVED_GATE_COMMIT }}" ] || [ "$GATE_TREE" != "${{ vars.APPROVED_GATE_TREE }}" ]; then
-            echo "::error::gate checkout HEAD/tree does not match the approved record"
+          if [ "$GATE_HEAD" != "${{ needs.nim367-h1-verify.outputs.approved_gate_commit }}" ] || [ "$GATE_TREE" != "${{ needs.nim367-h1-verify.outputs.approved_gate_tree }}" ]; then
+            echo "::error::gate checkout HEAD/tree does not match the H1-verified approved record -- BLOCKED_ATTESTATION"
             exit 1
           fi
           SUT_HEAD=$(git -C sut rev-parse HEAD)
@@ -696,6 +1048,34 @@ jobs:
               exit 1
             fi
           done
+
+          # Locked path-to-blob tuple: H1's own record must exactly equal
+          # what was actually checked out, closing the "candidate commit/tree
+          # and path-to-blob tuple" requirement of the closed schema.
+          python3 - <<PYEOF
+          import json, subprocess, sys
+
+          locked_blobs = json.loads('''${{ needs.nim367-h1-verify.outputs.approved_locked_blobs_json }}''')
+          for path, expected_blob in locked_blobs.items():
+              actual_blob = subprocess.check_output(
+                  ["git", "-C", "gate", "rev-parse", f"HEAD:{path}"], text=True
+              ).strip()
+              if actual_blob != expected_blob:
+                  print(f"::error::locked path {path} blob {actual_blob} does not equal H1-approved blob {expected_blob} -- BLOCKED_ATTESTATION")
+                  sys.exit(1)
+          print("Locked path-to-blob tuple: OK, matches H1 record exactly")
+          PYEOF
+
+          # Command-plan hash: hash the checked-out workflow file itself and
+          # compare to H1's commandPlanHash. This is the first point in the
+          # run where the actual command plan is on disk to hash -- h1-verify
+          # itself performs no checkout, by design (see its header comment).
+          ACTUAL_COMMAND_PLAN_HASH=$(shasum -a 256 gate/.github/workflows/ios-transcript-tests.yml | cut -d' ' -f1)
+          if [ "$ACTUAL_COMMAND_PLAN_HASH" != "${{ needs.nim367-h1-verify.outputs.approved_command_plan_hash }}" ]; then
+            echo "::error::checked-out workflow file hash ($ACTUAL_COMMAND_PLAN_HASH) does not equal H1's approved commandPlanHash -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+          echo "Command-plan hash: OK, matches H1 record exactly"
 
       - name: Materialize watchdog wrapper
         run: |
@@ -836,7 +1216,7 @@ jobs:
               -onlyUsePackageVersionsFromResolvedFile \
               -clonedSourcePackagesDirPath "$RESOLVER_ROOT/clones"
 
-          if ! grep -q "${{ vars.APPROVED_GATE_SCHEME }}" "$RUNNER_TEMP/nim367/scheme-list.stdout"; then
+          if ! grep -q "${{ needs.nim367-h1-verify.outputs.approved_gate_scheme }}" "$RUNNER_TEMP/nim367/scheme-list.stdout"; then
             echo "::error::approved test-bearing scheme not present in observed scheme list"
             exit 1
           fi
@@ -960,6 +1340,7 @@ jobs:
           set -euo pipefail
           PKG="$RUNNER_TEMP/nim367-package/payload"
           mkdir -p "$PKG"
+          cp "$RUNNER_TEMP/nim367-j/j-record.json" "$PKG"/ 2>/dev/null || true
           cp "$RUNNER_TEMP"/nim367/*.log "$PKG"/ 2>/dev/null || true
           cp "$RUNNER_TEMP"/nim367/*.watchdog.json "$PKG"/ 2>/dev/null || true
           find "$RUNNER_TEMP/nim367" -name '*.xcresult' -exec cp -R {} "$PKG"/ \; 2>/dev/null || true
@@ -982,52 +1363,189 @@ jobs:
     runs-on: macos-15
     environment: nim367-apple-gate-approval
     steps:
-      - name: Setup Xcode (approved build)
+      - name: Setup Xcode (H1-approved build)
         uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # reviewed release: v1 (v1.7.0)
         with:
-          xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
+          xcode-version: ${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}
 
-      - name: Verify J per-job attestation barrier (selected toolchain, server job record, clean stage root)
+      - name: Verify + persist J attestation record (selected toolchain byte-for-byte vs H1, paginated server job lookup, clean stage root)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ -d gate ] || [ -d sut ]; then
-            echo "::error::J barrier: candidate/SUT directories already exist before this job's first checkout -- stage root is not clean"
+            echo "::error::J barrier: candidate/SUT directories already exist before this job's first checkout -- stage root is not clean -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          XCODE_BUILD=$(xcodebuild -version | grep -o 'Build version [A-Za-z0-9]*' | sed 's/Build version //')
-          if [ "$XCODE_BUILD" != "${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}" ]; then
-            echo "::error::J barrier: this job's selected Xcode build ($XCODE_BUILD) does not equal the H1-approved Xcode build"
+          if [ -z "${{ needs.nim367-h1-verify.outputs.approved_runner_image_os }}" ] || \
+             [ -z "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}" ] || \
+             [ -z "${{ needs.nim367-h1-verify.outputs.approved_shared_state_manifest_sha256 }}" ]; then
+            echo "::error::J barrier: H1-verified approved_runner_image_os/approved_complete_tuple_sha256/approved_shared_state_manifest_sha256 are empty -- BLOCKED_ATTESTATION, never a warning/pass approximation"
             exit 1
           fi
-          if [ "${{ runner.os }}" != "${{ needs.nim367-attest-only.outputs.runner_os }}" ]; then
-            echo "::error::J barrier: runner.os does not match the attest-only barrier's observation"
-            exit 1
-          fi
+
           mkdir -p "$RUNNER_TEMP/nim367-j"
-          curl -sf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
-            > "$RUNNER_TEMP/nim367-j/jobs-response.json"
-          MATCHED_JOB=$(python3 - "$RUNNER_TEMP/nim367-j/jobs-response.json" <<'PYEOF'
+
+          XCODEBUILD_VERSION=$(xcodebuild -version)
+          XCODEBUILD_HELP_HASH=$(xcodebuild -help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_EXEC=$(xcrun --find swift)
+          SWIFTC_EXEC=$(xcrun --find swiftc)
+          SWIFT_VERSION_HASH=$("$SWIFT_EXEC" --version | shasum -a 256 | cut -d' ' -f1)
+          SWIFTC_VERSION_HASH=$("$SWIFTC_EXEC" --version | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_PACKAGE_HELP_HASH=$("$SWIFT_EXEC" package --help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_TEST_HELP_HASH=$("$SWIFT_EXEC" test --help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SW_VERS_HASH=$(sw_vers | shasum -a 256 | cut -d' ' -f1)
+          XCODE_BUILD=$(echo "$XCODEBUILD_VERSION" | grep -o 'Build version [A-Za-z0-9]*' | sed 's/Build version //')
+
+          python3 - > "$RUNNER_TEMP/nim367-j/shared-state-manifest.json" <<'PYEOF'
+          import json, os
+          roots = [
+              os.path.expanduser("~/Library/Caches/org.swift.swiftpm"),
+              os.path.expanduser("~/Library/org.swift.swiftpm"),
+              os.path.expanduser("~/.swiftpm"),
+              os.path.expanduser("~/Library/Developer/Xcode/DerivedData"),
+          ]
+          manifest = []
+          for root in sorted(roots):
+              if not os.path.exists(root):
+                  manifest.append({"root": root, "state": "absent"})
+                  continue
+              entries = []
+              for dirpath, dirnames, filenames in os.walk(root):
+                  dirnames.sort()
+                  for name in sorted(filenames):
+                      full = os.path.join(dirpath, name)
+                      try:
+                          size = os.path.getsize(full)
+                      except OSError:
+                          size = -1
+                      entries.append({"path": os.path.relpath(full, root), "size": size})
+              manifest.append({"root": root, "state": "present", "entryCount": len(entries), "entries": entries})
+          print(json.dumps(manifest, sort_keys=True))
+          PYEOF
+          SHARED_STATE_MANIFEST_HASH=$(shasum -a 256 "$RUNNER_TEMP/nim367-j/shared-state-manifest.json" | cut -d' ' -f1)
+
+          cat > "$RUNNER_TEMP/nim367-j/attestation-recompute.json" <<EOF
+          {
+            "schema": "nim367.attest-only.v2",
+            "runId": "${{ github.run_id }}",
+            "runAttempt": "${{ github.run_attempt }}",
+            "job": "${{ github.job }}",
+            "repository": "${{ github.repository }}",
+            "workflowRef": "${{ github.workflow_ref }}",
+            "workflowSha": "${{ github.workflow_sha }}",
+            "headRef": "${{ github.ref }}",
+            "headSha": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "runnerOs": "${{ runner.os }}",
+            "runnerArch": "${{ runner.arch }}",
+            "runnerName": "${{ runner.name }}",
+            "xcodeSelectP": $(xcode-select -p | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "xcodebuildVersion": $(echo "$XCODEBUILD_VERSION" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "xcodebuildHelpHash": "$XCODEBUILD_HELP_HASH",
+            "swiftExecRealpath": "$SWIFT_EXEC",
+            "swiftcExecRealpath": "$SWIFTC_EXEC",
+            "swiftVersionHash": "$SWIFT_VERSION_HASH",
+            "swiftcVersionHash": "$SWIFTC_VERSION_HASH",
+            "swiftPackageHelpHash": "$SWIFT_PACKAGE_HELP_HASH",
+            "swiftTestHelpHash": "$SWIFT_TEST_HELP_HASH",
+            "swVersHash": "$SW_VERS_HASH",
+            "sharedStateManifestSha256": "$SHARED_STATE_MANIFEST_HASH"
+          }
+          EOF
+          OBSERVED_COMPLETE_TUPLE_SHA256=$(shasum -a 256 "$RUNNER_TEMP/nim367-j/attestation-recompute.json" | cut -d' ' -f1)
+
+          if [ "$XCODE_BUILD" != "${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}" ]; then
+            echo "::error::J barrier: this job's selected Xcode build ($XCODE_BUILD) does not equal the H1-approved Xcode build -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+          if [ "${ImageOS:-unset}" != "${{ needs.nim367-h1-verify.outputs.approved_runner_image_os }}" ]; then
+            echo "::error::J barrier: runner image OS (\$ImageOS=${ImageOS:-unset}) does not equal the H1-approved runner image OS -- BLOCKED_ATTESTATION, never a warning"
+            exit 1
+          fi
+          if [ "$SHARED_STATE_MANIFEST_HASH" != "${{ needs.nim367-h1-verify.outputs.approved_shared_state_manifest_sha256 }}" ]; then
+            echo "::error::J barrier: this job's shared-state manifest does not equal the H1-approved manifest byte-for-byte -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+
+          JOBS_ALL="$RUNNER_TEMP/nim367-j/jobs-all.json"
+          echo "[]" > "$JOBS_ALL"
+          NEXT_URL="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100"
+          PAGE=1
+          while [ -n "$NEXT_URL" ]; do
+            HEADERS_FILE="$RUNNER_TEMP/nim367-j/jobs-headers-$PAGE.txt"
+            BODY_FILE="$RUNNER_TEMP/nim367-j/jobs-body-$PAGE.json"
+            curl -sf -D "$HEADERS_FILE" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$NEXT_URL" -o "$BODY_FILE"
+            python3 - "$JOBS_ALL" "$BODY_FILE" <<'PYEOF'
+          import json, sys
+          all_path, body_path = sys.argv[1], sys.argv[2]
+          with open(all_path) as f:
+              all_jobs = json.load(f)
+          with open(body_path) as f:
+              body = json.load(f)
+          all_jobs.extend(body.get("jobs", []))
+          with open(all_path, "w") as f:
+              json.dump(all_jobs, f)
+          PYEOF
+            NEXT_URL=$(grep -i '^link:' "$HEADERS_FILE" | grep -o '<[^>]*>; rel="next"' | sed -E 's/<(.*)>.*/\1/' || true)
+            PAGE=$((PAGE + 1))
+            if [ "$PAGE" -gt 20 ]; then
+              echo "::error::J barrier: pagination exceeded 20 pages, aborting to avoid unbounded loop"
+              exit 1
+            fi
+          done
+
+          MATCH_RESULT=$(python3 - "$JOBS_ALL" <<'PYEOF'
           import json, os, sys
           with open(sys.argv[1]) as f:
-              data = json.load(f)
+              jobs = json.load(f)
           runner_name = os.environ.get("RUNNER_NAME", "")
-          matches = [j for j in data.get("jobs", []) if j.get("runner_name") == runner_name]
-          print("NO_MATCH" if not matches else json.dumps({
-              "id": matches[0].get("id"), "runner_name": matches[0].get("runner_name"),
-              "runner_group_name": matches[0].get("runner_group_name"),
-              "labels": matches[0].get("labels"), "status": matches[0].get("status"),
-          }))
+          matches = [j for j in jobs if j.get("runner_name") == runner_name]
+          if len(matches) == 0:
+              print("NO_MATCH")
+          elif len(matches) > 1:
+              print("AMBIGUOUS_MATCH")
+          else:
+              m = matches[0]
+              print(json.dumps({
+                  "id": m.get("id"), "runner_name": m.get("runner_name"),
+                  "runner_group_name": m.get("runner_group_name"),
+                  "labels": m.get("labels"), "status": m.get("status"),
+              }))
           PYEOF
           )
-          if [ "$MATCHED_JOB" = "NO_MATCH" ]; then
-            echo "::error::J barrier: could not independently locate this job's server-side record via the Actions API by runner_name -- provider_not_exposed for this field on this run"
+
+          if [ "$MATCH_RESULT" = "NO_MATCH" ] || [ "$MATCH_RESULT" = "AMBIGUOUS_MATCH" ]; then
+            echo "::error::J barrier: server job-ID lookup failed ($MATCH_RESULT) after complete pagination -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          echo "J barrier server job record: $MATCHED_JOB"
-          echo "J attestation barrier: OK -- selected toolchain ($XCODE_BUILD), server job record, and clean stage root all verified before checkout"
+
+          python3 - "$RUNNER_TEMP/nim367-j/j-record.json" <<PYEOF
+          import json
+          record = {
+              "schema": "nim367.j.v1",
+              "runId": "${{ github.run_id }}",
+              "runAttempt": "${{ github.run_attempt }}",
+              "job": "${{ github.job }}",
+              "h1RecordSha256": "${{ needs.nim367-h1-verify.outputs.h1_record_sha256 }}",
+              "serverJobRecord": json.loads('''$MATCH_RESULT'''),
+              "selectedXcodeBuild": "$XCODE_BUILD",
+              "observedCompleteTupleSha256": "$OBSERVED_COMPLETE_TUPLE_SHA256",
+              "approvedCompleteTupleSha256Expected": "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}",
+              "sharedStateManifestSha256": "$SHARED_STATE_MANIFEST_HASH",
+              "cleanStageRootVerified": True,
+          }
+          with open("$RUNNER_TEMP/nim367-j/j-record.json", "w") as f:
+              json.dump(record, f, indent=2)
+          PYEOF
+          echo "J barrier server job record: $MATCH_RESULT"
+
+          if [ "$OBSERVED_COMPLETE_TUPLE_SHA256" != "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}" ]; then
+            echo "::error::J barrier: this job's selected-toolchain complete tuple does not equal H1's approved complete tuple byte-for-byte -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+
+          echo "J attestation barrier: OK and persisted -- selected toolchain ($XCODE_BUILD), byte-for-byte tuple match, server job record, shared-state manifest, and clean stage root all verified before checkout"
 
       - name: Checkout SUT (sealed, exact repair SHA)
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
@@ -1082,6 +1600,7 @@ jobs:
           set -euo pipefail
           PKG="$RUNNER_TEMP/nim367-package/payload"
           mkdir -p "$PKG"
+          cp "$RUNNER_TEMP/nim367-j/j-record.json" "$PKG"/ 2>/dev/null || true
           cp "$RUNNER_TEMP"/nim367/*.log "$PKG"/ 2>/dev/null || true
           find "$RUNNER_TEMP/nim367" -name '*.xcresult' -exec cp -R {} "$PKG"/ \; 2>/dev/null || true
           (cd "$RUNNER_TEMP/nim367-package" && find payload -type f | sort | xargs -I{} shasum -a 256 {} > SHA256SUMS)
@@ -1103,52 +1622,189 @@ jobs:
     runs-on: macos-15
     environment: nim367-apple-gate-approval
     steps:
-      - name: Setup Xcode (approved build)
+      - name: Setup Xcode (H1-approved build)
         uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # reviewed release: v1 (v1.7.0)
         with:
-          xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
+          xcode-version: ${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}
 
-      - name: Verify J per-job attestation barrier (selected toolchain, server job record, clean stage root)
+      - name: Verify + persist J attestation record (selected toolchain byte-for-byte vs H1, paginated server job lookup, clean stage root)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ -d gate ] || [ -d sut ]; then
-            echo "::error::J barrier: candidate/SUT directories already exist before this job's first checkout -- stage root is not clean"
+            echo "::error::J barrier: candidate/SUT directories already exist before this job's first checkout -- stage root is not clean -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          XCODE_BUILD=$(xcodebuild -version | grep -o 'Build version [A-Za-z0-9]*' | sed 's/Build version //')
-          if [ "$XCODE_BUILD" != "${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}" ]; then
-            echo "::error::J barrier: this job's selected Xcode build ($XCODE_BUILD) does not equal the H1-approved Xcode build"
+          if [ -z "${{ needs.nim367-h1-verify.outputs.approved_runner_image_os }}" ] || \
+             [ -z "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}" ] || \
+             [ -z "${{ needs.nim367-h1-verify.outputs.approved_shared_state_manifest_sha256 }}" ]; then
+            echo "::error::J barrier: H1-verified approved_runner_image_os/approved_complete_tuple_sha256/approved_shared_state_manifest_sha256 are empty -- BLOCKED_ATTESTATION, never a warning/pass approximation"
             exit 1
           fi
-          if [ "${{ runner.os }}" != "${{ needs.nim367-attest-only.outputs.runner_os }}" ]; then
-            echo "::error::J barrier: runner.os does not match the attest-only barrier's observation"
-            exit 1
-          fi
+
           mkdir -p "$RUNNER_TEMP/nim367-j"
-          curl -sf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
-            > "$RUNNER_TEMP/nim367-j/jobs-response.json"
-          MATCHED_JOB=$(python3 - "$RUNNER_TEMP/nim367-j/jobs-response.json" <<'PYEOF'
+
+          XCODEBUILD_VERSION=$(xcodebuild -version)
+          XCODEBUILD_HELP_HASH=$(xcodebuild -help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_EXEC=$(xcrun --find swift)
+          SWIFTC_EXEC=$(xcrun --find swiftc)
+          SWIFT_VERSION_HASH=$("$SWIFT_EXEC" --version | shasum -a 256 | cut -d' ' -f1)
+          SWIFTC_VERSION_HASH=$("$SWIFTC_EXEC" --version | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_PACKAGE_HELP_HASH=$("$SWIFT_EXEC" package --help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_TEST_HELP_HASH=$("$SWIFT_EXEC" test --help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SW_VERS_HASH=$(sw_vers | shasum -a 256 | cut -d' ' -f1)
+          XCODE_BUILD=$(echo "$XCODEBUILD_VERSION" | grep -o 'Build version [A-Za-z0-9]*' | sed 's/Build version //')
+
+          python3 - > "$RUNNER_TEMP/nim367-j/shared-state-manifest.json" <<'PYEOF'
+          import json, os
+          roots = [
+              os.path.expanduser("~/Library/Caches/org.swift.swiftpm"),
+              os.path.expanduser("~/Library/org.swift.swiftpm"),
+              os.path.expanduser("~/.swiftpm"),
+              os.path.expanduser("~/Library/Developer/Xcode/DerivedData"),
+          ]
+          manifest = []
+          for root in sorted(roots):
+              if not os.path.exists(root):
+                  manifest.append({"root": root, "state": "absent"})
+                  continue
+              entries = []
+              for dirpath, dirnames, filenames in os.walk(root):
+                  dirnames.sort()
+                  for name in sorted(filenames):
+                      full = os.path.join(dirpath, name)
+                      try:
+                          size = os.path.getsize(full)
+                      except OSError:
+                          size = -1
+                      entries.append({"path": os.path.relpath(full, root), "size": size})
+              manifest.append({"root": root, "state": "present", "entryCount": len(entries), "entries": entries})
+          print(json.dumps(manifest, sort_keys=True))
+          PYEOF
+          SHARED_STATE_MANIFEST_HASH=$(shasum -a 256 "$RUNNER_TEMP/nim367-j/shared-state-manifest.json" | cut -d' ' -f1)
+
+          cat > "$RUNNER_TEMP/nim367-j/attestation-recompute.json" <<EOF
+          {
+            "schema": "nim367.attest-only.v2",
+            "runId": "${{ github.run_id }}",
+            "runAttempt": "${{ github.run_attempt }}",
+            "job": "${{ github.job }}",
+            "repository": "${{ github.repository }}",
+            "workflowRef": "${{ github.workflow_ref }}",
+            "workflowSha": "${{ github.workflow_sha }}",
+            "headRef": "${{ github.ref }}",
+            "headSha": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "runnerOs": "${{ runner.os }}",
+            "runnerArch": "${{ runner.arch }}",
+            "runnerName": "${{ runner.name }}",
+            "xcodeSelectP": $(xcode-select -p | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "xcodebuildVersion": $(echo "$XCODEBUILD_VERSION" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "xcodebuildHelpHash": "$XCODEBUILD_HELP_HASH",
+            "swiftExecRealpath": "$SWIFT_EXEC",
+            "swiftcExecRealpath": "$SWIFTC_EXEC",
+            "swiftVersionHash": "$SWIFT_VERSION_HASH",
+            "swiftcVersionHash": "$SWIFTC_VERSION_HASH",
+            "swiftPackageHelpHash": "$SWIFT_PACKAGE_HELP_HASH",
+            "swiftTestHelpHash": "$SWIFT_TEST_HELP_HASH",
+            "swVersHash": "$SW_VERS_HASH",
+            "sharedStateManifestSha256": "$SHARED_STATE_MANIFEST_HASH"
+          }
+          EOF
+          OBSERVED_COMPLETE_TUPLE_SHA256=$(shasum -a 256 "$RUNNER_TEMP/nim367-j/attestation-recompute.json" | cut -d' ' -f1)
+
+          if [ "$XCODE_BUILD" != "${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}" ]; then
+            echo "::error::J barrier: this job's selected Xcode build ($XCODE_BUILD) does not equal the H1-approved Xcode build -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+          if [ "${ImageOS:-unset}" != "${{ needs.nim367-h1-verify.outputs.approved_runner_image_os }}" ]; then
+            echo "::error::J barrier: runner image OS (\$ImageOS=${ImageOS:-unset}) does not equal the H1-approved runner image OS -- BLOCKED_ATTESTATION, never a warning"
+            exit 1
+          fi
+          if [ "$SHARED_STATE_MANIFEST_HASH" != "${{ needs.nim367-h1-verify.outputs.approved_shared_state_manifest_sha256 }}" ]; then
+            echo "::error::J barrier: this job's shared-state manifest does not equal the H1-approved manifest byte-for-byte -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+
+          JOBS_ALL="$RUNNER_TEMP/nim367-j/jobs-all.json"
+          echo "[]" > "$JOBS_ALL"
+          NEXT_URL="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100"
+          PAGE=1
+          while [ -n "$NEXT_URL" ]; do
+            HEADERS_FILE="$RUNNER_TEMP/nim367-j/jobs-headers-$PAGE.txt"
+            BODY_FILE="$RUNNER_TEMP/nim367-j/jobs-body-$PAGE.json"
+            curl -sf -D "$HEADERS_FILE" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$NEXT_URL" -o "$BODY_FILE"
+            python3 - "$JOBS_ALL" "$BODY_FILE" <<'PYEOF'
+          import json, sys
+          all_path, body_path = sys.argv[1], sys.argv[2]
+          with open(all_path) as f:
+              all_jobs = json.load(f)
+          with open(body_path) as f:
+              body = json.load(f)
+          all_jobs.extend(body.get("jobs", []))
+          with open(all_path, "w") as f:
+              json.dump(all_jobs, f)
+          PYEOF
+            NEXT_URL=$(grep -i '^link:' "$HEADERS_FILE" | grep -o '<[^>]*>; rel="next"' | sed -E 's/<(.*)>.*/\1/' || true)
+            PAGE=$((PAGE + 1))
+            if [ "$PAGE" -gt 20 ]; then
+              echo "::error::J barrier: pagination exceeded 20 pages, aborting to avoid unbounded loop"
+              exit 1
+            fi
+          done
+
+          MATCH_RESULT=$(python3 - "$JOBS_ALL" <<'PYEOF'
           import json, os, sys
           with open(sys.argv[1]) as f:
-              data = json.load(f)
+              jobs = json.load(f)
           runner_name = os.environ.get("RUNNER_NAME", "")
-          matches = [j for j in data.get("jobs", []) if j.get("runner_name") == runner_name]
-          print("NO_MATCH" if not matches else json.dumps({
-              "id": matches[0].get("id"), "runner_name": matches[0].get("runner_name"),
-              "runner_group_name": matches[0].get("runner_group_name"),
-              "labels": matches[0].get("labels"), "status": matches[0].get("status"),
-          }))
+          matches = [j for j in jobs if j.get("runner_name") == runner_name]
+          if len(matches) == 0:
+              print("NO_MATCH")
+          elif len(matches) > 1:
+              print("AMBIGUOUS_MATCH")
+          else:
+              m = matches[0]
+              print(json.dumps({
+                  "id": m.get("id"), "runner_name": m.get("runner_name"),
+                  "runner_group_name": m.get("runner_group_name"),
+                  "labels": m.get("labels"), "status": m.get("status"),
+              }))
           PYEOF
           )
-          if [ "$MATCHED_JOB" = "NO_MATCH" ]; then
-            echo "::error::J barrier: could not independently locate this job's server-side record via the Actions API by runner_name -- provider_not_exposed for this field on this run"
+
+          if [ "$MATCH_RESULT" = "NO_MATCH" ] || [ "$MATCH_RESULT" = "AMBIGUOUS_MATCH" ]; then
+            echo "::error::J barrier: server job-ID lookup failed ($MATCH_RESULT) after complete pagination -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          echo "J barrier server job record: $MATCHED_JOB"
-          echo "J attestation barrier: OK -- selected toolchain ($XCODE_BUILD), server job record, and clean stage root all verified before checkout"
+
+          python3 - "$RUNNER_TEMP/nim367-j/j-record.json" <<PYEOF
+          import json
+          record = {
+              "schema": "nim367.j.v1",
+              "runId": "${{ github.run_id }}",
+              "runAttempt": "${{ github.run_attempt }}",
+              "job": "${{ github.job }}",
+              "h1RecordSha256": "${{ needs.nim367-h1-verify.outputs.h1_record_sha256 }}",
+              "serverJobRecord": json.loads('''$MATCH_RESULT'''),
+              "selectedXcodeBuild": "$XCODE_BUILD",
+              "observedCompleteTupleSha256": "$OBSERVED_COMPLETE_TUPLE_SHA256",
+              "approvedCompleteTupleSha256Expected": "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}",
+              "sharedStateManifestSha256": "$SHARED_STATE_MANIFEST_HASH",
+              "cleanStageRootVerified": True,
+          }
+          with open("$RUNNER_TEMP/nim367-j/j-record.json", "w") as f:
+              json.dump(record, f, indent=2)
+          PYEOF
+          echo "J barrier server job record: $MATCH_RESULT"
+
+          if [ "$OBSERVED_COMPLETE_TUPLE_SHA256" != "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}" ]; then
+            echo "::error::J barrier: this job's selected-toolchain complete tuple does not equal H1's approved complete tuple byte-for-byte -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+
+          echo "J attestation barrier: OK and persisted -- selected toolchain ($XCODE_BUILD), byte-for-byte tuple match, server job record, shared-state manifest, and clean stage root all verified before checkout"
 
       - name: Checkout gate (sealed, workflow_sha)
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
@@ -1192,7 +1848,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/nim367"
           cd gate/packages/ios/NimbalystAppleGate
           xcodebuild test \
-            -scheme "${{ vars.APPROVED_GATE_SCHEME }}" \
+            -scheme "${{ needs.nim367-h1-verify.outputs.approved_gate_scheme }}" \
             -destination "$IOS_SIMULATOR_DESTINATION" \
             -skipPackagePluginValidation \
             -disableAutomaticPackageResolution \
@@ -1213,6 +1869,7 @@ jobs:
           set -euo pipefail
           PKG="$RUNNER_TEMP/nim367-package/payload"
           mkdir -p "$PKG"
+          cp "$RUNNER_TEMP/nim367-j/j-record.json" "$PKG"/ 2>/dev/null || true
           cp "$RUNNER_TEMP"/nim367/*.log "$PKG"/ 2>/dev/null || true
           find "$RUNNER_TEMP/nim367" -name '*.xcresult' -exec cp -R {} "$PKG"/ \; 2>/dev/null || true
           (cd "$RUNNER_TEMP/nim367-package" && find payload -type f | sort | xargs -I{} shasum -a 256 {} > SHA256SUMS)
@@ -1234,52 +1891,189 @@ jobs:
     runs-on: macos-15
     environment: nim367-apple-gate-approval
     steps:
-      - name: Setup Xcode (approved build)
+      - name: Setup Xcode (H1-approved build)
         uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # reviewed release: v1 (v1.7.0)
         with:
-          xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
+          xcode-version: ${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}
 
-      - name: Verify J per-job attestation barrier (selected toolchain, server job record, clean stage root)
+      - name: Verify + persist J attestation record (selected toolchain byte-for-byte vs H1, paginated server job lookup, clean stage root)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ -d gate ] || [ -d sut ]; then
-            echo "::error::J barrier: candidate/SUT directories already exist before this job's first checkout -- stage root is not clean"
+            echo "::error::J barrier: candidate/SUT directories already exist before this job's first checkout -- stage root is not clean -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          XCODE_BUILD=$(xcodebuild -version | grep -o 'Build version [A-Za-z0-9]*' | sed 's/Build version //')
-          if [ "$XCODE_BUILD" != "${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}" ]; then
-            echo "::error::J barrier: this job's selected Xcode build ($XCODE_BUILD) does not equal the H1-approved Xcode build"
+          if [ -z "${{ needs.nim367-h1-verify.outputs.approved_runner_image_os }}" ] || \
+             [ -z "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}" ] || \
+             [ -z "${{ needs.nim367-h1-verify.outputs.approved_shared_state_manifest_sha256 }}" ]; then
+            echo "::error::J barrier: H1-verified approved_runner_image_os/approved_complete_tuple_sha256/approved_shared_state_manifest_sha256 are empty -- BLOCKED_ATTESTATION, never a warning/pass approximation"
             exit 1
           fi
-          if [ "${{ runner.os }}" != "${{ needs.nim367-attest-only.outputs.runner_os }}" ]; then
-            echo "::error::J barrier: runner.os does not match the attest-only barrier's observation"
-            exit 1
-          fi
+
           mkdir -p "$RUNNER_TEMP/nim367-j"
-          curl -sf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
-            > "$RUNNER_TEMP/nim367-j/jobs-response.json"
-          MATCHED_JOB=$(python3 - "$RUNNER_TEMP/nim367-j/jobs-response.json" <<'PYEOF'
+
+          XCODEBUILD_VERSION=$(xcodebuild -version)
+          XCODEBUILD_HELP_HASH=$(xcodebuild -help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_EXEC=$(xcrun --find swift)
+          SWIFTC_EXEC=$(xcrun --find swiftc)
+          SWIFT_VERSION_HASH=$("$SWIFT_EXEC" --version | shasum -a 256 | cut -d' ' -f1)
+          SWIFTC_VERSION_HASH=$("$SWIFTC_EXEC" --version | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_PACKAGE_HELP_HASH=$("$SWIFT_EXEC" package --help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_TEST_HELP_HASH=$("$SWIFT_EXEC" test --help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SW_VERS_HASH=$(sw_vers | shasum -a 256 | cut -d' ' -f1)
+          XCODE_BUILD=$(echo "$XCODEBUILD_VERSION" | grep -o 'Build version [A-Za-z0-9]*' | sed 's/Build version //')
+
+          python3 - > "$RUNNER_TEMP/nim367-j/shared-state-manifest.json" <<'PYEOF'
+          import json, os
+          roots = [
+              os.path.expanduser("~/Library/Caches/org.swift.swiftpm"),
+              os.path.expanduser("~/Library/org.swift.swiftpm"),
+              os.path.expanduser("~/.swiftpm"),
+              os.path.expanduser("~/Library/Developer/Xcode/DerivedData"),
+          ]
+          manifest = []
+          for root in sorted(roots):
+              if not os.path.exists(root):
+                  manifest.append({"root": root, "state": "absent"})
+                  continue
+              entries = []
+              for dirpath, dirnames, filenames in os.walk(root):
+                  dirnames.sort()
+                  for name in sorted(filenames):
+                      full = os.path.join(dirpath, name)
+                      try:
+                          size = os.path.getsize(full)
+                      except OSError:
+                          size = -1
+                      entries.append({"path": os.path.relpath(full, root), "size": size})
+              manifest.append({"root": root, "state": "present", "entryCount": len(entries), "entries": entries})
+          print(json.dumps(manifest, sort_keys=True))
+          PYEOF
+          SHARED_STATE_MANIFEST_HASH=$(shasum -a 256 "$RUNNER_TEMP/nim367-j/shared-state-manifest.json" | cut -d' ' -f1)
+
+          cat > "$RUNNER_TEMP/nim367-j/attestation-recompute.json" <<EOF
+          {
+            "schema": "nim367.attest-only.v2",
+            "runId": "${{ github.run_id }}",
+            "runAttempt": "${{ github.run_attempt }}",
+            "job": "${{ github.job }}",
+            "repository": "${{ github.repository }}",
+            "workflowRef": "${{ github.workflow_ref }}",
+            "workflowSha": "${{ github.workflow_sha }}",
+            "headRef": "${{ github.ref }}",
+            "headSha": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "runnerOs": "${{ runner.os }}",
+            "runnerArch": "${{ runner.arch }}",
+            "runnerName": "${{ runner.name }}",
+            "xcodeSelectP": $(xcode-select -p | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "xcodebuildVersion": $(echo "$XCODEBUILD_VERSION" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "xcodebuildHelpHash": "$XCODEBUILD_HELP_HASH",
+            "swiftExecRealpath": "$SWIFT_EXEC",
+            "swiftcExecRealpath": "$SWIFTC_EXEC",
+            "swiftVersionHash": "$SWIFT_VERSION_HASH",
+            "swiftcVersionHash": "$SWIFTC_VERSION_HASH",
+            "swiftPackageHelpHash": "$SWIFT_PACKAGE_HELP_HASH",
+            "swiftTestHelpHash": "$SWIFT_TEST_HELP_HASH",
+            "swVersHash": "$SW_VERS_HASH",
+            "sharedStateManifestSha256": "$SHARED_STATE_MANIFEST_HASH"
+          }
+          EOF
+          OBSERVED_COMPLETE_TUPLE_SHA256=$(shasum -a 256 "$RUNNER_TEMP/nim367-j/attestation-recompute.json" | cut -d' ' -f1)
+
+          if [ "$XCODE_BUILD" != "${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}" ]; then
+            echo "::error::J barrier: this job's selected Xcode build ($XCODE_BUILD) does not equal the H1-approved Xcode build -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+          if [ "${ImageOS:-unset}" != "${{ needs.nim367-h1-verify.outputs.approved_runner_image_os }}" ]; then
+            echo "::error::J barrier: runner image OS (\$ImageOS=${ImageOS:-unset}) does not equal the H1-approved runner image OS -- BLOCKED_ATTESTATION, never a warning"
+            exit 1
+          fi
+          if [ "$SHARED_STATE_MANIFEST_HASH" != "${{ needs.nim367-h1-verify.outputs.approved_shared_state_manifest_sha256 }}" ]; then
+            echo "::error::J barrier: this job's shared-state manifest does not equal the H1-approved manifest byte-for-byte -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+
+          JOBS_ALL="$RUNNER_TEMP/nim367-j/jobs-all.json"
+          echo "[]" > "$JOBS_ALL"
+          NEXT_URL="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100"
+          PAGE=1
+          while [ -n "$NEXT_URL" ]; do
+            HEADERS_FILE="$RUNNER_TEMP/nim367-j/jobs-headers-$PAGE.txt"
+            BODY_FILE="$RUNNER_TEMP/nim367-j/jobs-body-$PAGE.json"
+            curl -sf -D "$HEADERS_FILE" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$NEXT_URL" -o "$BODY_FILE"
+            python3 - "$JOBS_ALL" "$BODY_FILE" <<'PYEOF'
+          import json, sys
+          all_path, body_path = sys.argv[1], sys.argv[2]
+          with open(all_path) as f:
+              all_jobs = json.load(f)
+          with open(body_path) as f:
+              body = json.load(f)
+          all_jobs.extend(body.get("jobs", []))
+          with open(all_path, "w") as f:
+              json.dump(all_jobs, f)
+          PYEOF
+            NEXT_URL=$(grep -i '^link:' "$HEADERS_FILE" | grep -o '<[^>]*>; rel="next"' | sed -E 's/<(.*)>.*/\1/' || true)
+            PAGE=$((PAGE + 1))
+            if [ "$PAGE" -gt 20 ]; then
+              echo "::error::J barrier: pagination exceeded 20 pages, aborting to avoid unbounded loop"
+              exit 1
+            fi
+          done
+
+          MATCH_RESULT=$(python3 - "$JOBS_ALL" <<'PYEOF'
           import json, os, sys
           with open(sys.argv[1]) as f:
-              data = json.load(f)
+              jobs = json.load(f)
           runner_name = os.environ.get("RUNNER_NAME", "")
-          matches = [j for j in data.get("jobs", []) if j.get("runner_name") == runner_name]
-          print("NO_MATCH" if not matches else json.dumps({
-              "id": matches[0].get("id"), "runner_name": matches[0].get("runner_name"),
-              "runner_group_name": matches[0].get("runner_group_name"),
-              "labels": matches[0].get("labels"), "status": matches[0].get("status"),
-          }))
+          matches = [j for j in jobs if j.get("runner_name") == runner_name]
+          if len(matches) == 0:
+              print("NO_MATCH")
+          elif len(matches) > 1:
+              print("AMBIGUOUS_MATCH")
+          else:
+              m = matches[0]
+              print(json.dumps({
+                  "id": m.get("id"), "runner_name": m.get("runner_name"),
+                  "runner_group_name": m.get("runner_group_name"),
+                  "labels": m.get("labels"), "status": m.get("status"),
+              }))
           PYEOF
           )
-          if [ "$MATCHED_JOB" = "NO_MATCH" ]; then
-            echo "::error::J barrier: could not independently locate this job's server-side record via the Actions API by runner_name -- provider_not_exposed for this field on this run"
+
+          if [ "$MATCH_RESULT" = "NO_MATCH" ] || [ "$MATCH_RESULT" = "AMBIGUOUS_MATCH" ]; then
+            echo "::error::J barrier: server job-ID lookup failed ($MATCH_RESULT) after complete pagination -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          echo "J barrier server job record: $MATCHED_JOB"
-          echo "J attestation barrier: OK -- selected toolchain ($XCODE_BUILD), server job record, and clean stage root all verified before checkout"
+
+          python3 - "$RUNNER_TEMP/nim367-j/j-record.json" <<PYEOF
+          import json
+          record = {
+              "schema": "nim367.j.v1",
+              "runId": "${{ github.run_id }}",
+              "runAttempt": "${{ github.run_attempt }}",
+              "job": "${{ github.job }}",
+              "h1RecordSha256": "${{ needs.nim367-h1-verify.outputs.h1_record_sha256 }}",
+              "serverJobRecord": json.loads('''$MATCH_RESULT'''),
+              "selectedXcodeBuild": "$XCODE_BUILD",
+              "observedCompleteTupleSha256": "$OBSERVED_COMPLETE_TUPLE_SHA256",
+              "approvedCompleteTupleSha256Expected": "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}",
+              "sharedStateManifestSha256": "$SHARED_STATE_MANIFEST_HASH",
+              "cleanStageRootVerified": True,
+          }
+          with open("$RUNNER_TEMP/nim367-j/j-record.json", "w") as f:
+              json.dump(record, f, indent=2)
+          PYEOF
+          echo "J barrier server job record: $MATCH_RESULT"
+
+          if [ "$OBSERVED_COMPLETE_TUPLE_SHA256" != "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}" ]; then
+            echo "::error::J barrier: this job's selected-toolchain complete tuple does not equal H1's approved complete tuple byte-for-byte -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+
+          echo "J attestation barrier: OK and persisted -- selected toolchain ($XCODE_BUILD), byte-for-byte tuple match, server job record, shared-state manifest, and clean stage root all verified before checkout"
 
       - name: Checkout SUT (sealed, exact repair SHA)
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
@@ -1361,6 +2155,7 @@ jobs:
           set -euo pipefail
           PKG="$RUNNER_TEMP/nim367-package/payload"
           mkdir -p "$PKG"
+          cp "$RUNNER_TEMP/nim367-j/j-record.json" "$PKG"/ 2>/dev/null || true
           cp "$RUNNER_TEMP"/nim367/*.log "$PKG"/ 2>/dev/null || true
           find "$RUNNER_TEMP/nim367" -name '*.xcresult' -exec cp -R {} "$PKG"/ \; 2>/dev/null || true
           echo "{\"verdict\":\"${TSAN_FOCUSED_VERDICT:-UNKNOWN}\"}" > "$PKG/tsan-focused-classification.json"
@@ -1383,52 +2178,189 @@ jobs:
     runs-on: macos-15
     environment: nim367-apple-gate-approval
     steps:
-      - name: Setup Xcode (approved build)
+      - name: Setup Xcode (H1-approved build)
         uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # reviewed release: v1 (v1.7.0)
         with:
-          xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
+          xcode-version: ${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}
 
-      - name: Verify J per-job attestation barrier (selected toolchain, server job record, clean stage root)
+      - name: Verify + persist J attestation record (selected toolchain byte-for-byte vs H1, paginated server job lookup, clean stage root)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ -d gate ] || [ -d sut ]; then
-            echo "::error::J barrier: candidate/SUT directories already exist before this job's first checkout -- stage root is not clean"
+            echo "::error::J barrier: candidate/SUT directories already exist before this job's first checkout -- stage root is not clean -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          XCODE_BUILD=$(xcodebuild -version | grep -o 'Build version [A-Za-z0-9]*' | sed 's/Build version //')
-          if [ "$XCODE_BUILD" != "${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}" ]; then
-            echo "::error::J barrier: this job's selected Xcode build ($XCODE_BUILD) does not equal the H1-approved Xcode build"
+          if [ -z "${{ needs.nim367-h1-verify.outputs.approved_runner_image_os }}" ] || \
+             [ -z "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}" ] || \
+             [ -z "${{ needs.nim367-h1-verify.outputs.approved_shared_state_manifest_sha256 }}" ]; then
+            echo "::error::J barrier: H1-verified approved_runner_image_os/approved_complete_tuple_sha256/approved_shared_state_manifest_sha256 are empty -- BLOCKED_ATTESTATION, never a warning/pass approximation"
             exit 1
           fi
-          if [ "${{ runner.os }}" != "${{ needs.nim367-attest-only.outputs.runner_os }}" ]; then
-            echo "::error::J barrier: runner.os does not match the attest-only barrier's observation"
-            exit 1
-          fi
+
           mkdir -p "$RUNNER_TEMP/nim367-j"
-          curl -sf -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
-            > "$RUNNER_TEMP/nim367-j/jobs-response.json"
-          MATCHED_JOB=$(python3 - "$RUNNER_TEMP/nim367-j/jobs-response.json" <<'PYEOF'
+
+          XCODEBUILD_VERSION=$(xcodebuild -version)
+          XCODEBUILD_HELP_HASH=$(xcodebuild -help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_EXEC=$(xcrun --find swift)
+          SWIFTC_EXEC=$(xcrun --find swiftc)
+          SWIFT_VERSION_HASH=$("$SWIFT_EXEC" --version | shasum -a 256 | cut -d' ' -f1)
+          SWIFTC_VERSION_HASH=$("$SWIFTC_EXEC" --version | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_PACKAGE_HELP_HASH=$("$SWIFT_EXEC" package --help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SWIFT_TEST_HELP_HASH=$("$SWIFT_EXEC" test --help 2>&1 | shasum -a 256 | cut -d' ' -f1)
+          SW_VERS_HASH=$(sw_vers | shasum -a 256 | cut -d' ' -f1)
+          XCODE_BUILD=$(echo "$XCODEBUILD_VERSION" | grep -o 'Build version [A-Za-z0-9]*' | sed 's/Build version //')
+
+          python3 - > "$RUNNER_TEMP/nim367-j/shared-state-manifest.json" <<'PYEOF'
+          import json, os
+          roots = [
+              os.path.expanduser("~/Library/Caches/org.swift.swiftpm"),
+              os.path.expanduser("~/Library/org.swift.swiftpm"),
+              os.path.expanduser("~/.swiftpm"),
+              os.path.expanduser("~/Library/Developer/Xcode/DerivedData"),
+          ]
+          manifest = []
+          for root in sorted(roots):
+              if not os.path.exists(root):
+                  manifest.append({"root": root, "state": "absent"})
+                  continue
+              entries = []
+              for dirpath, dirnames, filenames in os.walk(root):
+                  dirnames.sort()
+                  for name in sorted(filenames):
+                      full = os.path.join(dirpath, name)
+                      try:
+                          size = os.path.getsize(full)
+                      except OSError:
+                          size = -1
+                      entries.append({"path": os.path.relpath(full, root), "size": size})
+              manifest.append({"root": root, "state": "present", "entryCount": len(entries), "entries": entries})
+          print(json.dumps(manifest, sort_keys=True))
+          PYEOF
+          SHARED_STATE_MANIFEST_HASH=$(shasum -a 256 "$RUNNER_TEMP/nim367-j/shared-state-manifest.json" | cut -d' ' -f1)
+
+          cat > "$RUNNER_TEMP/nim367-j/attestation-recompute.json" <<EOF
+          {
+            "schema": "nim367.attest-only.v2",
+            "runId": "${{ github.run_id }}",
+            "runAttempt": "${{ github.run_attempt }}",
+            "job": "${{ github.job }}",
+            "repository": "${{ github.repository }}",
+            "workflowRef": "${{ github.workflow_ref }}",
+            "workflowSha": "${{ github.workflow_sha }}",
+            "headRef": "${{ github.ref }}",
+            "headSha": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "runnerOs": "${{ runner.os }}",
+            "runnerArch": "${{ runner.arch }}",
+            "runnerName": "${{ runner.name }}",
+            "xcodeSelectP": $(xcode-select -p | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "xcodebuildVersion": $(echo "$XCODEBUILD_VERSION" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "xcodebuildHelpHash": "$XCODEBUILD_HELP_HASH",
+            "swiftExecRealpath": "$SWIFT_EXEC",
+            "swiftcExecRealpath": "$SWIFTC_EXEC",
+            "swiftVersionHash": "$SWIFT_VERSION_HASH",
+            "swiftcVersionHash": "$SWIFTC_VERSION_HASH",
+            "swiftPackageHelpHash": "$SWIFT_PACKAGE_HELP_HASH",
+            "swiftTestHelpHash": "$SWIFT_TEST_HELP_HASH",
+            "swVersHash": "$SW_VERS_HASH",
+            "sharedStateManifestSha256": "$SHARED_STATE_MANIFEST_HASH"
+          }
+          EOF
+          OBSERVED_COMPLETE_TUPLE_SHA256=$(shasum -a 256 "$RUNNER_TEMP/nim367-j/attestation-recompute.json" | cut -d' ' -f1)
+
+          if [ "$XCODE_BUILD" != "${{ needs.nim367-h1-verify.outputs.approved_xcode_build }}" ]; then
+            echo "::error::J barrier: this job's selected Xcode build ($XCODE_BUILD) does not equal the H1-approved Xcode build -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+          if [ "${ImageOS:-unset}" != "${{ needs.nim367-h1-verify.outputs.approved_runner_image_os }}" ]; then
+            echo "::error::J barrier: runner image OS (\$ImageOS=${ImageOS:-unset}) does not equal the H1-approved runner image OS -- BLOCKED_ATTESTATION, never a warning"
+            exit 1
+          fi
+          if [ "$SHARED_STATE_MANIFEST_HASH" != "${{ needs.nim367-h1-verify.outputs.approved_shared_state_manifest_sha256 }}" ]; then
+            echo "::error::J barrier: this job's shared-state manifest does not equal the H1-approved manifest byte-for-byte -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+
+          JOBS_ALL="$RUNNER_TEMP/nim367-j/jobs-all.json"
+          echo "[]" > "$JOBS_ALL"
+          NEXT_URL="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100"
+          PAGE=1
+          while [ -n "$NEXT_URL" ]; do
+            HEADERS_FILE="$RUNNER_TEMP/nim367-j/jobs-headers-$PAGE.txt"
+            BODY_FILE="$RUNNER_TEMP/nim367-j/jobs-body-$PAGE.json"
+            curl -sf -D "$HEADERS_FILE" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$NEXT_URL" -o "$BODY_FILE"
+            python3 - "$JOBS_ALL" "$BODY_FILE" <<'PYEOF'
+          import json, sys
+          all_path, body_path = sys.argv[1], sys.argv[2]
+          with open(all_path) as f:
+              all_jobs = json.load(f)
+          with open(body_path) as f:
+              body = json.load(f)
+          all_jobs.extend(body.get("jobs", []))
+          with open(all_path, "w") as f:
+              json.dump(all_jobs, f)
+          PYEOF
+            NEXT_URL=$(grep -i '^link:' "$HEADERS_FILE" | grep -o '<[^>]*>; rel="next"' | sed -E 's/<(.*)>.*/\1/' || true)
+            PAGE=$((PAGE + 1))
+            if [ "$PAGE" -gt 20 ]; then
+              echo "::error::J barrier: pagination exceeded 20 pages, aborting to avoid unbounded loop"
+              exit 1
+            fi
+          done
+
+          MATCH_RESULT=$(python3 - "$JOBS_ALL" <<'PYEOF'
           import json, os, sys
           with open(sys.argv[1]) as f:
-              data = json.load(f)
+              jobs = json.load(f)
           runner_name = os.environ.get("RUNNER_NAME", "")
-          matches = [j for j in data.get("jobs", []) if j.get("runner_name") == runner_name]
-          print("NO_MATCH" if not matches else json.dumps({
-              "id": matches[0].get("id"), "runner_name": matches[0].get("runner_name"),
-              "runner_group_name": matches[0].get("runner_group_name"),
-              "labels": matches[0].get("labels"), "status": matches[0].get("status"),
-          }))
+          matches = [j for j in jobs if j.get("runner_name") == runner_name]
+          if len(matches) == 0:
+              print("NO_MATCH")
+          elif len(matches) > 1:
+              print("AMBIGUOUS_MATCH")
+          else:
+              m = matches[0]
+              print(json.dumps({
+                  "id": m.get("id"), "runner_name": m.get("runner_name"),
+                  "runner_group_name": m.get("runner_group_name"),
+                  "labels": m.get("labels"), "status": m.get("status"),
+              }))
           PYEOF
           )
-          if [ "$MATCHED_JOB" = "NO_MATCH" ]; then
-            echo "::error::J barrier: could not independently locate this job's server-side record via the Actions API by runner_name -- provider_not_exposed for this field on this run"
+
+          if [ "$MATCH_RESULT" = "NO_MATCH" ] || [ "$MATCH_RESULT" = "AMBIGUOUS_MATCH" ]; then
+            echo "::error::J barrier: server job-ID lookup failed ($MATCH_RESULT) after complete pagination -- BLOCKED_ATTESTATION"
             exit 1
           fi
-          echo "J barrier server job record: $MATCHED_JOB"
-          echo "J attestation barrier: OK -- selected toolchain ($XCODE_BUILD), server job record, and clean stage root all verified before checkout"
+
+          python3 - "$RUNNER_TEMP/nim367-j/j-record.json" <<PYEOF
+          import json
+          record = {
+              "schema": "nim367.j.v1",
+              "runId": "${{ github.run_id }}",
+              "runAttempt": "${{ github.run_attempt }}",
+              "job": "${{ github.job }}",
+              "h1RecordSha256": "${{ needs.nim367-h1-verify.outputs.h1_record_sha256 }}",
+              "serverJobRecord": json.loads('''$MATCH_RESULT'''),
+              "selectedXcodeBuild": "$XCODE_BUILD",
+              "observedCompleteTupleSha256": "$OBSERVED_COMPLETE_TUPLE_SHA256",
+              "approvedCompleteTupleSha256Expected": "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}",
+              "sharedStateManifestSha256": "$SHARED_STATE_MANIFEST_HASH",
+              "cleanStageRootVerified": True,
+          }
+          with open("$RUNNER_TEMP/nim367-j/j-record.json", "w") as f:
+              json.dump(record, f, indent=2)
+          PYEOF
+          echo "J barrier server job record: $MATCH_RESULT"
+
+          if [ "$OBSERVED_COMPLETE_TUPLE_SHA256" != "${{ needs.nim367-h1-verify.outputs.approved_complete_tuple_sha256 }}" ]; then
+            echo "::error::J barrier: this job's selected-toolchain complete tuple does not equal H1's approved complete tuple byte-for-byte -- BLOCKED_ATTESTATION"
+            exit 1
+          fi
+
+          echo "J attestation barrier: OK and persisted -- selected toolchain ($XCODE_BUILD), byte-for-byte tuple match, server job record, shared-state manifest, and clean stage root all verified before checkout"
 
       - name: Checkout gate (sealed, workflow_sha)
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
@@ -1473,7 +2405,7 @@ jobs:
           cd gate/packages/ios/NimbalystAppleGate
           set +e
           xcodebuild test \
-            -scheme "${{ vars.APPROVED_GATE_SCHEME }}" \
+            -scheme "${{ needs.nim367-h1-verify.outputs.approved_gate_scheme }}" \
             -destination "$IOS_SIMULATOR_DESTINATION" \
             -skipPackagePluginValidation \
             -disableAutomaticPackageResolution \
@@ -1511,6 +2443,7 @@ jobs:
           set -euo pipefail
           PKG="$RUNNER_TEMP/nim367-package/payload"
           mkdir -p "$PKG"
+          cp "$RUNNER_TEMP/nim367-j/j-record.json" "$PKG"/ 2>/dev/null || true
           cp "$RUNNER_TEMP"/nim367/*.log "$PKG"/ 2>/dev/null || true
           find "$RUNNER_TEMP/nim367" -name '*.xcresult' -exec cp -R {} "$PKG"/ \; 2>/dev/null || true
           echo "{\"verdict\":\"${TSAN_PRODUCTION_VERDICT:-UNKNOWN}\"}" > "$PKG/tsan-production-classification.json"
