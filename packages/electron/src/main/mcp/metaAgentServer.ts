@@ -12,6 +12,7 @@ import { parse as parseUrl } from "url";
 import { randomUUID } from "crypto";
 import { requireMcpAuth } from "./mcpAuth";
 import { resolveProjectPath } from "../utils/workspaceDetection";
+import { resolveTargetWorkspaceBinding } from "./targetWorkspaceBinding";
 
 type CreateSessionArgs = {
   title?: string;
@@ -350,6 +351,11 @@ function createMetaAgentMcpServer(
                 type: "string",
                 description: "The session ID to inspect.",
               },
+              targetWorkspacePath: {
+                type: "string",
+                description:
+                  "Optional explicit workspace path for a session in another project. If omitted, this call remains bound to the caller's workspace.",
+              },
             },
             required: ["sessionId"],
           },
@@ -364,6 +370,11 @@ function createMetaAgentMcpServer(
               sessionId: {
                 type: "string",
                 description: "The session ID to inspect.",
+              },
+              targetWorkspacePath: {
+                type: "string",
+                description:
+                  "Optional explicit workspace path for a session in another project. If omitted, this call remains bound to the caller's workspace.",
               },
             },
             required: ["sessionId"],
@@ -384,6 +395,11 @@ function createMetaAgentMcpServer(
                 type: "string",
                 description: "The follow-up prompt to send.",
               },
+              targetWorkspacePath: {
+                type: "string",
+                description:
+                  "Optional explicit workspace path for the target session. If omitted, this call remains bound to the caller's workspace.",
+              },
             },
             required: ["sessionId", "prompt"],
           },
@@ -398,6 +414,11 @@ function createMetaAgentMcpServer(
               sessionId: {
                 type: "string",
                 description: "The child session waiting for input.",
+              },
+              targetWorkspacePath: {
+                type: "string",
+                description:
+                  "Optional explicit workspace path for the target session. If omitted, this call remains bound to the caller's workspace.",
               },
               promptId: {
                 type: "string",
@@ -494,7 +515,7 @@ function createMetaAgentMcpServer(
                 type: "text",
                 text: await toolFns.getSessionStatus(
                   aiSessionId,
-                  effectiveWorkspaceId,
+                  resolveTargetWorkspaceBinding(effectiveWorkspaceId, args),
                   args?.sessionId as string
                 ),
               },
@@ -508,7 +529,7 @@ function createMetaAgentMcpServer(
                 type: "text",
                 text: await toolFns.getSessionResult(
                   aiSessionId,
-                  effectiveWorkspaceId,
+                  resolveTargetWorkspaceBinding(effectiveWorkspaceId, args),
                   args?.sessionId as string
                 ),
               },
@@ -522,7 +543,7 @@ function createMetaAgentMcpServer(
                 type: "text",
                 text: await toolFns.sendPrompt(
                   aiSessionId,
-                  effectiveWorkspaceId,
+                  resolveTargetWorkspaceBinding(effectiveWorkspaceId, args),
                   args?.sessionId as string,
                   args?.prompt as string
                 ),
@@ -535,7 +556,11 @@ function createMetaAgentMcpServer(
             content: [
               {
                 type: "text",
-                text: await toolFns.respondToPrompt(aiSessionId, effectiveWorkspaceId, args),
+                text: await toolFns.respondToPrompt(
+                  aiSessionId,
+                  resolveTargetWorkspaceBinding(effectiveWorkspaceId, args),
+                  args
+                ),
               },
             ],
             isError: false,

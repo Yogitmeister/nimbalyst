@@ -16,6 +16,13 @@ import {
 } from "@nimbalyst/runtime";
 import type { SessionMeta } from "@nimbalyst/runtime";
 import { requireMcpAuth } from "./mcpAuth";
+import { resolveTargetWorkspaceBinding } from "./targetWorkspaceBinding";
+
+const TARGET_WORKSPACE_PATH_SCHEMA = {
+  type: "string",
+  description:
+    "Optional explicit workspace path for an operation in another project. If omitted, this call remains bound to the caller's workspace.",
+} as const;
 
 // ─── Transport tracking ─────────────────────────────────────────────
 
@@ -190,7 +197,7 @@ async function handleGetSessionSummary(
   const sessionId = targetSessionId || currentSessionId;
 
   const session = await AISessionsRepository.get(sessionId);
-  if (!session) {
+  if (!session || session.workspacePath !== workspaceId) {
     return `Error: Session ${sessionId} not found`;
   }
 
@@ -701,6 +708,7 @@ function createSessionContextMcpServer(
                 description:
                   "ID of the session to summarize. If omitted, summarizes the current session. Use list_recent_sessions to find session IDs.",
               },
+              targetWorkspacePath: TARGET_WORKSPACE_PATH_SCHEMA,
             },
             required: [],
           },
@@ -717,6 +725,7 @@ function createSessionContextMcpServer(
                 description:
                   "ID of the workstream parent session. If omitted, uses the current session's parent workstream.",
               },
+              targetWorkspacePath: TARGET_WORKSPACE_PATH_SCHEMA,
             },
             required: [],
           },
@@ -754,6 +763,7 @@ function createSessionContextMcpServer(
                 description:
                   "If true, include archived sessions in the results. Defaults to false. Archived sessions are marked with [ARCHIVED] in the output.",
               },
+              targetWorkspacePath: TARGET_WORKSPACE_PATH_SCHEMA,
             },
             required: [],
           },
@@ -815,6 +825,7 @@ function createSessionContextMcpServer(
                 description:
                   "ID of the session to update. Use list_recent_sessions to find session IDs.",
               },
+              targetWorkspacePath: TARGET_WORKSPACE_PATH_SCHEMA,
               phase: {
                 type: ["string", "null"],
                 enum: [
@@ -852,10 +863,11 @@ function createSessionContextMcpServer(
     try {
       switch (toolName) {
         case "get_session_summary": {
+          const targetWorkspaceId = resolveTargetWorkspaceBinding(workspaceId, args);
           const result = await handleGetSessionSummary(
             args?.sessionId as string | undefined,
             aiSessionId,
-            workspaceId
+            targetWorkspaceId
           );
           return {
             content: [{ type: "text", text: result }],
@@ -864,10 +876,11 @@ function createSessionContextMcpServer(
         }
 
         case "get_workstream_overview": {
+          const targetWorkspaceId = resolveTargetWorkspaceBinding(workspaceId, args);
           const result = await handleGetWorkstreamOverview(
             args?.workstreamId as string | undefined,
             aiSessionId,
-            workspaceId
+            targetWorkspaceId
           );
           return {
             content: [{ type: "text", text: result }],
@@ -876,6 +889,7 @@ function createSessionContextMcpServer(
         }
 
         case "list_recent_sessions": {
+          const targetWorkspaceId = resolveTargetWorkspaceBinding(workspaceId, args);
           const limit = Math.min(
             Math.max((args?.limit as number) || 10, 1),
             250
@@ -891,7 +905,7 @@ function createSessionContextMcpServer(
             args?.query as string | undefined,
             limit,
             offset,
-            workspaceId,
+            targetWorkspaceId,
             aiSessionId,
             includeArchived,
             searchField
@@ -965,6 +979,15 @@ function createSessionContextMcpServer(
           if (!sessionId) {
             return {
               content: [{ type: "text", text: "Error: sessionId is required" }],
+              isError: true,
+            };
+          }
+
+          const targetWorkspaceId = resolveTargetWorkspaceBinding(workspaceId, args);
+          const targetSession = await AISessionsRepository.get(sessionId);
+          if (!targetSession || targetSession.workspacePath !== targetWorkspaceId) {
+            return {
+              content: [{ type: "text", text: `Error: Session ${sessionId} not found` }],
               isError: true,
             };
           }

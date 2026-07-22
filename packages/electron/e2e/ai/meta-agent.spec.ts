@@ -691,3 +691,72 @@ test('create_session rejects conflicting useWorktree and worktreeId', async () =
     })
   ).rejects.toThrow(/cannot be combined/i);
 });
+
+test('target session tools require an explicit matching workspace binding across projects', async () => {
+  const targetWorkspacePath = await createTempWorkspace();
+  const targetSessionId = `cross-workspace-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  try {
+    const insertResult = await invokeElectron<{ success: boolean; error?: string }>(
+      page,
+      'test:insert-session',
+      {
+        id: targetSessionId,
+        workspaceId: targetWorkspacePath,
+        title: 'Cross-workspace repair target',
+        provider: 'claude-code',
+        model: 'claude-code:opus',
+        status: 'idle',
+      }
+    );
+    expect(insertResult.success, insertResult.error).toBe(true);
+
+    await expect(
+      callMetaAgentTool(metaAgentClient, 'get_session_status', {
+        sessionId: targetSessionId,
+      })
+    ).rejects.toThrow(/not found/i);
+
+    await expect(
+      callMetaAgentTool(metaAgentClient, 'get_session_status', {
+        sessionId: targetSessionId,
+        targetWorkspacePath: workspacePath,
+      })
+    ).rejects.toThrow(/not found/i);
+
+    const status = await callMetaAgentTool<{ sessionId: string; status: string }>(
+      metaAgentClient,
+      'get_session_status',
+      {
+        sessionId: targetSessionId,
+        targetWorkspacePath,
+      }
+    );
+    expect(status).toMatchObject({ sessionId: targetSessionId, status: 'idle' });
+
+    const sent = await callMetaAgentTool<{
+      sessionId: string;
+      prompt: string;
+      bypassedExecutionForTest?: boolean;
+    }>(metaAgentClient, 'send_prompt', {
+      sessionId: targetSessionId,
+      targetWorkspacePath,
+      prompt: 'Execute the explicitly bound cross-workspace task',
+    });
+    expect(sent).toMatchObject({
+      sessionId: targetSessionId,
+      prompt: 'Execute the explicitly bound cross-workspace task',
+      bypassedExecutionForTest: true,
+    });
+
+    const result = await callMetaAgentTool<{ sessionId: string; userPrompts: string[] }>(
+      metaAgentClient,
+      'get_session_result',
+      { sessionId: targetSessionId, targetWorkspacePath }
+    );
+    expect(result.sessionId).toBe(targetSessionId);
+    expect(result.userPrompts).toContain('Execute the explicitly bound cross-workspace task');
+  } finally {
+    await fs.rm(targetWorkspacePath, { recursive: true, force: true }).catch(() => undefined);
+  }
+});
