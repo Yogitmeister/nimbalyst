@@ -264,23 +264,117 @@ jobs:
   # NIM-367 manual acceptance gate. Every job below runs only on an explicit
   # workflow_dispatch and reads its OWNER-FILLED IMMUTABLE identity values
   # (approved gate ref/commit/tree/blobs, approved scheme, approved Xcode
-  # build, pinned action commits, TSan fallback mode/allowlist) from the
-  # `nim367-apple-gate-approval` protected GitHub Environment. Those values
-  # are populated by a separate owner-authority Phase D record, never by
-  # this workflow file itself -- see
+  # build, TSan fallback mode/allowlist) from the `nim367-apple-gate-approval`
+  # protected GitHub Environment. Those values are populated by a separate
+  # owner-authority Phase D record, never by this workflow file itself -- see
   # D:/!! CLAUDE/_pending/v12_nim367_apple_ci_gate_implementation_brief.md,
-  # "Independent gate-revision trust anchor". A `uses:` ref written here as
-  # `<OWNER-FILLED-40HEX-COMMIT>` is a literal placeholder (not a fabricated
-  # SHA) and is intentionally not a runnable ref until Phase D fills it.
+  # "Independent gate-revision trust anchor".
   #
-  # This job set intentionally does not claim GATE_EVIDENCE_PASS or
-  # APPLE_ACCEPTED anywhere -- those verdicts require real Apple runtime
-  # evidence that only exists after an authorized dispatch executes these
-  # steps on real hosted-macOS hardware.
+  # Action pins below are resolved, verifiable upstream commit SHAs (recorded
+  # with source in
+  # D:/!! CLAUDE/_pending/v12_nim367_canonical_successor_owner_completion_20260723.md),
+  # not placeholders -- this closes the action-pin gap flagged by
+  # v12_nim367_canonical_successor_owner_brief_20260723.md. They still require
+  # separate Phase D re-approval before any real dispatch, per "Immutable
+  # action supply-chain lock" in the normative Apple contract.
+  #
+  # `nim367-attest-only` (below) implements the credit-contract's H0/H1/J
+  # attest-only barrier structurally: it runs first, performs no checkout of
+  # candidate or SUT, and publishes host/tool/runner observations as job
+  # outputs. Every candidate job re-observes the same tuple on its own runner
+  # and fails closed on any mismatch before its own checkout step -- this is
+  # the mechanically checkable part of the "J" per-job attestation. The
+  # cryptographically signed H0 pre-dispatch envelope and H1 post-attestation
+  # lease described in
+  # D:/!! CLAUDE/_pending/v12_nim367_hosted_macos_credit_contract_revision_20260722.md
+  # remain external owner-authority records this workflow file cannot create;
+  # candidate jobs' `environment: nim367-apple-gate-approval` protection rule
+  # (required reviewers) is the GitHub-native approximation of the H1 barrier
+  # until that owner record exists.
+  #
+  # This job set intentionally does not claim GATE_EVIDENCE_PASS,
+  # APPLE_VERIFICATION_PASS, or APPLE_ACCEPTED anywhere -- those verdicts
+  # require real Apple runtime evidence that only exists after an authorized
+  # dispatch executes these steps on real hosted-macOS hardware.
+
+  nim367-attest-only:
+    name: 'NIM-367 Gate 0: attest-only barrier (no candidate/SUT checkout)'
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    environment: nim367-apple-gate-approval
+    permissions:
+      contents: read
+    outputs:
+      xcode_build: ${{ steps.attest.outputs.xcode_build }}
+      swift_version_hash: ${{ steps.attest.outputs.swift_version_hash }}
+      swiftc_version_hash: ${{ steps.attest.outputs.swiftc_version_hash }}
+      runner_os: ${{ steps.attest.outputs.runner_os }}
+      attestation_manifest_sha256: ${{ steps.attest.outputs.attestation_manifest_sha256 }}
+    steps:
+      - name: Attest-only host/tool/server observation (no checkout)
+        id: attest
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nim367-attest"
+
+          SW_VERS=$(sw_vers)
+          UNAME_A=$(uname -a)
+          XCODE_SELECT_P=$(xcode-select -p)
+          XCODEBUILD_VERSION=$(xcodebuild -version)
+          SWIFT_EXEC=$(xcrun --find swift)
+          SWIFTC_EXEC=$(xcrun --find swiftc)
+          SWIFT_VERSION_OUT=$("$SWIFT_EXEC" --version)
+          SWIFTC_VERSION_OUT=$("$SWIFTC_EXEC" --version)
+          SWIFT_VERSION_HASH=$(echo "$SWIFT_VERSION_OUT" | shasum -a 256 | cut -d' ' -f1)
+          SWIFTC_VERSION_HASH=$(echo "$SWIFTC_VERSION_OUT" | shasum -a 256 | cut -d' ' -f1)
+
+          cat > "$RUNNER_TEMP/nim367-attest/attestation.json" <<EOF
+          {
+            "schema": "nim367.attest-only.v1",
+            "runId": "${{ github.run_id }}",
+            "runAttempt": "${{ github.run_attempt }}",
+            "job": "${{ github.job }}",
+            "repository": "${{ github.repository }}",
+            "workflowRef": "${{ github.workflow_ref }}",
+            "workflowSha": "${{ github.workflow_sha }}",
+            "headRef": "${{ github.ref }}",
+            "headSha": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "runnerOs": "${{ runner.os }}",
+            "runnerArch": "${{ runner.arch }}",
+            "runnerName": "${{ runner.name }}",
+            "xcodeSelectP": $(echo "$XCODE_SELECT_P" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "xcodebuildVersion": $(echo "$XCODEBUILD_VERSION" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read().strip()))"),
+            "swiftExecRealpath": "$SWIFT_EXEC",
+            "swiftcExecRealpath": "$SWIFTC_EXEC",
+            "swiftVersionHash": "$SWIFT_VERSION_HASH",
+            "swiftcVersionHash": "$SWIFTC_VERSION_HASH"
+          }
+          EOF
+
+          MANIFEST_HASH=$(shasum -a 256 "$RUNNER_TEMP/nim367-attest/attestation.json" | cut -d' ' -f1)
+          XCODE_BUILD=$(echo "$XCODEBUILD_VERSION" | grep -o 'Build version [A-Za-z0-9]*' | sed 's/Build version //')
+
+          echo "xcode_build=$XCODE_BUILD" >> "$GITHUB_OUTPUT"
+          echo "swift_version_hash=$SWIFT_VERSION_HASH" >> "$GITHUB_OUTPUT"
+          echo "swiftc_version_hash=$SWIFTC_VERSION_HASH" >> "$GITHUB_OUTPUT"
+          echo "runner_os=${{ runner.os }}" >> "$GITHUB_OUTPUT"
+          echo "attestation_manifest_sha256=$MANIFEST_HASH" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::This job performed no candidate or SUT checkout. Observed only pre-installed host/tool state. Full H0/H1 signed-record verification remains external owner authority (see v12_nim367_hosted_macos_credit_contract_revision_20260722.md)."
+
+      - name: Upload attest-only evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # reviewed release: v4
+        with:
+          name: nim367-attest-only-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nim367-attest
+          overwrite: false
+          retention-days: 90
 
   nim367-identity-compile-focused:
     name: 'NIM-367 Gate 1: identity + strict compile + focused'
     if: github.event_name == 'workflow_dispatch'
+    needs: nim367-attest-only
     runs-on: macos-15
     environment: nim367-apple-gate-approval
     permissions:
@@ -288,6 +382,22 @@ jobs:
     env:
       NIM367_REPAIR_SHA: ${{ inputs.repair_sha }}
     steps:
+      - name: Verify J attestation barrier (re-observe host/tool tuple, compare to attest-only)
+        run: |
+          set -euo pipefail
+          OBSERVED_SWIFT_HASH=$(xcrun swift --version | shasum -a 256 | cut -d' ' -f1)
+          OBSERVED_SWIFTC_HASH=$(xcrun swiftc --version | shasum -a 256 | cut -d' ' -f1)
+          if [ "$OBSERVED_SWIFT_HASH" != "${{ needs.nim367-attest-only.outputs.swift_version_hash }}" ] || \
+             [ "$OBSERVED_SWIFTC_HASH" != "${{ needs.nim367-attest-only.outputs.swiftc_version_hash }}" ]; then
+            echo "::error::this job's Swift/SwiftC tuple does not match the attest-only barrier's observation (J record mismatch)"
+            exit 1
+          fi
+          if [ "${{ runner.os }}" != "${{ needs.nim367-attest-only.outputs.runner_os }}" ]; then
+            echo "::error::this job's runner.os does not match the attest-only barrier's observation"
+            exit 1
+          fi
+          echo "J attestation barrier: OK (matches attest-only observation ${{ needs.nim367-attest-only.outputs.attestation_manifest_sha256 }})"
+
       - name: Verify exact-SHA and identity-lock inputs
         run: |
           set -euo pipefail
@@ -321,7 +431,7 @@ jobs:
           fi
 
       - name: Checkout gate (sealed, workflow_sha)
-        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
         with:
           ref: ${{ github.workflow_sha }}
           path: gate
@@ -329,7 +439,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout SUT (sealed, exact repair SHA)
-        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
         with:
           ref: ${{ inputs.repair_sha }}
           path: sut
@@ -370,7 +480,7 @@ jobs:
           done
 
       - name: Setup Xcode (approved build)
-        uses: maxim-lobanov/setup-xcode@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # reviewed release: v1 (v1.7.0)
         with:
           xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
 
@@ -645,7 +755,7 @@ jobs:
 
       - name: Upload gate 1 evidence
         if: always()
-        uses: actions/upload-artifact@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: owner-selected
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # reviewed release: v4
         with:
           name: nim367-compile-focused-${{ inputs.repair_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/nim367-package
@@ -655,12 +765,24 @@ jobs:
   nim367-deterministic-stress:
     name: 'NIM-367 Gate 2: deterministic 20x stress'
     if: github.event_name == 'workflow_dispatch'
-    needs: nim367-identity-compile-focused
+    needs: [nim367-attest-only, nim367-identity-compile-focused]
     runs-on: macos-15
     environment: nim367-apple-gate-approval
     steps:
+      - name: Verify J attestation barrier (re-observe host/tool tuple, compare to attest-only)
+        run: |
+          set -euo pipefail
+          OBSERVED_SWIFT_HASH=$(xcrun swift --version | shasum -a 256 | cut -d' ' -f1)
+          OBSERVED_SWIFTC_HASH=$(xcrun swiftc --version | shasum -a 256 | cut -d' ' -f1)
+          if [ "$OBSERVED_SWIFT_HASH" != "${{ needs.nim367-attest-only.outputs.swift_version_hash }}" ] || \
+             [ "$OBSERVED_SWIFTC_HASH" != "${{ needs.nim367-attest-only.outputs.swiftc_version_hash }}" ]; then
+            echo "::error::this job's Swift/SwiftC tuple does not match the attest-only barrier's observation (J record mismatch)"
+            exit 1
+          fi
+          echo "J attestation barrier: OK"
+
       - name: Checkout SUT (sealed, exact repair SHA)
-        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
         with:
           ref: ${{ inputs.repair_sha }}
           path: sut
@@ -668,7 +790,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Xcode (approved build)
-        uses: maxim-lobanov/setup-xcode@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # reviewed release: v1 (v1.7.0)
         with:
           xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
 
@@ -724,7 +846,7 @@ jobs:
 
       - name: Upload gate 2 evidence
         if: always()
-        uses: actions/upload-artifact@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: owner-selected
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # reviewed release: v4
         with:
           name: nim367-deterministic-stress-${{ inputs.repair_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/nim367-package
@@ -734,12 +856,24 @@ jobs:
   nim367-production-urlsession-stress:
     name: 'NIM-367 Gate 3: production URLSession/WebSocket seeded stress'
     if: github.event_name == 'workflow_dispatch'
-    needs: nim367-identity-compile-focused
+    needs: [nim367-attest-only, nim367-identity-compile-focused]
     runs-on: macos-15
     environment: nim367-apple-gate-approval
     steps:
+      - name: Verify J attestation barrier (re-observe host/tool tuple, compare to attest-only)
+        run: |
+          set -euo pipefail
+          OBSERVED_SWIFT_HASH=$(xcrun swift --version | shasum -a 256 | cut -d' ' -f1)
+          OBSERVED_SWIFTC_HASH=$(xcrun swiftc --version | shasum -a 256 | cut -d' ' -f1)
+          if [ "$OBSERVED_SWIFT_HASH" != "${{ needs.nim367-attest-only.outputs.swift_version_hash }}" ] || \
+             [ "$OBSERVED_SWIFTC_HASH" != "${{ needs.nim367-attest-only.outputs.swiftc_version_hash }}" ]; then
+            echo "::error::this job's Swift/SwiftC tuple does not match the attest-only barrier's observation (J record mismatch)"
+            exit 1
+          fi
+          echo "J attestation barrier: OK"
+
       - name: Checkout gate (sealed, workflow_sha)
-        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
         with:
           ref: ${{ github.workflow_sha }}
           path: gate
@@ -747,7 +881,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout SUT (sealed, exact repair SHA)
-        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
         with:
           ref: ${{ inputs.repair_sha }}
           path: sut
@@ -755,7 +889,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Xcode (approved build)
-        uses: maxim-lobanov/setup-xcode@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # reviewed release: v1 (v1.7.0)
         with:
           xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
 
@@ -813,7 +947,7 @@ jobs:
 
       - name: Upload gate 3 evidence
         if: always()
-        uses: actions/upload-artifact@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: owner-selected
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # reviewed release: v4
         with:
           name: nim367-production-urlsession-stress-${{ inputs.repair_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/nim367-package
@@ -823,12 +957,24 @@ jobs:
   nim367-tsan-focused:
     name: 'NIM-367 Gate 4a: TSan focused'
     if: github.event_name == 'workflow_dispatch'
-    needs: nim367-identity-compile-focused
+    needs: [nim367-attest-only, nim367-identity-compile-focused]
     runs-on: macos-15
     environment: nim367-apple-gate-approval
     steps:
+      - name: Verify J attestation barrier (re-observe host/tool tuple, compare to attest-only)
+        run: |
+          set -euo pipefail
+          OBSERVED_SWIFT_HASH=$(xcrun swift --version | shasum -a 256 | cut -d' ' -f1)
+          OBSERVED_SWIFTC_HASH=$(xcrun swiftc --version | shasum -a 256 | cut -d' ' -f1)
+          if [ "$OBSERVED_SWIFT_HASH" != "${{ needs.nim367-attest-only.outputs.swift_version_hash }}" ] || \
+             [ "$OBSERVED_SWIFTC_HASH" != "${{ needs.nim367-attest-only.outputs.swiftc_version_hash }}" ]; then
+            echo "::error::this job's Swift/SwiftC tuple does not match the attest-only barrier's observation (J record mismatch)"
+            exit 1
+          fi
+          echo "J attestation barrier: OK"
+
       - name: Checkout SUT (sealed, exact repair SHA)
-        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
         with:
           ref: ${{ inputs.repair_sha }}
           path: sut
@@ -836,7 +982,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Xcode (approved build)
-        uses: maxim-lobanov/setup-xcode@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # reviewed release: v1 (v1.7.0)
         with:
           xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
 
@@ -920,7 +1066,7 @@ jobs:
 
       - name: Upload gate 4a evidence
         if: always()
-        uses: actions/upload-artifact@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: owner-selected
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # reviewed release: v4
         with:
           name: nim367-tsan-focused-${{ inputs.repair_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/nim367-package
@@ -930,12 +1076,24 @@ jobs:
   nim367-tsan-production:
     name: 'NIM-367 Gate 4b: TSan production'
     if: github.event_name == 'workflow_dispatch'
-    needs: nim367-identity-compile-focused
+    needs: [nim367-attest-only, nim367-identity-compile-focused]
     runs-on: macos-15
     environment: nim367-apple-gate-approval
     steps:
+      - name: Verify J attestation barrier (re-observe host/tool tuple, compare to attest-only)
+        run: |
+          set -euo pipefail
+          OBSERVED_SWIFT_HASH=$(xcrun swift --version | shasum -a 256 | cut -d' ' -f1)
+          OBSERVED_SWIFTC_HASH=$(xcrun swiftc --version | shasum -a 256 | cut -d' ' -f1)
+          if [ "$OBSERVED_SWIFT_HASH" != "${{ needs.nim367-attest-only.outputs.swift_version_hash }}" ] || \
+             [ "$OBSERVED_SWIFTC_HASH" != "${{ needs.nim367-attest-only.outputs.swiftc_version_hash }}" ]; then
+            echo "::error::this job's Swift/SwiftC tuple does not match the attest-only barrier's observation (J record mismatch)"
+            exit 1
+          fi
+          echo "J attestation barrier: OK"
+
       - name: Checkout gate (sealed, workflow_sha)
-        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
         with:
           ref: ${{ github.workflow_sha }}
           path: gate
@@ -943,7 +1101,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout SUT (sealed, exact repair SHA)
-        uses: actions/checkout@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # reviewed release: v5.0.0
         with:
           ref: ${{ inputs.repair_sha }}
           path: sut
@@ -951,7 +1109,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Xcode (approved build)
-        uses: maxim-lobanov/setup-xcode@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: v1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # reviewed release: v1 (v1.7.0)
         with:
           xcode-version: ${{ vars.APPROVED_XCODE_BUILD }}
 
@@ -1028,7 +1186,7 @@ jobs:
 
       - name: Upload gate 4b evidence
         if: always()
-        uses: actions/upload-artifact@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: owner-selected
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # reviewed release: v4
         with:
           name: nim367-tsan-production-${{ inputs.repair_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/nim367-package
@@ -1039,6 +1197,7 @@ jobs:
     name: 'NIM-367 Gate 5: final evidence collation (not Apple acceptance)'
     if: always() && github.event_name == 'workflow_dispatch'
     needs:
+      - nim367-attest-only
       - nim367-identity-compile-focused
       - nim367-deterministic-stress
       - nim367-production-urlsession-stress
@@ -1050,7 +1209,7 @@ jobs:
       contents: read
     steps:
       - name: Download all gate artifacts
-        uses: actions/download-artifact@<OWNER-FILLED-40HEX-COMMIT> # final evidence collation only
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # reviewed release: v4, final evidence collation only
         with:
           path: ${{ runner.temp }}/nim367-artifacts
 
@@ -1084,7 +1243,7 @@ jobs:
           PYEOF
 
       - name: Upload evidence summary
-        uses: actions/upload-artifact@<OWNER-FILLED-40HEX-COMMIT> # reviewed release: owner-selected
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # reviewed release: v4
         with:
           name: nim367-evidence-summary-${{ inputs.repair_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/nim367-summary
