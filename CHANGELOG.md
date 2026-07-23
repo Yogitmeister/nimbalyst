@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Changes to existing functionality go here -->
 
 ### Fixed
-<!-- Bug fixes go here -->
+- Native child sessions created with a worktree no longer fail to run their queued initial prompt with "Session not found" — the dispatch now routes through the canonical workspace while preserving worktree execution.
 
 ### Removed
 <!-- Removed features go here -->

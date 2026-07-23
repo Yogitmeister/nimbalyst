@@ -519,7 +519,7 @@ export class MetaAgentService {
     }
 
     if (initialPrompt && !shouldBypassExecution) {
-      await this.aiService.triggerQueuedPromptProcessingForSession(sessionId, worktreePath || workspaceId);
+      await this.aiService.triggerQueuedPromptProcessingForSession(sessionId, workspaceId);
     }
 
     return {
