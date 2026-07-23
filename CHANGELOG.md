@@ -59,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stopping a Codex agent session now reliably cancels it instead of bouncing back to "running".
 - SQLite databases open in the browser again instead of failing while loading the database engine.
 - Shared documents open reliably for accounts with legacy shares; the migration now runs in the background with status and retry controls.
+- Model controls now expose only supported reasoning options and distinguish adaptive thinking from context size.
 - Pull request rows now show the time of the latest real activity instead of a misleading timestamp.
 
 ### Removed
