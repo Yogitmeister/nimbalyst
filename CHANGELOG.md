@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
-- Delegated agent sessions now report their resolved launch model and reasoning settings, accept auditable priority prompts without stale-turn interrupts, and automatically resume ordinary queued prompts after turns and restarts.
+- Delegated agent sessions now report their resolved launch model and reasoning settings, accept auditable priority prompts without stale-turn interrupts, and automatically resume ordinary queued prompts after turns and restarts without overlapping an interrupted priority turn.
 - Session-pane workstream and worktree labels now reveal their full names on hover.
 - Expanded workstream rows now show external session renames immediately without reloading the session view.
 - Empty workstreams now remain explicit containers instead of exposing another session's transcript or becoming draggable sessions.
