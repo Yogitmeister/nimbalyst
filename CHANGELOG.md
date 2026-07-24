@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded workstream rows now show external session renames immediately without reloading the session view.
 - Empty workstreams now remain explicit containers instead of exposing another session's transcript or becoming draggable sessions.
 - Agent-mode document embeds now recover when their target file is created after the document opens.
-- Orchestrator sessions can launch isolated worktree agents in another loaded project and retain status, result, queue, prompt, and reply control.
+- Orchestrator sessions can launch isolated worktree agents from their source project into another loaded project and retain status, result, queue, prompt, and reply control.
 - Automations no longer rerun the same scheduled occurrence after restarting while a run is waiting or fails.
 - Pinning or unpinning a session inside an expanded workstream now updates its icon, menu, and position immediately.
 - Voice Mode now explains blocked or missing microphones on Windows and links directly to microphone privacy settings.
