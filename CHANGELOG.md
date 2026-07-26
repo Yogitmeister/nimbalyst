@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- Opening a second Nimbalyst instance no longer disrupts the running app's agent controls.
 - Structured agent prompts now retain their actionable state until exactly one answer settles and reliably resume their waiting session.
 - Delegated agent sessions now report their resolved launch model and reasoning settings, accept auditable priority prompts without stale-turn interrupts, and automatically resume ordinary queued prompts after turns, restarts, and interactive replies without overlapping an interrupted priority turn.
 - Session-pane workstream and worktree labels now reveal their full names on hover.
