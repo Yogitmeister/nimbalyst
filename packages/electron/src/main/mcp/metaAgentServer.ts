@@ -280,7 +280,7 @@ export const META_AGENT_TOOL_DEFS: Array<{
           type: "string",
           get enum() { return claudeCodeBackendIds(); },
           description:
-            "Optional explicit Ollama Claude-Agent backend profile id to route this claude-code child through instead of Anthropic. Omit model when set (it is derived from the backend); if both are set they must agree. Fails closed on an unknown id or a mismatched model/provider rather than silently running on Anthropic.",
+            "Optional explicit non-Anthropic Claude Agent backend profile id (Ollama or Codex) to route this claude-code child through instead of Anthropic. Omit model when set (it is derived from the backend); if both are set they must agree. Fails closed on an unknown id or a mismatched model/provider rather than silently running on Anthropic.",
         },
       },
     },
@@ -358,7 +358,7 @@ export const META_AGENT_TOOL_DEFS: Array<{
           type: "string",
           get enum() { return claudeCodeBackendIds(); },
           description:
-            "Optional explicit Ollama Claude-Agent backend profile id to route this claude-code session through instead of Anthropic. Omit model when set (it is derived from the backend); if both are set they must agree. Fails closed on an unknown id or a mismatched model/provider rather than silently running on Anthropic.",
+            "Optional explicit non-Anthropic Claude Agent backend profile id (Ollama or Codex) to route this claude-code session through instead of Anthropic. Omit model when set (it is derived from the backend); if both are set they must agree. Fails closed on an unknown id or a mismatched model/provider rather than silently running on Anthropic.",
         },
         notifyOnComplete: {
           type: "boolean",

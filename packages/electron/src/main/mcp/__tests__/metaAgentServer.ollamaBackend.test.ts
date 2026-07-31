@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { CLAUDE_CODE_BACKENDS } from '@nimbalyst/runtime/ai/server';
 import { META_AGENT_TOOL_DEFS } from '../metaAgentServer';
 
-describe('meta-agent Ollama Claude Code backend schema', () => {
+describe('meta-agent Claude Code backend schema', () => {
   for (const toolName of ['create_session', 'spawn_session']) {
     it(`exposes the exact backend profile on ${toolName}`, () => {
       const tool = META_AGENT_TOOL_DEFS.find((candidate) => candidate.name === toolName);
@@ -10,23 +11,13 @@ describe('meta-agent Ollama Claude Code backend schema', () => {
         enum?: string[];
       } | undefined;
 
+      // Asserted against the live registry rather than a second hardcoded
+      // list, so this test can't itself drift out of sync with a new
+      // provider family the way its Ollama-only literal enum just did.
       expect(property).toEqual(
         expect.objectContaining({
           type: 'string',
-          enum: [
-            'ollama-glm-5-2-cloud',
-            'ollama-gpt-oss-20b-cloud',
-            'ollama-nemotron-3-nano-cloud',
-            'ollama-deepseek-v4-flash-cloud',
-            'ollama-qwen3-5-cloud',
-            'ollama-nemotron-3-super-cloud',
-            'ollama-glm-5-1-cloud',
-            'ollama-minimax-m2-7-cloud',
-            'ollama-kimi-k2-6-cloud',
-            'ollama-kimi-k2-7-code-cloud',
-            'ollama-minimax-m3-cloud',
-            'ollama-deepseek-v4-pro-cloud',
-          ],
+          enum: CLAUDE_CODE_BACKENDS.map((backend) => backend.id),
         })
       );
     });
