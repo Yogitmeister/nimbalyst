@@ -9,6 +9,7 @@ import {
   type ClaudeCodeBackend,
 } from '@nimbalyst/runtime/ai/server';
 import { preflightOllamaClaudeCodeBackend } from './ai/OllamaClaudeCodePreflight';
+import { preflightCodexClaudeCodeBackend } from './ai/CodexClaudeCodePreflight';
 import type { AIProviderType } from '@nimbalyst/runtime/ai/server/types';
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
 import type { EffortLevel, ThinkingMode } from '@nimbalyst/runtime/ai/server/effortLevels';
@@ -108,25 +109,44 @@ interface CreateChildSessionArgs {
 interface PublicClaudeCodeBackend {
   id: string;
   persistedModel: string;
-  transportProfile: 'litellm';
-  provider: 'ollama';
+  transportProfile: 'litellm' | 'cliproxyapi';
+  provider: 'ollama' | 'codex-proxy';
   model: string;
   upstreamModel: string;
   downstreamAlias: string;
   baseUrl: string;
 }
 
+function transportProfileForBackend(provider: ClaudeCodeBackend['provider']): 'litellm' | 'cliproxyapi' {
+  return provider === 'codex-proxy' ? 'cliproxyapi' : 'litellm';
+}
+
 function toPublicClaudeCodeBackend(backend: ClaudeCodeBackend): PublicClaudeCodeBackend {
   return {
     id: backend.id,
     persistedModel: backend.persistedModel,
-    transportProfile: 'litellm',
+    transportProfile: transportProfileForBackend(backend.provider),
     provider: backend.provider,
     model: backend.model,
     upstreamModel: backend.upstreamModel,
     downstreamAlias: backend.claudeModelAlias,
     baseUrl: backend.baseUrl,
   };
+}
+
+/**
+ * Dispatch to the correct provider-specific preflight. Both underlying
+ * checks share the same read-only, fail-closed contract (see
+ * OllamaClaudeCodePreflight.ts / CodexClaudeCodePreflight.ts doc comments):
+ * neither starts nor repairs its gateway, and callers must run this before
+ * any worktree, session, or queue-row mutation.
+ */
+async function preflightClaudeCodeBackend(backend: ClaudeCodeBackend): Promise<void> {
+  if (backend.provider === 'codex-proxy') {
+    await preflightCodexClaudeCodeBackend(backend);
+    return;
+  }
+  await preflightOllamaClaudeCodeBackend(backend);
 }
 
 interface SendPromptNowArgs {
@@ -267,17 +287,22 @@ async function resolveChildSessionModelAndProvider(
     finalModelSource = 'requested';
   }
 
-  // Only consult backend resolution when there is an actual Ollama signal
-  // (an explicit backend id, or a canonical model that already carries the
-  // ollama-* identity). The overwhelming majority of child sessions are
-  // ordinary Anthropic/openai-codex/extension-agent spawns with neither, and
-  // skipping the call for them keeps this path a no-op dependency for those
-  // sessions -- matching every other call site in this file, which resolves
-  // claude-code backends the same way. Missing means an ordinary Anthropic
-  // session; a present signal fails closed on any inconsistency (unknown id,
-  // mismatched model) rather than silently falling back.
+  // Only consult backend resolution when there is an actual non-Anthropic
+  // claude-code brain signal (an explicit backend id, or a canonical model
+  // that already carries the ollama-* or codex-* identity -- NOTE: this is
+  // the `claude-code:codex-*` in-app brain profile, unrelated to the
+  // separate native `openai-codex:*` provider). The overwhelming majority of
+  // child sessions are ordinary Anthropic/openai-codex/extension-agent
+  // spawns with neither, and skipping the call for them keeps this path a
+  // no-op dependency for those sessions -- matching every other call site in
+  // this file, which resolves claude-code backends the same way. Missing
+  // means an ordinary Anthropic session; a present signal fails closed on
+  // any inconsistency (unknown id, mismatched model) rather than silently
+  // falling back.
   const claudeCodeBackend =
-    args.claudeCodeBackend || finalModel.startsWith('claude-code:ollama-')
+    args.claudeCodeBackend
+    || finalModel.startsWith('claude-code:ollama-')
+    || finalModel.startsWith('claude-code:codex-')
       ? resolveClaudeCodeBackendForConfig({
           model: finalModel,
           claudeCodeBackend: args.claudeCodeBackend,
@@ -678,7 +703,7 @@ export class MetaAgentService {
     // workstream container), so it sets skipBackendPreflight to avoid a
     // redundant second network round-trip here.
     if (claudeCodeBackend && !args.skipBackendPreflight) {
-      await preflightOllamaClaudeCodeBackend(claudeCodeBackend);
+      await preflightClaudeCodeBackend(claudeCodeBackend);
     }
 
     const toolScope = parseSessionLaunchToolScope(args.toolScope);
@@ -982,7 +1007,7 @@ export class MetaAgentService {
     // createChildSessionInternal is told to skip its own preflight via
     // skipBackendPreflight so a healthy route is only checked once per call.
     if (previewResolution.claudeCodeBackend) {
-      await preflightOllamaClaudeCodeBackend(previewResolution.claudeCodeBackend);
+      await preflightClaudeCodeBackend(previewResolution.claudeCodeBackend);
     }
 
     const isolated = args.isolated === true;

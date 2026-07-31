@@ -130,5 +130,41 @@
     "baseUrl": "http://127.0.0.1:4002",
     "authToken": "sk-nim-local-proxy",
     "claudeModelAlias": "claude-ollama-deepseek-v4-pro"
+  },
+  {
+    "id": "codex-sol",
+    "persistedModel": "claude-code:codex-sol",
+    "provider": "codex-proxy",
+    "model": "gpt-5.6-sol",
+    "upstreamModel": "gpt-5.6-sol",
+    "upstreamBaseUrl": "http://127.0.0.1:38118",
+    "baseUrl": "http://127.0.0.1:38118",
+    "authToken": "sk-nim-codex-proxy",
+    "claudeModelAlias": "gpt-5.6-sol",
+    "label": "Sol"
+  },
+  {
+    "id": "codex-terra",
+    "persistedModel": "claude-code:codex-terra",
+    "provider": "codex-proxy",
+    "model": "gpt-5.6-terra",
+    "upstreamModel": "gpt-5.6-terra",
+    "upstreamBaseUrl": "http://127.0.0.1:38118",
+    "baseUrl": "http://127.0.0.1:38118",
+    "authToken": "sk-nim-codex-proxy",
+    "claudeModelAlias": "gpt-5.6-terra",
+    "label": "Terra"
+  },
+  {
+    "id": "codex-luna",
+    "persistedModel": "claude-code:codex-luna",
+    "provider": "codex-proxy",
+    "model": "gpt-5.6-luna",
+    "upstreamModel": "gpt-5.6-luna",
+    "upstreamBaseUrl": "http://127.0.0.1:38118",
+    "baseUrl": "http://127.0.0.1:38118",
+    "authToken": "sk-nim-codex-proxy",
+    "claudeModelAlias": "gpt-5.6-luna",
+    "label": "Luna"
   }
 ]

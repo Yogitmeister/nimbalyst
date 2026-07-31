@@ -13,7 +13,7 @@
 import { AIProviderType, AI_PROVIDER_TYPES, isClaudeCodeFamily } from './types';
 import {
   CLAUDE_CODE_ACCEPTED_VARIANT_INPUTS,
-  CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES,
+  CLAUDE_CODE_CUSTOM_BACKEND_IDENTITIES,
   DEFAULT_MODELS,
   normalizeClaudeCodeVariant,
 } from '../modelConstants';
@@ -165,17 +165,17 @@ export class ModelIdentifier {
     if (isClaudeCodeFamily(provider)) {
       const normalizedModel = model.toLowerCase();
 
-      // The Nimbalyst-created Ollama brain is a canonical persisted model
-      // identity, not an ordinary Claude variant plus mutable metadata. Keep
-      // the allowlist exact and SDK-only: the interactive claude-code-cli
-      // provider is not this programmatic route.
-      const ollamaIdentity = provider === 'claude-code'
-        ? CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES.find(
+      // Every Nimbalyst-created non-Anthropic brain (Ollama, Codex, ...) is a
+      // canonical persisted model identity, not an ordinary Claude variant
+      // plus mutable metadata. Keep the allowlist exact and SDK-only: the
+      // interactive claude-code-cli provider is not this programmatic route.
+      const customIdentity = provider === 'claude-code'
+        ? CLAUDE_CODE_CUSTOM_BACKEND_IDENTITIES.find(
           (identity) => identity.variant === normalizedModel
         )
         : undefined;
-      if (ollamaIdentity) {
-        return new ModelIdentifier(provider, ollamaIdentity.variant);
+      if (customIdentity) {
+        return new ModelIdentifier(provider, customIdentity.variant);
       }
 
       // Strip known suffixes to get base variant

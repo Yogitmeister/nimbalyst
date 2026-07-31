@@ -49,7 +49,7 @@ describe('Claude Code persisted session routing', () => {
       OLLAMA_MODEL,
       undefined,
       async () => ({ model: 'claude-code:ollama-similar' })
-    )).rejects.toThrow('Unsupported Claude Code Ollama model identity');
+    )).rejects.toThrow('Unsupported Claude Code custom backend model identity');
   });
 
   it('preserves the ordinary-session fallback when persistence is unavailable', async () => {

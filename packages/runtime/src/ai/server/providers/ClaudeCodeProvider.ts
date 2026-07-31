@@ -47,7 +47,7 @@ import {
   CLAUDE_CODE_SAFE_FALLBACK_MODEL,
   baseContextWindowForVariant,
 } from '../../modelConstants';
-import { resolveClaudeCodeBackendForConfig } from './claudeCode/customBackends';
+import { CLAUDE_CODE_BACKENDS, resolveClaudeCodeBackendForConfig } from './claudeCode/customBackends';
 import { isBedrockToolSearchError } from '../utils/errorDetection';
 import { AgentMessagesRepository } from '../../../storage/repositories/AgentMessagesRepository';
 import { TranscriptMigrationRepository } from '../../../storage/repositories/TranscriptMigrationRepository';
@@ -3716,6 +3716,25 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       maxTokens: 8192,
       contextWindow: 128000,
     });
+
+    // One generalized row per registered custom backend (Ollama fleet +
+    // Codex leg), covering every provider family in CLAUDE_CODE_BACKENDS
+    // with the same code path -- see DECISION_BRIEF.md's dropdown
+    // generalization note. DeepSeek keeps its own one-off push above
+    // untouched (different mechanism, already shipped, not in this registry).
+    // contextWindow/maxTokens use the same conservative default as the
+    // DeepSeek row above: none of these backends' real per-model context
+    // limits are tracked in the registry today, and a wrong specific number
+    // is worse than an honest floor.
+    for (const backend of CLAUDE_CODE_BACKENDS) {
+      models.push({
+        id: backend.persistedModel,
+        name: `Claude Agent · ${backend.label ?? backend.id}`,
+        provider: 'claude-code' as const,
+        maxTokens: 8192,
+        contextWindow: 128000,
+      });
+    }
 
     return models;
   }

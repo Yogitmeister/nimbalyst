@@ -9,7 +9,7 @@ import type { ToolResult } from './protocols/ProtocolInterface';
 import { ModelIdentifier } from './ModelIdentifier';
 import {
   CLAUDE_CODE_ACCEPTED_VARIANT_INPUTS,
-  CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES,
+  CLAUDE_CODE_CUSTOM_BACKEND_IDENTITIES,
   CLAUDE_CODE_PINNED_SDK_MODELS,
   normalizeClaudeCodeVariant,
 } from '../modelConstants';
@@ -258,11 +258,11 @@ export function resolveClaudeCodeModelVariant(configuredModel: string | undefine
   // Try parsing with ModelIdentifier
   const parsed = ModelIdentifier.tryParse(configured);
   if (parsed && isClaudeCodeFamily(parsed.provider)) {
-    const ollamaIdentity = CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES.find(
+    const customIdentity = CLAUDE_CODE_CUSTOM_BACKEND_IDENTITIES.find(
       (identity) => identity.persistedModel === parsed.combined
     );
-    if (ollamaIdentity) {
-      return ollamaIdentity.sdkAlias;
+    if (customIdentity) {
+      return customIdentity.sdkAlias;
     }
     // baseVariant strips suffixes like -1m
     const variant = parsed.baseVariant as ClaudeCodeVariant;

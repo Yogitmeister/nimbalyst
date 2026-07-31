@@ -21,6 +21,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import {
+  CLAUDE_CODE_CODEX_SOL_MODEL,
+  CLAUDE_CODE_CODEX_SOL_SDK_ALIAS,
+  CLAUDE_CODE_CODEX_SOL_VARIANT,
+  CLAUDE_CODE_CODEX_TERRA_MODEL,
+  CLAUDE_CODE_CODEX_TERRA_SDK_ALIAS,
+  CLAUDE_CODE_CODEX_TERRA_VARIANT,
+  CLAUDE_CODE_CODEX_LUNA_MODEL,
+  CLAUDE_CODE_CODEX_LUNA_SDK_ALIAS,
+  CLAUDE_CODE_CODEX_LUNA_VARIANT,
   CLAUDE_CODE_OLLAMA_GLM_5_2_CLOUD_MODEL,
   CLAUDE_CODE_OLLAMA_GLM_5_2_CLOUD_SDK_ALIAS,
   CLAUDE_CODE_OLLAMA_GLM_5_2_CLOUD_VARIANT,
@@ -65,18 +74,29 @@ export const OLLAMA_GLM_5_2_CLOUD_BACKEND_ID =
 export interface ClaudeCodeBackend {
   id: string;
   persistedModel: string;
-  provider: 'ollama';
+  provider: 'ollama' | 'codex-proxy';
   model: string;
   upstreamModel: string;
   upstreamBaseUrl: string;
   baseUrl: string;
-  /** Non-secret local proxy token mirrored by the existing LiteLLM config. */
+  /**
+   * Non-secret local proxy token. For 'ollama' this mirrors the existing
+   * LiteLLM config; for 'codex-proxy' it is CLIProxyAPI's own configured
+   * ingress api-key (also non-secret -- the real credential is the Codex
+   * OAuth record CLIProxyAPI holds server-side, never this token).
+   */
   authToken: string;
   /**
-   * Claude-shaped alias accepted by the existing LiteLLM profile. LiteLLM
-   * translates this alias to `model` at the Ollama Cloud OpenAI endpoint.
+   * The model identity Claude Code is told to request.
+   * - 'ollama': a Claude-shaped alias accepted by the LiteLLM profile, which
+   *   translates it to `model` at the Ollama Cloud OpenAI endpoint.
+   * - 'codex-proxy': the literal Codex catalog model id (e.g. `gpt-5.6-terra`)
+   *   -- CLIProxyAPI accepts it directly, so this collapses to the same value
+   *   as `model`/`upstreamModel` for these entries. See modelConstants.ts.
    */
   claudeModelAlias: string;
+  /** Display label for the model dropdown, e.g. "Terra". Falls back to `id`. */
+  label?: string;
 }
 
 const SEED_BACKENDS: readonly ClaudeCodeBackend[] = [
@@ -214,21 +234,89 @@ const SEED_BACKENDS: readonly ClaudeCodeBackend[] = [
   },
 ];
 
+/**
+ * Codex ChatGPT-subscription backends via a dedicated, Nimbalyst-managed
+ * CLIProxyAPI instance (router-for-me/CLIProxyAPI v7.2.86 -- the same
+ * pinned/hashed binary already live-evaluated for the standalone terminal
+ * pilot at tools/claudex/, see knowledge/methods/
+ * claudex_codex_subscription_brain.md and DECISION_BRIEF.md's 2026-08-01
+ * supersession note). Port 38118 is deliberately distinct from that terminal
+ * pilot's own pinned port (38117) so a developer's personal `claudex` session
+ * and an in-app Nimbalyst session never collide on the same loopback listener
+ * -- same reasoning as the Ollama leg never sharing a port with a user's own
+ * proxy. `upstreamModel`/`upstreamBaseUrl` are not meaningful for this
+ * provider (CLIProxyAPI owns the Codex-side routing entirely) and are set to
+ * the literal model id / this backend's own baseUrl for schema uniformity.
+ */
+const CODEX_PROXY_BASE_URL = 'http://127.0.0.1:38118';
+const CODEX_PROXY_AUTH_TOKEN = 'sk-nim-codex-proxy';
+
+const CODEX_SEED_BACKENDS: readonly ClaudeCodeBackend[] = [
+  {
+    id: CLAUDE_CODE_CODEX_SOL_VARIANT,
+    persistedModel: CLAUDE_CODE_CODEX_SOL_MODEL,
+    provider: 'codex-proxy',
+    model: CLAUDE_CODE_CODEX_SOL_SDK_ALIAS,
+    upstreamModel: CLAUDE_CODE_CODEX_SOL_SDK_ALIAS,
+    upstreamBaseUrl: CODEX_PROXY_BASE_URL,
+    baseUrl: CODEX_PROXY_BASE_URL,
+    authToken: CODEX_PROXY_AUTH_TOKEN,
+    claudeModelAlias: CLAUDE_CODE_CODEX_SOL_SDK_ALIAS,
+    label: 'Sol',
+  },
+  {
+    id: CLAUDE_CODE_CODEX_TERRA_VARIANT,
+    persistedModel: CLAUDE_CODE_CODEX_TERRA_MODEL,
+    provider: 'codex-proxy',
+    model: CLAUDE_CODE_CODEX_TERRA_SDK_ALIAS,
+    upstreamModel: CLAUDE_CODE_CODEX_TERRA_SDK_ALIAS,
+    upstreamBaseUrl: CODEX_PROXY_BASE_URL,
+    baseUrl: CODEX_PROXY_BASE_URL,
+    authToken: CODEX_PROXY_AUTH_TOKEN,
+    claudeModelAlias: CLAUDE_CODE_CODEX_TERRA_SDK_ALIAS,
+    label: 'Terra',
+  },
+  {
+    id: CLAUDE_CODE_CODEX_LUNA_VARIANT,
+    persistedModel: CLAUDE_CODE_CODEX_LUNA_MODEL,
+    provider: 'codex-proxy',
+    model: CLAUDE_CODE_CODEX_LUNA_SDK_ALIAS,
+    upstreamModel: CLAUDE_CODE_CODEX_LUNA_SDK_ALIAS,
+    upstreamBaseUrl: CODEX_PROXY_BASE_URL,
+    baseUrl: CODEX_PROXY_BASE_URL,
+    authToken: CODEX_PROXY_AUTH_TOKEN,
+    claudeModelAlias: CLAUDE_CODE_CODEX_LUNA_SDK_ALIAS,
+    label: 'Luna',
+  },
+];
+
 function isValidBackend(candidate: unknown): candidate is ClaudeCodeBackend {
   if (typeof candidate !== 'object' || candidate === null) return false;
   const c = candidate as Record<string, unknown>;
   return (
     typeof c.id === 'string' && c.id.length > 0 &&
     typeof c.persistedModel === 'string' && c.persistedModel.length > 0 &&
-    c.provider === 'ollama' &&
+    (c.provider === 'ollama' || c.provider === 'codex-proxy') &&
     typeof c.model === 'string' && c.model.length > 0 &&
     typeof c.upstreamModel === 'string' && c.upstreamModel.length > 0 &&
     typeof c.upstreamBaseUrl === 'string' && c.upstreamBaseUrl.length > 0 &&
     typeof c.baseUrl === 'string' && c.baseUrl.length > 0 &&
     typeof c.authToken === 'string' && c.authToken.length > 0 &&
-    typeof c.claudeModelAlias === 'string' && c.claudeModelAlias.length > 0
+    typeof c.claudeModelAlias === 'string' && c.claudeModelAlias.length > 0 &&
+    (c.label === undefined || (typeof c.label === 'string' && c.label.length > 0))
   );
 }
+
+/**
+ * Every backend Nimbalyst ships out of the box, across every provider family.
+ * `ALL_SEED_BACKENDS` is what actually seeds/falls back the effective list;
+ * `SEED_BACKENDS` (Ollama-only) stays exported for existing call sites and
+ * tests that specifically exercise the Ollama fleet.
+ */
+const ALL_SEED_BACKENDS: readonly ClaudeCodeBackend[] = [
+  ...SEED_BACKENDS,
+  ...CODEX_SEED_BACKENDS,
+];
 
 /**
  * userData/ollama-backends.json -- same directory electron-store already
@@ -236,6 +324,16 @@ function isValidBackend(candidate: unknown): candidate is ClaudeCodeBackend {
  * Windows). Resolved via process.env.APPDATA directly rather than Electron's
  * app.getPath('userData') so this module stays a plain, Electron-free data
  * module -- it is unit-tested with plain vitest today and must stay that way.
+ *
+ * The filename predates the Codex leg and is kept for backward compatibility
+ * (an existing install's override file already lives here); despite the
+ * name, it now holds every custom backend family, not just Ollama. KNOWN
+ * GAP: bootstrapOverrideFile() below only writes once, on first run when the
+ * file is absent -- an install that already has this file from before the
+ * Codex leg shipped will NOT automatically gain the new Codex rows; the user
+ * (or a future migration) must add them to the existing file by hand. Not
+ * addressed here; flagged in the PR's acceptance note rather than silently
+ * left implicit.
  */
 function getOverrideFilePath(): string | undefined {
   const appData = process.env.APPDATA;
@@ -275,7 +373,7 @@ function bootstrapOverrideFile(): void {
   try {
     if (fs.existsSync(filePath)) return;
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, JSON.stringify(SEED_BACKENDS, null, 2) + '\n', 'utf-8');
+    fs.writeFileSync(filePath, JSON.stringify(ALL_SEED_BACKENDS, null, 2) + '\n', 'utf-8');
   } catch {
     // Non-fatal: read-only environment, missing permissions, etc. The app
     // still works off the in-memory seed either way.
@@ -293,7 +391,7 @@ if (!loadedOverride) {
  * model going forward means editing the override JSON file directly -- no
  * Nimbalyst code change or rebuild required. See the module doc comment.
  */
-export const CLAUDE_CODE_BACKENDS: readonly ClaudeCodeBackend[] = loadedOverride ?? SEED_BACKENDS;
+export const CLAUDE_CODE_BACKENDS: readonly ClaudeCodeBackend[] = loadedOverride ?? ALL_SEED_BACKENDS;
 
 /**
  * Resolve a persisted backend id.
@@ -332,8 +430,8 @@ export function resolveClaudeCodeBackendFromModel(
   if (backend) {
     return backend;
   }
-  if (model.startsWith('claude-code:ollama-')) {
-    throw new Error(`Unsupported Claude Code Ollama model identity: ${model}`);
+  if (model.startsWith('claude-code:ollama-') || model.startsWith('claude-code:codex-')) {
+    throw new Error(`Unsupported Claude Code custom backend model identity: ${model}`);
   }
   return undefined;
 }
@@ -483,9 +581,12 @@ export const CLAUDE_CODE_AMBIENT_ROUTE_ENV_KEYS = [
 /**
  * Overlay one backend profile onto a per-spawn environment.
  *
- * The LiteLLM proxy owns translation from Anthropic Messages to Ollama Cloud's
- * OpenAI-compatible API. All Claude roles, including native Task/Agent children,
- * use the same proxy alias and therefore the same exact Ollama model.
+ * The backend's own loopback proxy owns protocol translation to the real
+ * upstream (LiteLLM -> Ollama Cloud's OpenAI-compatible API for 'ollama';
+ * CLIProxyAPI -> Codex's ChatGPT-subscription backend for 'codex-proxy').
+ * This function is provider-agnostic by design: all Claude roles, including
+ * native Task/Agent children, use the same alias and therefore the same
+ * exact backend model, regardless of which provider family it belongs to.
  */
 export function applyClaudeCodeBackendEnv(
   env: Record<string, string | undefined>,

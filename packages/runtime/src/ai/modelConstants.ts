@@ -419,6 +419,67 @@ export const CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES = [
 ] as const;
 
 /**
+ * Codex ChatGPT-subscription backends (Program 2 Codex leg, 2026-08-01). Same
+ * shape as the Ollama entries above: a persisted model identity, a
+ * claudeCodeBackend variant id, and an SDK-facing alias routed through a
+ * dedicated per-Nimbalyst CLIProxyAPI instance (see customBackends.ts) to the
+ * real Codex ChatGPT-subscription model. Unlike Ollama, no alias translation
+ * table is involved -- CLIProxyAPI accepts the real Codex catalog model id
+ * directly, so `sdkAlias` here IS the literal Codex model string, confirmed
+ * against the already-pinned `tools/claudex/claudex.py` (`ALLOWED_MODELS`).
+ */
+export const CLAUDE_CODE_CODEX_SOL_MODEL =
+  'claude-code:codex-sol' as const;
+export const CLAUDE_CODE_CODEX_SOL_VARIANT =
+  'codex-sol' as const;
+export const CLAUDE_CODE_CODEX_SOL_SDK_ALIAS =
+  'gpt-5.6-sol' as const;
+
+export const CLAUDE_CODE_CODEX_TERRA_MODEL =
+  'claude-code:codex-terra' as const;
+export const CLAUDE_CODE_CODEX_TERRA_VARIANT =
+  'codex-terra' as const;
+export const CLAUDE_CODE_CODEX_TERRA_SDK_ALIAS =
+  'gpt-5.6-terra' as const;
+
+export const CLAUDE_CODE_CODEX_LUNA_MODEL =
+  'claude-code:codex-luna' as const;
+export const CLAUDE_CODE_CODEX_LUNA_VARIANT =
+  'codex-luna' as const;
+export const CLAUDE_CODE_CODEX_LUNA_SDK_ALIAS =
+  'gpt-5.6-luna' as const;
+
+export const CLAUDE_CODE_CODEX_BACKEND_IDENTITIES = [
+  {
+    persistedModel: CLAUDE_CODE_CODEX_SOL_MODEL,
+    variant: CLAUDE_CODE_CODEX_SOL_VARIANT,
+    sdkAlias: CLAUDE_CODE_CODEX_SOL_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_CODEX_TERRA_MODEL,
+    variant: CLAUDE_CODE_CODEX_TERRA_VARIANT,
+    sdkAlias: CLAUDE_CODE_CODEX_TERRA_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_CODEX_LUNA_MODEL,
+    variant: CLAUDE_CODE_CODEX_LUNA_VARIANT,
+    sdkAlias: CLAUDE_CODE_CODEX_LUNA_SDK_ALIAS,
+  },
+] as const;
+
+/**
+ * Union of every programmatic non-Anthropic Claude Agent backend identity
+ * (Ollama + Codex). `ModelIdentifier` and the SDK option resolver in
+ * `types.ts` consume this union instead of the Ollama-only list directly, so
+ * a future third provider family only means adding one more spread here --
+ * neither consumer needs to change.
+ */
+export const CLAUDE_CODE_CUSTOM_BACKEND_IDENTITIES = [
+  ...CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES,
+  ...CLAUDE_CODE_CODEX_BACKEND_IDENTITIES,
+] as const;
+
+/**
  * Accepted input aliases for Claude Agent model identifiers.
  *
  * `opus-5` is intentionally accepted as an alias for the canonical `opus`

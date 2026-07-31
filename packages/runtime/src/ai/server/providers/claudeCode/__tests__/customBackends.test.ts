@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES } from '../../../../modelConstants';
+import {
+  CLAUDE_CODE_CODEX_BACKEND_IDENTITIES,
+  CLAUDE_CODE_CUSTOM_BACKEND_IDENTITIES,
+  CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES,
+} from '../../../../modelConstants';
 import { resolveClaudeCodeModelVariant } from '../../../types';
 import {
   applyClaudeCodeBackendEnv,
@@ -215,7 +219,7 @@ describe('Claude Code custom backends', () => {
   });
 
   it('binds every allowlisted backend to canonical parsing and its exact SDK alias', () => {
-    expect(CLAUDE_CODE_BACKENDS).toHaveLength(CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES.length);
+    expect(CLAUDE_CODE_BACKENDS).toHaveLength(CLAUDE_CODE_CUSTOM_BACKEND_IDENTITIES.length);
 
     for (const identity of CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES) {
       const backend = resolveClaudeCodeBackend(identity.variant);
@@ -223,6 +227,26 @@ describe('Claude Code custom backends', () => {
         id: identity.variant,
         persistedModel: identity.persistedModel,
         claudeModelAlias: identity.sdkAlias,
+        provider: 'ollama',
+      });
+      expect(resolveClaudeCodeBackendFromModel(identity.persistedModel)).toBe(backend);
+      expect(
+        resolveClaudeCodeModelVariant(identity.persistedModel, 'claude-code:opus')
+      ).toBe(identity.sdkAlias);
+    }
+
+    for (const identity of CLAUDE_CODE_CODEX_BACKEND_IDENTITIES) {
+      const backend = resolveClaudeCodeBackend(identity.variant);
+      expect(backend).toMatchObject({
+        id: identity.variant,
+        persistedModel: identity.persistedModel,
+        claudeModelAlias: identity.sdkAlias,
+        provider: 'codex-proxy',
+        // CLIProxyAPI takes the literal Codex model id directly -- unlike
+        // Ollama's LiteLLM alias indirection, sdkAlias/model/upstreamModel
+        // collapse to the same string (see customBackends.ts doc comment).
+        model: identity.sdkAlias,
+        upstreamModel: identity.sdkAlias,
       });
       expect(resolveClaudeCodeBackendFromModel(identity.persistedModel)).toBe(backend);
       expect(
@@ -234,7 +258,10 @@ describe('Claude Code custom backends', () => {
   it('rejects lookalike model identities and backend/model mismatches', () => {
     expect(() =>
       resolveClaudeCodeBackendFromModel('claude-code:ollama-glm-5-2-cloud-ish')
-    ).toThrow('Unsupported Claude Code Ollama model identity');
+    ).toThrow('Unsupported Claude Code custom backend model identity');
+    expect(() =>
+      resolveClaudeCodeBackendFromModel('claude-code:codex-terra-ish')
+    ).toThrow('Unsupported Claude Code custom backend model identity');
     expect(() =>
       resolveClaudeCodeBackendForConfig({
         model: 'claude-code:sonnet',
