@@ -7,8 +7,8 @@
  * verified request/response shape this pins.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'fs';
+import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 
 vi.mock('../CLIManager', () => ({
@@ -20,9 +20,21 @@ import { ollamaUsageService } from '../OllamaUsageService';
 describe('OllamaUsageService', () => {
   const originalFetch = global.fetch;
   const originalApiKey = process.env.OLLAMA_API_KEY;
+  const originalCacheDir = process.env.TOKEN_OPTIMIZER_CACHE_DIR;
+  const realDefaultSidecarPath = join(homedir(), '.claude', 'token-optimizer', 'ollama-usage.json');
+  let isolatedCacheDir: string;
+  let defaultSidecarBefore: { exists: boolean; mtimeMs?: number; bytes?: Buffer };
+
+  function snapshotFile(path: string): { exists: boolean; mtimeMs?: number; bytes?: Buffer } {
+    if (!existsSync(path)) return { exists: false };
+    return { exists: true, mtimeMs: statSync(path).mtimeMs, bytes: readFileSync(path) };
+  }
 
   beforeEach(() => {
     vi.restoreAllMocks();
+    defaultSidecarBefore = snapshotFile(realDefaultSidecarPath);
+    isolatedCacheDir = mkdtempSync(join(tmpdir(), 'nimbalyst-ollama-suite-'));
+    process.env.TOKEN_OPTIMIZER_CACHE_DIR = isolatedCacheDir;
     delete process.env.OLLAMA_API_KEY;
   });
 
@@ -33,6 +45,10 @@ describe('OllamaUsageService', () => {
     } else {
       process.env.OLLAMA_API_KEY = originalApiKey;
     }
+    rmSync(isolatedCacheDir, { recursive: true, force: true });
+    if (originalCacheDir === undefined) delete process.env.TOKEN_OPTIMIZER_CACHE_DIR;
+    else process.env.TOKEN_OPTIMIZER_CACHE_DIR = originalCacheDir;
+    expect(snapshotFile(realDefaultSidecarPath)).toEqual(defaultSidecarBefore);
   });
 
   function mockFetch(handlers: { usage?: () => Promise<any>; proxy?: (url: string) => Promise<any> }) {

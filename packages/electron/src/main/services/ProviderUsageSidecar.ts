@@ -1,6 +1,6 @@
 import { basename, dirname, join } from 'path';
 import { homedir } from 'os';
-import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, unlinkSync, writeFileSync } from 'fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'fs';
 
 export interface OllamaUsageSidecarInput {
   limitsAvailable: boolean;
@@ -69,6 +69,36 @@ export function projectOllamaUsageSidecar(input: OllamaUsageSidecarInput): Provi
   };
 }
 
+const LOCK_STALE_MS = 60 * 1000;
+
+function tryAcquireSidecarLock(lockPath: string): number | null {
+  try {
+    const existing = statSync(lockPath);
+    if (Date.now() - existing.mtimeMs > LOCK_STALE_MS) unlinkSync(lockPath);
+  } catch {
+    // Missing lock is normal; exclusive creation below resolves races.
+  }
+
+  try {
+    const descriptor = openSync(lockPath, 'wx');
+    writeFileSync(descriptor, `${process.pid}\n`, 'utf8');
+    return descriptor;
+  } catch {
+    return null;
+  }
+}
+
+function priorFetchedAt(targetPath: string): number | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(targetPath, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const fetchedAt = (parsed as { fetched_at?: unknown }).fetched_at;
+    return typeof fetchedAt === 'number' && Number.isFinite(fetchedAt) ? fetchedAt : null;
+  } catch {
+    return null;
+  }
+}
+
 function writeJsonAtomically(targetPath: string, value: ProviderUsageSidecar): void {
   const directory = dirname(targetPath);
   mkdirSync(directory, { recursive: true });
@@ -101,6 +131,28 @@ export function publishOllamaUsageSidecar(
 ): boolean {
   const sidecar = projectOllamaUsageSidecar(input);
   if (!sidecar) return false;
-  writeJsonAtomically(targetPath, sidecar);
-  return true;
+
+  // Standalone ollama_usage.js uses this exact <sidecar>.lock convention.
+  // Holding it across read/compare/write makes Nimbalyst and standalone
+  // publishers one ownership domain and preserves the newest valid sidecar.
+  const lockPath = `${targetPath}.lock`;
+  const descriptor = tryAcquireSidecarLock(lockPath);
+  if (descriptor === null) return false;
+  try {
+    const prior = priorFetchedAt(targetPath);
+    if (prior !== null && prior > sidecar.fetched_at) return false;
+    writeJsonAtomically(targetPath, sidecar);
+    return true;
+  } finally {
+    try {
+      closeSync(descriptor);
+    } catch {
+      // Lock cleanup below is still required after a descriptor close failure.
+    }
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      // The lock may already have been removed by cleanup after a write error.
+    }
+  }
 }

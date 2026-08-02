@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, it } from 'vitest';
@@ -61,6 +61,29 @@ describe('ProviderUsageSidecar', () => {
         session: { utilization: 2, resetsAt: null },
         lastUpdated: Date.now() + 1,
       })).toBeNull();
+
+      const fresherAt = Date.now();
+      expect(publishOllamaUsageSidecar({
+        limitsAvailable: true,
+        session: { utilization: 40, resetsAt: null },
+        lastUpdated: fresherAt,
+      }, target)).toBe(true);
+      const freshBytes = readFileSync(target, 'utf8');
+      expect(publishOllamaUsageSidecar({
+        limitsAvailable: true,
+        session: { utilization: 10, resetsAt: null },
+        lastUpdated: fresherAt - 1,
+      }, target)).toBe(false);
+      expect(readFileSync(target, 'utf8')).toBe(freshBytes);
+
+      const lockPath = `${target}.lock`;
+      writeFileSync(lockPath, 'owned-by-standalone\n', 'utf8');
+      expect(publishOllamaUsageSidecar({
+        limitsAvailable: true,
+        session: { utilization: 50, resetsAt: null },
+        lastUpdated: Date.now(),
+      }, target)).toBe(false);
+      expect(readFileSync(target, 'utf8')).toBe(freshBytes);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
