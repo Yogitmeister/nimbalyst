@@ -22,6 +22,7 @@ const { claudeUsageServiceMock, codexUsageServiceMock, geminiUsageServiceMock, o
     refresh: vi.fn(),
   },
   ollamaUsageServiceMock: {
+    recordActivity: vi.fn(),
     getUsage: vi.fn(),
   },
 }));
@@ -108,6 +109,13 @@ describe('usagePollingServer', () => {
     const result = await dispatchUsagePollingTool('get_provider_usage', { provider: 'gemini' });
 
     expect(result.content[0].text).toContain('not started -- Gemini usage will appear after your first request.');
+  });
+
+  it('wakes Ollama polling before reading its cached usage', async () => {
+    await dispatchUsagePollingTool('get_provider_usage', { provider: 'ollama' });
+
+    expect(ollamaUsageServiceMock.recordActivity).toHaveBeenCalledTimes(1);
+    expect(ollamaUsageServiceMock.getUsage).toHaveBeenCalledWith(false);
   });
 
   it('scopes to a single provider when specified', async () => {

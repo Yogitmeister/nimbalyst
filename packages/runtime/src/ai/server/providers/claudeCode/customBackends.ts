@@ -385,6 +385,8 @@ export const CLAUDE_CODE_AMBIENT_ROUTE_ENV_KEYS = [
   'no_proxy',
 
   // Provider selectors and provider-specific credentials.
+  'CLAUDE_CODE_PROVIDER',
+  'OLLAMA_API_KEY',
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY',
@@ -502,6 +504,7 @@ export function applyClaudeCodeBackendEnv(
 
   env.ANTHROPIC_BASE_URL = backend.baseUrl;
   env.ANTHROPIC_AUTH_TOKEN = backend.authToken;
+  env.CLAUDE_CODE_PROVIDER = 'ollama';
   env.ANTHROPIC_DEFAULT_OPUS_MODEL = backend.claudeModelAlias;
   env.ANTHROPIC_DEFAULT_SONNET_MODEL = backend.claudeModelAlias;
   env.ANTHROPIC_DEFAULT_HAIKU_MODEL = backend.claudeModelAlias;

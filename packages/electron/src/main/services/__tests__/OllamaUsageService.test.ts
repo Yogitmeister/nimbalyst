@@ -7,6 +7,9 @@
  * verified request/response shape this pins.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 vi.mock('../CLIManager', () => ({
   getShellEnvironment: vi.fn(() => ({})),
@@ -94,6 +97,61 @@ describe('OllamaUsageService', () => {
     ]);
     expect(data.costUSD).toBe(0);
     expect(data.costPeriod?.type).toBe('last_4_weeks');
+  });
+
+  it('publishes a redacted shared sidecar after a valid refresh', async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), 'nimbalyst-ollama-sidecar-'));
+    const originalCacheDir = process.env.TOKEN_OPTIMIZER_CACHE_DIR;
+    process.env.TOKEN_OPTIMIZER_CACHE_DIR = cacheDir;
+    process.env.OLLAMA_API_KEY = 'test-key-not-real';
+    mockFetch({
+      usage: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          limits: {
+            session: { usage: 0, models: [{ name: 'must-not-persist', request_count: 1 }] },
+            weekly: { usage: 0.051, models: [{ name: 'must-not-persist', request_count: 2 }] },
+          },
+        }),
+      }),
+    });
+
+    try {
+      await ollamaUsageService.refresh();
+      const sidecar = JSON.parse(readFileSync(join(cacheDir, 'ollama-usage.json'), 'utf8'));
+      expect(sidecar).toMatchObject({
+        schema_version: 1,
+        provider: 'ollama',
+        source: 'nimbalyst-ollama',
+        windows: [
+          { slot: 'session', used_percentage: 0, window_seconds: null, resets_at: null },
+          { slot: 'weekly', used_percentage: 5.1, window_seconds: null, resets_at: null },
+        ],
+      });
+      expect(JSON.stringify(sidecar)).not.toContain('must-not-persist');
+      expect(JSON.stringify(sidecar)).not.toContain('test-key-not-real');
+    } finally {
+      if (originalCacheDir === undefined) delete process.env.TOKEN_OPTIMIZER_CACHE_DIR;
+      else process.env.TOKEN_OPTIMIZER_CACHE_DIR = originalCacheDir;
+      rmSync(cacheDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects out-of-range account utilization instead of publishing invalid usage', async () => {
+    process.env.OLLAMA_API_KEY = 'test-key-not-real';
+    mockFetch({
+      usage: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ limits: { session: { usage: 1.1, models: [] } } }),
+      }),
+    });
+
+    const data = await ollamaUsageService.refresh();
+
+    expect(data.limitsAvailable).toBe(false);
+    expect(data.error).toContain('did not include session/weekly usage');
   });
 
   it('sends the raw API key with no "Bearer " prefix', async () => {

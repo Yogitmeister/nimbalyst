@@ -418,6 +418,12 @@ export const CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES = [
   },
 ] as const;
 
+/** True only for an exact persisted Ollama Claude Agent backend identity. */
+export function isClaudeCodeOllamaBackendModel(value: unknown): boolean {
+  return typeof value === 'string'
+    && CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES.some((identity) => identity.persistedModel === value);
+}
+
 /**
  * Accepted input aliases for Claude Agent model identifiers.
  *

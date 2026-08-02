@@ -34,6 +34,8 @@ const PINNED_SDK_AMBIENT_ROUTE_KEYS = [
   'all_proxy',
   'NO_PROXY',
   'no_proxy',
+  'CLAUDE_CODE_PROVIDER',
+  'OLLAMA_API_KEY',
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY',
@@ -136,6 +138,7 @@ const PINNED_ROUTE_VALUES: Readonly<Record<string, string>> = {
   CLAUDE_CONTEXT_COLLAPSE_MODEL: 'claude-sonnet-4-5-20250929',
   CLAUDE_CODE_SUBAGENT_MODEL: 'claude-sonnet-4-5-20250929',
   CLAUDE_CODE_NO_MODEL_FALLBACK: '1',
+  CLAUDE_CODE_PROVIDER: 'ollama',
   NO_PROXY: '127.0.0.1,localhost',
 };
 

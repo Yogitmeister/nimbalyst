@@ -89,6 +89,8 @@ const HOSTILE_AMBIENT_ENV = {
   AGENT_PROXY_URL: 'https://hostile-agent-proxy.invalid',
   AGENT_PROXY_AUTH_TOKEN: 'hostile-agent-token',
   HTTPS_PROXY: 'http://hostile-proxy.invalid:8080',
+  CLAUDE_CODE_PROVIDER: 'hostile-provider',
+  OLLAMA_API_KEY: 'hostile-ollama-key',
   CLAUDE_CODE_USE_BEDROCK: '1',
   AWS_ACCESS_KEY_ID: 'hostile-aws-key',
   CLAUDE_CODE_USE_VERTEX: '1',
@@ -265,6 +267,7 @@ describe('programmatic Ollama route integration', () => {
         ANTHROPIC_AUTH_TOKEN: backend.authToken,
         ANTHROPIC_MODEL: backend.claudeModelAlias,
         CLAUDE_CODE_SUBAGENT_MODEL: backend.claudeModelAlias,
+        CLAUDE_CODE_PROVIDER: 'ollama',
       });
     }
   });
@@ -300,6 +303,7 @@ describe('programmatic Ollama route integration', () => {
         ANTHROPIC_DEFAULT_SONNET_MODEL: EXACT_ALIAS,
         CLAUDE_CODE_SUBAGENT_MODEL: EXACT_ALIAS,
         CLAUDE_CODE_NO_MODEL_FALLBACK: '1',
+        CLAUDE_CODE_PROVIDER: 'ollama',
         NO_PROXY: '127.0.0.1,localhost',
       });
       for (const key of Object.keys(HOSTILE_AMBIENT_ENV)) {
@@ -307,6 +311,7 @@ describe('programmatic Ollama route integration', () => {
           key !== 'ANTHROPIC_MODEL'
           && key !== 'ANTHROPIC_DEFAULT_SONNET_MODEL'
           && key !== 'CLAUDE_CODE_SUBAGENT_MODEL'
+          && key !== 'CLAUDE_CODE_PROVIDER'
         ) {
           expect(turn.options.env[key]).toBeUndefined();
         }

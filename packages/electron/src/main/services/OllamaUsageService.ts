@@ -50,6 +50,7 @@
 import { BrowserWindow } from 'electron';
 import { logger } from '../utils/logger';
 import { getShellEnvironment } from './CLIManager';
+import { publishOllamaUsageSidecar } from './ProviderUsageSidecar';
 
 type OllamaEnv = Record<string, string | undefined>;
 
@@ -131,7 +132,7 @@ interface LiteLLMModelInfoResponse {
 }
 
 function parseWindow(raw: RawOllamaUsageWindow | undefined): OllamaUsageWindow | undefined {
-  if (!raw || typeof raw.usage !== 'number') return undefined;
+  if (!raw || typeof raw.usage !== 'number' || !Number.isFinite(raw.usage) || raw.usage < 0 || raw.usage > 1) return undefined;
   const models = (raw.models ?? [])
     .filter((m): m is { name: string; request_count: number } =>
       typeof m?.name === 'string' && typeof m?.request_count === 'number'
@@ -245,6 +246,12 @@ class OllamaUsageServiceImpl {
     };
     this.cachedUsage = usageData;
     this.lastFetchTime = Date.now();
+    try {
+      publishOllamaUsageSidecar(usageData);
+    } catch {
+      // Statusline publication is best-effort and must never disrupt the UI poll.
+      logger.main.debug('[OllamaUsageService] Unable to publish redacted usage sidecar.');
+    }
     this.broadcastUpdate();
     return usageData;
   }

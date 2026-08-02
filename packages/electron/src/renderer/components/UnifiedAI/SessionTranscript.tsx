@@ -18,6 +18,7 @@ import React, { useCallback, useRef, useImperativeHandle, forwardRef, useEffect,
 import { useAtom, useSetAtom, useAtomValue } from 'jotai';
 import { store, registerInteractiveWidgetHost, unregisterInteractiveWidgetHost } from '@nimbalyst/runtime/store';
 import type { SessionData, ChatAttachment, TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
+import { isClaudeCodeOllamaBackendModel } from '@nimbalyst/runtime/ai/modelConstants';
 import { AgentTranscriptPanel } from '@nimbalyst/runtime/ui/AgentTranscript/components/AgentTranscriptPanel';
 import { ClaudeCliTerminalStrip } from './ClaudeCliTerminalStrip';
 import { ClaudeCliNotInstalledNotice } from './ClaudeCliNotInstalledNotice';
@@ -33,6 +34,7 @@ import { useDialog } from '../../contexts/DialogContext';
 import { FileGutter } from '../AIChat/FileGutter';
 import { recordClaudeActivity } from '../../store/listeners/claudeUsageListeners';
 import { recordCodexActivity } from '../../store/listeners/codexUsageListeners';
+import { recordOllamaActivity } from '../../store/listeners/ollamaUsageListeners';
 import { PendingReviewBanner } from '../AIChat/PendingReviewBanner';
 import { WakeupBanner } from '../AIChat/WakeupBanner';
 import type { AIMode } from './ModeTag';
@@ -1299,8 +1301,12 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
 
       await window.electronAPI.invoke('ai:sendMessage', message, docContext, sessionId, workspacePath);
 
-      // Record activity for usage tracking (wake up polling if sleeping)
-      if (provider?.startsWith('claude')) {
+      // Record activity for usage tracking (wake up polling if sleeping). Ollama
+      // uses the generic claude-code provider, so only an exact persisted backend
+      // identity may wake its trusted account-usage publisher.
+      if (isClaudeCodeOllamaBackendModel(currentModel)) {
+        recordOllamaActivity();
+      } else if (provider?.startsWith('claude')) {
         recordClaudeActivity();
       } else if (provider === 'openai-codex') {
         recordCodexActivity();
@@ -1319,7 +1325,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       });
       setIsProcessing(false);
     }
-  }, [sessionId, sessionData, isLoading, getEffectiveDocumentContext, aiMode, workspacePath, setDraftInput, setDraftAttachments, setLastSubmitAt, resetHistory, updateSessionStore, handleQueue, setIsProcessing, messages, sessionHasMessages, startedCliSessionId, mode, onClearSession, onClearAgentSession, clearAIInputHistory, provider, recordClaudeActivity]);
+  }, [sessionId, sessionData, isLoading, getEffectiveDocumentContext, aiMode, workspacePath, setDraftInput, setDraftAttachments, setLastSubmitAt, resetHistory, updateSessionStore, handleQueue, setIsProcessing, messages, sessionHasMessages, startedCliSessionId, mode, onClearSession, onClearAgentSession, clearAIInputHistory, provider, currentModel, recordClaudeActivity, recordCodexActivity, recordOllamaActivity]);
 
   // Launch a sibling session from a `launch: new-session` action prompt.
   // Builds the originating-session mention prefix here (in the renderer) so the

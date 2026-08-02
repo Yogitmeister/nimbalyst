@@ -206,6 +206,7 @@ async function handleGetProviderUsage(
         break;
       }
       case "ollama": {
+        await ollamaUsageService.recordActivity();
         const data = await ollamaUsageService.getUsage(forceRefresh);
         sections.push(formatOllamaUsage(data));
         break;

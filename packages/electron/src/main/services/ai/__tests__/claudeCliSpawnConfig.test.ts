@@ -90,6 +90,15 @@ describe('buildClaudeCliSpawnConfig', () => {
     expect(cfg.env.HOME).toBe('/Users/me');
   });
 
+  it('strips OLLAMA_API_KEY so genuine Claude children cannot receive the trusted usage-polling key', () => {
+    const cfg = buildClaudeCliSpawnConfig({
+      ...base,
+      baseEnv: { OLLAMA_API_KEY: 'sentinel-not-real', HOME: '/Users/me' },
+    });
+    expect(cfg.env.OLLAMA_API_KEY).toBeUndefined();
+    expect(cfg.env.HOME).toBe('/Users/me');
+  });
+
   it('strips CLAUDECODE so a Nimbalyst process launched inside a Claude Code session does not make the child CLI refuse to start', () => {
     const cfg = buildClaudeCliSpawnConfig({
       ...base,

@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES } from '../../modelConstants';
+import {
+  CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES,
+  isClaudeCodeOllamaBackendModel,
+} from '../../modelConstants';
 import { ModelIdentifier } from '../ModelIdentifier';
 
 describe('ModelIdentifier', () => {
@@ -32,6 +35,14 @@ describe('ModelIdentifier', () => {
           ModelIdentifier.parse(`claude-code-cli:${identity.variant}`)
         ).toThrow('Invalid Claude Code variant');
       }
+    });
+
+    it('recognizes only exact persisted Ollama backend identities', () => {
+      for (const identity of CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES) {
+        expect(isClaudeCodeOllamaBackendModel(identity.persistedModel)).toBe(true);
+        expect(isClaudeCodeOllamaBackendModel(`${identity.persistedModel}-ish`)).toBe(false);
+      }
+      expect(isClaudeCodeOllamaBackendModel('claude-code:sonnet')).toBe(false);
     });
 
     it('parses claude-code with 1m suffix', () => {

@@ -157,13 +157,15 @@ export interface ClaudeCliSpawnConfig {
  *
  * - `ANTHROPIC_API_KEY` — CLAUDE.md implicit-API-key rule: a stray shell key must
  *   never override (or get billed against) the CLI's own subscription login.
+ * - `OLLAMA_API_KEY` — trusted account polling may use it in Electron main, but
+ *   a genuine Claude child must never inherit it.
  * - `CLAUDECODE` — the running `claude` CLI sets this in its child env so nested
  *   processes know they're inside a Claude Code session. If Nimbalyst itself was
  *   launched from inside a `claude` session (e.g. dev started from Claude Code),
  *   the main process inherits `CLAUDECODE=1` and would forward it to our spawned
  *   CLI, which can then refuse to start.
  */
-const FORBIDDEN_ENV_KEYS: readonly string[] = ['ANTHROPIC_API_KEY', 'CLAUDECODE'];
+const FORBIDDEN_ENV_KEYS: readonly string[] = ['ANTHROPIC_API_KEY', 'OLLAMA_API_KEY', 'CLAUDECODE'];
 
 /**
  * Built-in CLI tools we deny so the model uses our MCP equivalents instead.
