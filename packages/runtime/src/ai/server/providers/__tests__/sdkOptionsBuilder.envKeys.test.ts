@@ -72,6 +72,7 @@ function makeParams(overrides: Partial<Parameters<typeof buildSdkOptions>[1]> = 
 describe('buildSdkOptions env-key hardening', () => {
   let originalAnthropic: string | undefined;
   let originalOpenAI: string | undefined;
+  let originalOllama: string | undefined;
   let originalEntrypoint: string | undefined;
   let originalToolSearch: string | undefined;
   let originalDisableAutoupdater: string | undefined;
@@ -80,6 +81,7 @@ describe('buildSdkOptions env-key hardening', () => {
   beforeEach(() => {
     originalAnthropic = process.env.ANTHROPIC_API_KEY;
     originalOpenAI = process.env.OPENAI_API_KEY;
+    originalOllama = process.env.OLLAMA_API_KEY;
     originalEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT;
     originalToolSearch = process.env.ENABLE_TOOL_SEARCH;
     originalDisableAutoupdater = process.env.DISABLE_AUTOUPDATER;
@@ -96,6 +98,11 @@ describe('buildSdkOptions env-key hardening', () => {
       delete process.env.OPENAI_API_KEY;
     } else {
       process.env.OPENAI_API_KEY = originalOpenAI;
+    }
+    if (originalOllama === undefined) {
+      delete process.env.OLLAMA_API_KEY;
+    } else {
+      process.env.OLLAMA_API_KEY = originalOllama;
     }
     if (originalEntrypoint === undefined) {
       delete process.env.CLAUDE_CODE_ENTRYPOINT;
@@ -130,6 +137,25 @@ describe('buildSdkOptions env-key hardening', () => {
 
     expect(options.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(options.env.OPENAI_API_KEY).toBeUndefined();
+  });
+
+  it('removes OLLAMA_API_KEY from ordinary lead and managed-child environments', async () => {
+    process.env.OLLAMA_API_KEY = 'ollama-key-from-process';
+    const teammateManager = {
+      resolveTeamContext: async () => undefined,
+      packagedBuildOptions: undefined as any,
+    } as Parameters<typeof buildSdkOptions>[0]['teammateManager'];
+
+    const { options } = await buildSdkOptions(
+      makeDeps({ teammateManager }),
+      makeParams({
+        shellEnv: { OLLAMA_API_KEY: 'ollama-key-from-shell' },
+        settingsEnv: { OLLAMA_API_KEY: 'ollama-key-from-settings' },
+      })
+    );
+
+    expect(options.env.OLLAMA_API_KEY).toBeUndefined();
+    expect(teammateManager.managedChildLaunchOptions?.env.OLLAMA_API_KEY).toBeUndefined();
   });
 
   it('ignores ANTHROPIC_API_KEY that settingsEnv might carry', async () => {

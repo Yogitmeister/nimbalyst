@@ -363,8 +363,9 @@ export async function buildSdkOptions(
   }
 
   // Set up environment variables.
-  // Strip API keys from every env source we compose so we never silently use
-  // a key the user didn't explicitly configure in Nimbalyst settings. A user's
+  // Strip Anthropic, OpenAI, and Ollama API keys from every env source we
+  // compose so an ordinary Claude SDK/managed-child session cannot inherit a
+  // provider credential the user did not explicitly configure for that route. A user's
   // .env file with ANTHROPIC_API_KEY was picked up here and billed their
   // personal Anthropic account $100+.
   //
@@ -374,9 +375,24 @@ export async function buildSdkOptions(
   // the Claude native binary treats the mere presence of that variable as an
   // API-key auth signal, which can shadow a valid OAuth/CLI login and produce
   // "Authentication failed" even though accountInfo() succeeds in settings.
-  const { ANTHROPIC_API_KEY: _envAnthropicKey, OPENAI_API_KEY: _envOpenaiKey, ...sanitizedProcessEnv } = process.env;
-  const { ANTHROPIC_API_KEY: _shellAnthropicKey, OPENAI_API_KEY: _shellOpenaiKey, ...sanitizedShellEnv } = shellEnv;
-  const { ANTHROPIC_API_KEY: _settingsAnthropicKey, OPENAI_API_KEY: _settingsOpenaiKey, ...sanitizedSettingsEnv } = settingsEnv;
+  const {
+    ANTHROPIC_API_KEY: _envAnthropicKey,
+    OPENAI_API_KEY: _envOpenaiKey,
+    OLLAMA_API_KEY: _envOllamaKey,
+    ...sanitizedProcessEnv
+  } = process.env;
+  const {
+    ANTHROPIC_API_KEY: _shellAnthropicKey,
+    OPENAI_API_KEY: _shellOpenaiKey,
+    OLLAMA_API_KEY: _shellOllamaKey,
+    ...sanitizedShellEnv
+  } = shellEnv;
+  const {
+    ANTHROPIC_API_KEY: _settingsAnthropicKey,
+    OPENAI_API_KEY: _settingsOpenaiKey,
+    OLLAMA_API_KEY: _settingsOllamaKey,
+    ...sanitizedSettingsEnv
+  } = settingsEnv;
 
   const enableAgentTeams = sanitizedSettingsEnv.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1';
   const env: any = {
