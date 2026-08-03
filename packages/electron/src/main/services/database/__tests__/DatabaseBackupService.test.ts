@@ -97,4 +97,64 @@ describe('DatabaseBackupService temp-dir cleanup', () => {
     // timestamped name), but no temp-backup-* should remain anywhere.
     expect(fs.existsSync(tempPath)).toBe(false);
   });
+
+  it('reports physical session bloat and dry-run guidance before another rolling copy', async () => {
+    const gib = 1024 ** 3;
+    const mib = 1024 ** 2;
+    const query = vi.fn(async (_sql: string) => ({
+      rows: [{
+        database_size_bytes: String(5 * gib),
+        ai_sessions_relation_size_bytes: String(1800 * mib),
+        ai_sessions_live_bytes: String(2 * mib),
+      }],
+    }));
+
+    const service = new DatabaseBackupService(
+      path.join(tmp, 'pglite-db'),
+      { query } as never,
+    );
+    const serviceWithGrowthProbe = service as unknown as {
+      metadata: {
+        currentBackup: { timestamp: string; size: number; verified: boolean };
+        previousBackup: { timestamp: string; size: number; verified: boolean };
+        oldestBackup: { timestamp: string; size: number; verified: boolean };
+        lastBackupAttempt: null;
+        lastSuccessfulBackup: null;
+      };
+      assessPhysicalGrowth: () => Promise<{
+        databaseSizeBytes: number;
+        aiSessionsRelationSizeBytes: number;
+        aiSessionsLiveBytes: number;
+        retainedBackupBytes: number;
+        projectedPeakBytes: number;
+        sessionPhysicalToLiveRatio: number;
+        maintenanceRecommended: boolean;
+        operatorGuidance: string | null;
+      }>;
+    };
+    serviceWithGrowthProbe.metadata = {
+      currentBackup: { timestamp: 'current', size: 5 * gib, verified: true },
+      previousBackup: { timestamp: 'previous', size: 5 * gib, verified: true },
+      oldestBackup: { timestamp: 'oldest', size: 5 * gib, verified: true },
+      lastBackupAttempt: null,
+      lastSuccessfulBackup: null,
+    };
+
+    const assessment = await serviceWithGrowthProbe.assessPhysicalGrowth();
+
+    expect(query).toHaveBeenCalledOnce();
+    expect(query.mock.calls[0]?.[0]).toContain('pg_database_size(current_database())');
+    expect(query.mock.calls[0]?.[0]).toContain("pg_total_relation_size('ai_sessions')");
+    expect(query.mock.calls[0]?.[0]).toContain('pg_column_size(metadata)');
+    expect(assessment).toMatchObject({
+      databaseSizeBytes: 5 * gib,
+      aiSessionsRelationSizeBytes: 1800 * mib,
+      aiSessionsLiveBytes: 2 * mib,
+      retainedBackupBytes: 15 * gib,
+      projectedPeakBytes: 20 * gib,
+      sessionPhysicalToLiveRatio: 900,
+      maintenanceRecommended: true,
+    });
+    expect(assessment.operatorGuidance).toMatch(/Settings.*dry-run.*before the next backup/i);
+  });
 });
