@@ -1,69 +1,81 @@
 import type { DocumentContext } from '@nimbalyst/runtime/ai/server/types';
-import { mergeClaimedRun, selectCoalescibleRun } from './coalesceQueuedPrompts';
+import type { QueueSettlementResult } from '../PGLiteQueuedPromptsStore';
+import { payloadReceiptsMatch, queueTruthMismatchError, type QueuedPromptPayloadReceipt } from './queuedPromptTruth';
+import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
+export type SessionPromptDispatchPreflight = (sessionId: string) => Promise<boolean>;
 
-/**
- * The per-session "a queued-prompt chain is running" guard, as an ownership lease.
- *
- * #1018: this used to be a bare `Set<string>`, and every dispatch released it in
- * its `finally` with an unconditional `delete(sessionId)`. When an interrupt
- * displaced an in-flight dispatch with a priority prompt, the displaced dispatch
- * eventually settled and deleted a guard the priority prompt now held — so an
- * ordinary FIFO prompt could be claimed and sent while the priority prompt was
- * still executing. Releasing now requires still being the owner.
- *
- * Extends `Set<string>` so every existing `.has(sessionId)` reader keeps working
- * unchanged, including the seven reads in MessageStreamingHandler.
- */
-export class SessionProcessingGuard extends Set<string> {
-  private owners = new Map<string, symbol>();
-
-  /** Take the guard for `sessionId`; the returned token is required to release it. */
-  acquire(sessionId: string): symbol {
-    const token = Symbol(sessionId);
-    this.owners.set(sessionId, token);
-    this.add(sessionId);
-    return token;
-  }
-
-  /** Release only if `token` is still the owner. Returns whether it released. */
-  releaseIfOwner(sessionId: string, token: symbol): boolean {
-    if (this.owners.get(sessionId) !== token) return false;
-    return this.delete(sessionId);
-  }
-
-  /**
-   * Unconditional release, used by the authoritative cancel/interrupt paths.
-   * Clearing the owner is what makes the displaced dispatch's later
-   * `releaseIfOwner` a no-op rather than a release of whoever came next.
-   */
-  override delete(sessionId: string): boolean {
-    this.owners.delete(sessionId);
-    return super.delete(sessionId);
-  }
+interface SessionWithDispatchMetadata {
+  metadata?: unknown;
 }
+
+export function createSessionPromptDispatchPreflight(
+  loadSession: (sessionId: string) => Promise<SessionWithDispatchMetadata | null>,
+): SessionPromptDispatchPreflight {
+  return async (sessionId: string): Promise<boolean> => {
+    try {
+      const session = await loadSession(sessionId);
+      if (!session) return false;
+
+      let metadata = session.metadata;
+      if (metadata === null || metadata === undefined) return true;
+      if (typeof metadata === 'string') {
+        try {
+          metadata = JSON.parse(metadata) as unknown;
+        } catch {
+          return false;
+        }
+      }
+      if (typeof metadata !== 'object' || Array.isArray(metadata)) return false;
+      return (metadata as Record<string, unknown>).modelChangeReconciliation == null;
+    } catch {
+      return false;
+    }
+  };
+}
+
+export const preflightSessionPromptDispatch = createSessionPromptDispatchPreflight(
+  (sessionId) => AISessionsRepository.get(sessionId),
+);
 
 export interface ClaimedQueuedPrompt {
   id: string;
   prompt: string;
+  claimToken?: string;
   attachments?: unknown[] | null;
   documentContext?: DocumentContext | null;
+  payloadReceipt?: QueuedPromptPayloadReceipt;
+  clientSubmissionId?: string;
+  sourceSessionId?: string;
+  sourceRoomId?: string;
+  submissionSequence?: number;
+  producer?: string;
+  claimTrigger?: string;
+  claimTriggeredAt?: number;
+  turnId?: string;
+  providerInputMessageId?: string;
+  providerOutputMessageId?: string;
 }
 
 export interface QueuedPromptStoreLike {
   listPending(sessionId: string): Promise<ClaimedQueuedPrompt[]>;
-  claim(promptId: string): Promise<ClaimedQueuedPrompt | null>;
-  complete(promptId: string): Promise<void>;
-  fail(promptId: string, errorMessage: string): Promise<void>;
+  claim(promptId: string, expectedSessionId: string, claimTrigger?: string): Promise<ClaimedQueuedPrompt | null>;
+  beginDispatch(promptId: string, expectedSessionId: string, claimToken: string): Promise<QueueSettlementResult>;
+  releaseClaim(promptId: string, expectedSessionId: string, claimToken: string): Promise<QueueSettlementResult>;
+  completeAfterDispatch(promptId: string, expectedSessionId: string, claimToken: string, terminal?: QueuedPromptTerminalReceipt): Promise<QueueSettlementResult>;
+  failAfterDispatch(promptId: string, errorMessage: string, expectedSessionId: string, claimToken: string, terminal?: QueuedPromptTerminalReceipt): Promise<QueueSettlementResult>;
 }
+
+export interface QueuedPromptTerminalReceipt {
+  lifecycle: 'completed' | 'failed';
+  terminalAt: number;
+  eventSequence: number;
+}
+
+const settlementAccepted = (result: QueueSettlementResult) =>
+  result.outcome === 'settled' || result.outcome === 'idempotent_same_claim';
 
 interface DispatchClaimedQueuedPromptOptions {
   claimed: ClaimedQueuedPrompt;
-  /**
-   * Every row this turn delivers. Defaults to `[claimed.id]`; a coalesced run
-   * passes all of its ids so complete/fail settle the whole batch rather than
-   * leaving the merged-away rows stuck in `executing`.
-   */
-  claimedIds?: string[];
   continueQueuedPromptChain: (
     sessionId: string,
     workspacePath: string,
@@ -74,7 +86,7 @@ interface DispatchClaimedQueuedPromptOptions {
   onAfterSettled?: () => Promise<void>;
   onChainSettled?: (payload: { sessionId: string; workspacePath: string; source: string }) => Promise<void>;
   onPromptClaimed: (payload: { sessionId: string; promptId: string }) => void;
-  processingSet: SessionProcessingGuard;
+  processingLeases: Map<string, symbol>;
   queueStore: QueuedPromptStoreLike;
   sendMessageHandler: (
     event: Electron.IpcMainInvokeEvent,
@@ -82,7 +94,7 @@ interface DispatchClaimedQueuedPromptOptions {
     documentContext?: DocumentContext,
     sessionId?: string,
     workspacePath?: string,
-  ) => Promise<{ content: string }>;
+  ) => Promise<{ content: string; queuedPromptTerminal?: QueuedPromptTerminalReceipt }>;
   sessionId: string;
   source: string;
   startSession: (options: { sessionId: string; workspacePath: string }) => Promise<void>;
@@ -95,13 +107,12 @@ export async function dispatchClaimedQueuedPrompt(
 ): Promise<void> {
   const {
     claimed,
-    claimedIds,
     continueQueuedPromptChain,
     logError,
     onAfterSettled,
     onChainSettled,
     onPromptClaimed,
-    processingSet,
+    processingLeases,
     queueStore,
     sendMessageHandler,
     sessionId,
@@ -111,57 +122,117 @@ export async function dispatchClaimedQueuedPrompt(
     workspacePath,
   } = options;
 
-  const settleIds = claimedIds && claimedIds.length > 0 ? claimedIds : [claimed.id];
-
-  // #1018: hold the guard as a lease. An interrupt can drop it and hand the
-  // session to a priority prompt while this dispatch is still in flight, so the
-  // release below must check it is still the owner.
-  const guardToken = processingSet.acquire(sessionId);
+  const dispatchLease = Symbol(`queued-prompt:${sessionId}:${claimed.id}`);
+  const claimToken = claimed.claimToken;
+  if (!claimToken) {
+    throw new Error(`Queued prompt ${claimed.id} was claimed without an ownership token`);
+  }
+  processingLeases.set(sessionId, dispatchLease);
 
   try {
     await startSession({ sessionId, workspacePath });
   } catch (error) {
-    processingSet.releaseIfOwner(sessionId, guardToken);
+    const release = await queueStore.releaseClaim(claimed.id, sessionId, claimToken);
+    if (!settlementAccepted(release)) {
+      logError(`[AIService] Failed to release pre-dispatch claim ${claimed.id} (${release.outcome})`, error);
+    }
+    if (processingLeases.get(sessionId) === dispatchLease) processingLeases.delete(sessionId);
     throw error;
   }
 
-  // Announce every merged row, not just the head, so the renderer clears the
-  // whole run from the queue list instead of leaving stale entries on screen.
-  for (const promptId of settleIds) {
-    onPromptClaimed({ sessionId, promptId });
+  try {
+    onPromptClaimed({ sessionId, promptId: claimed.id });
+  } catch (notificationError) {
+    logError(`[AIService] Failed to notify renderer of claimed prompt ${claimed.id}:`, notificationError);
   }
 
   const docContext = {
     ...(claimed.documentContext || {}),
     queuedPromptId: claimed.id,
     attachments: claimed.attachments,
+    // This travels with the persisted input message. It binds the source and
+    // terminal-output identities without using timestamps, prompt text, or
+    // array position as a proxy.
+    queuedPromptTruth: {
+      clientSubmissionId: claimed.clientSubmissionId ?? claimed.id,
+      queueRowId: claimed.id,
+      sourceSessionId: claimed.sourceSessionId ?? sessionId,
+      sourceRoomId: claimed.sourceRoomId ?? sessionId,
+      submissionSequence: claimed.submissionSequence,
+      producer: claimed.producer,
+      claimTrigger: claimed.claimTrigger,
+      claimTriggeredAt: claimed.claimTriggeredAt,
+      turnId: claimed.turnId,
+      providerInputMessageId: claimed.providerInputMessageId,
+      providerOutputMessageId: claimed.providerOutputMessageId,
+      payloadReceipt: claimed.payloadReceipt,
+      lifecycle: 'streaming' as const,
+    },
   } as DocumentContext;
 
   setImmediate(async () => {
+    let dispatchStarted = false;
+    let compatibleSettlement = false;
     try {
+      if (processingLeases.get(sessionId) !== dispatchLease) return;
+      if (claimed.payloadReceipt && !payloadReceiptsMatch(claimed.prompt, claimed.payloadReceipt)) {
+        throw queueTruthMismatchError();
+      }
+      const begin = await queueStore.beginDispatch(claimed.id, sessionId, claimToken);
+      if (!settlementAccepted(begin)) {
+        logError(`[AIService] Dispatch intent rejected for queued prompt ${claimed.id} (${begin.outcome})`, new Error(begin.outcome));
+        return;
+      }
+      dispatchStarted = true;
+      if (processingLeases.get(sessionId) !== dispatchLease) return;
       const mockEvent = {
         sender: targetWindow.webContents,
         senderFrame: targetWindow.webContents.mainFrame,
       } as Electron.IpcMainInvokeEvent;
 
-      await sendMessageHandler(mockEvent, claimed.prompt, docContext, sessionId, workspacePath);
-      for (const promptId of settleIds) {
-        await queueStore.complete(promptId);
+      const result = await sendMessageHandler(mockEvent, claimed.prompt, docContext, sessionId, workspacePath);
+      const completion = result.queuedPromptTerminal?.lifecycle === 'failed'
+        ? await queueStore.failAfterDispatch(
+            claimed.id,
+            'Provider returned a terminal error',
+            sessionId,
+            claimToken,
+            result.queuedPromptTerminal,
+          )
+        : result.queuedPromptTerminal
+          ? await queueStore.completeAfterDispatch(claimed.id, sessionId, claimToken, result.queuedPromptTerminal)
+          : await queueStore.completeAfterDispatch(claimed.id, sessionId, claimToken);
+      compatibleSettlement = settlementAccepted(completion);
+      if (!compatibleSettlement) {
+        logError(`[AIService] Completion rejected for queued prompt ${claimed.id} (${completion.outcome})`, new Error(completion.outcome));
       }
     } catch (queueError) {
       logError(`[AIService] Failed to process queued prompt ${claimed.id}:`, queueError);
-      for (const promptId of settleIds) {
-        await queueStore.fail(
-          promptId,
-          queueError instanceof Error ? queueError.message : 'Unknown error',
-        );
+      const terminal = (queueError as Error & { queuedPromptTerminal?: QueuedPromptTerminalReceipt }).queuedPromptTerminal;
+      const settlement = dispatchStarted
+        ? terminal
+          ? await queueStore.failAfterDispatch(
+              claimed.id,
+              queueError instanceof Error ? queueError.message : 'Unknown error',
+              sessionId,
+              claimToken,
+              terminal,
+            )
+          : await queueStore.failAfterDispatch(
+              claimed.id,
+              queueError instanceof Error ? queueError.message : 'Unknown error',
+              sessionId,
+              claimToken,
+            )
+        : await queueStore.releaseClaim(claimed.id, sessionId, claimToken);
+      compatibleSettlement = settlementAccepted(settlement);
+      if (!compatibleSettlement) {
+        logError(`[AIService] Failure settlement rejected for queued prompt ${claimed.id} (${settlement.outcome})`, queueError);
       }
     } finally {
-      // Only release if this dispatch still owns the guard: if an interrupt
-      // displaced it, the priority prompt that replaced it is still running and
-      // releasing here would let the FIFO continuation start a second turn
-      // underneath it (#1018).
-      processingSet.releaseIfOwner(sessionId, guardToken);
+      if (processingLeases.get(sessionId) !== dispatchLease) return;
+      processingLeases.delete(sessionId);
+      if (!compatibleSettlement) return;
       try {
         await continueQueuedPromptChain(
           sessionId,
@@ -176,7 +247,7 @@ export async function dispatchClaimedQueuedPrompt(
       // The inner sendMessage's completion handler deferred endSession because
       // processingSet still contained this session (we hadn't reached this
       // delete yet), so nobody has marked the session idle. Do it now.
-      if (!processingSet.has(sessionId) && onChainSettled) {
+      if (!processingLeases.has(sessionId) && onChainSettled) {
         try {
           await onChainSettled({ sessionId, workspacePath, source });
         } catch (settledErr) {
@@ -201,7 +272,8 @@ interface TryClaimAndDispatchNextQueuedPromptOptions {
   onAfterSettled?: DispatchClaimedQueuedPromptOptions['onAfterSettled'];
   onChainSettled?: DispatchClaimedQueuedPromptOptions['onChainSettled'];
   onPromptClaimed: DispatchClaimedQueuedPromptOptions['onPromptClaimed'];
-  processingSet: SessionProcessingGuard;
+  processingLeases: Map<string, symbol>;
+  preflight: SessionPromptDispatchPreflight;
   queueStore: QueuedPromptStoreLike;
   sendMessageHandler: DispatchClaimedQueuedPromptOptions['sendMessageHandler'] | null;
   sessionId: string;
@@ -222,7 +294,8 @@ export async function tryClaimAndDispatchNextQueuedPrompt(
     onAfterSettled,
     onChainSettled,
     onPromptClaimed,
-    processingSet,
+    processingLeases,
+    preflight,
     queueStore,
     sendMessageHandler,
     sessionId,
@@ -243,49 +316,36 @@ export async function tryClaimAndDispatchNextQueuedPrompt(
     return false;
   }
 
-  if (processingSet.has(sessionId)) {
+  if (processingLeases.has(sessionId)) {
     logInfo(`[AIService] ${source}: session ${sessionId} already processing a queued prompt, skipping`);
+    return false;
+  }
+
+  if (!(await preflight(sessionId))) {
+    logInfo(`[AIService] ${source}: session admission preflight rejected ${sessionId}`);
     return false;
   }
 
   const pendingPrompts = await queueStore.listPending(sessionId);
   if (pendingPrompts.length === 0) {
-    // logInfo(`[AIService] ${source}: no pending prompts for session ${sessionId}`);
+    logInfo(`[AIService] ${source}: no pending prompts for session ${sessionId}`);
     return false;
   }
 
-  // Agent-authored rows deliver as one turn; a human row keeps its own turn and
-  // bounds the run on both sides. See coalesceQueuedPrompts.ts.
-  const run = selectCoalescibleRun(pendingPrompts);
-  const nextPrompt = run[0];
+  const nextPrompt = pendingPrompts[0];
   logInfo(`[AIService] ${source}: processing prompt ${nextPrompt.id} for session ${sessionId}`);
 
-  const claimedHead = await queueStore.claim(nextPrompt.id);
-  if (!claimedHead) {
+  const claimed = await queueStore.claim(nextPrompt.id, sessionId, source);
+  if (!claimed) {
     logInfo(`[AIService] ${source}: prompt ${nextPrompt.id} already claimed`);
     return false;
   }
 
-  // Claim the tail one row at a time. A row that fails to claim was taken by
-  // another drainer, so stop extending rather than skipping over it -- pulling
-  // the row behind it forward would deliver the run out of order.
-  const claimedRun = [claimedHead];
-  for (const queued of run.slice(1)) {
-    const claimedNext = await queueStore.claim(queued.id);
-    if (!claimedNext) break;
-    claimedRun.push(claimedNext);
-  }
-
-  const claimed = mergeClaimedRun(claimedRun);
-  const claimedIds = claimedRun.map((row) => row.id);
-
-  if (claimedRun.length > 1) {
-    logInfo(`[AIService] ${source}: coalesced ${claimedRun.length} agent-authored prompts into one turn for session ${sessionId}`);
-  }
-
   if (!sendMessageHandler) {
-    for (const promptId of claimedIds) {
-      await queueStore.fail(promptId, 'sendMessageHandler not initialized');
+    if (!claimed.claimToken) throw new Error(`Queued prompt ${claimed.id} was claimed without an ownership token`);
+    const release = await queueStore.releaseClaim(claimed.id, sessionId, claimed.claimToken);
+    if (!settlementAccepted(release)) {
+      logError(`[AIService] Failed to release uninitialized-handler claim ${claimed.id} (${release.outcome})`, new Error(release.outcome));
     }
     logError('[AIService] Failed to process queued prompt because sendMessageHandler is not initialized', new Error('sendMessageHandler not initialized'));
     return false;
@@ -293,13 +353,12 @@ export async function tryClaimAndDispatchNextQueuedPrompt(
 
   await dispatchClaimedQueuedPrompt({
     claimed,
-    claimedIds,
     continueQueuedPromptChain,
     logError,
     onAfterSettled,
     onChainSettled,
     onPromptClaimed,
-    processingSet,
+    processingLeases,
     queueStore,
     sendMessageHandler,
     sessionId,

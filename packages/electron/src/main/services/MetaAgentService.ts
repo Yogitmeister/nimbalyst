@@ -1,4 +1,3 @@
-import type { OrchestrationMessageKind } from '@nimbalyst/runtime/ai/server/types';
 import path from 'path';
 import { BrowserWindow } from 'electron';
 import { randomUUID } from 'crypto';
@@ -6,14 +5,7 @@ import { safeHandle } from '../utils/ipcRegistry';
 import { SessionManager } from '@nimbalyst/runtime/ai/server';
 import type { AIProviderType, PromptProvenance } from '@nimbalyst/runtime/ai/server/types';
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
-import {
-  EFFORT_LEVELS,
-  clampEffortLevel,
-  type EffortLevel,
-} from '@nimbalyst/runtime/ai/server/effortLevels';
-import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
-import { AgentMessagesRepository } from '@nimbalyst/runtime/storage/repositories/AgentMessagesRepository';
-import { SessionFilesRepository } from '@nimbalyst/runtime/storage/repositories/SessionFilesRepository';
+import { AISessionsRepository, AgentMessagesRepository, SessionFilesRepository } from '@nimbalyst/runtime';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { getDefaultAIModel } from '../utils/store';
 import { toMillis } from '../utils/timestampUtils';
@@ -25,11 +17,15 @@ import { gitRefWatcher } from '../file/GitRefWatcher';
 import { AIService } from './ai/AIService';
 import { setMetaAgentToolFns } from '../mcp/metaAgentServer';
 import { computeNotificationSignature } from './metaAgentNotificationSignature';
-import { deletePendingChildUpdates } from './ai/pendingChildUpdates';
 import { extractMessageText, extractUserPrompts } from './metaAgentMessageText';
 import type { NotificationOptions, NotificationResult } from './NotificationService';
-import type { MobilePushResult } from '@nimbalyst/runtime/sync/types';
 import { composeNotificationTitle } from '../../shared/notificationTitle';
+import {
+  createPriorityPromptDeliveryService,
+  createPriorityTargetGeneration,
+  type PriorityControlPrompt,
+  type PriorityTargetState,
+} from './PriorityPromptDeliveryService';
 
 type SessionStatusValue = 'idle' | 'running' | 'waiting_for_input' | 'error' | 'interrupted';
 type PromptType = 'permission_request' | 'ask_user_question_request' | 'exit_plan_mode_request';
@@ -76,31 +72,6 @@ interface CreateChildSessionArgs {
   useWorktree?: boolean;
   worktreeId?: string;
   toolScope?: string;
-  /**
-   * Reasoning effort for the new session. Omit to leave the child on the
-   * app-wide default (what every spawn did before this existed) — an omitted
-   * value is NOT inherited from the caller.
-   */
-  effortLevel?: string;
-}
-
-/**
- * Validate a caller-supplied effort level. Deliberately throws instead of
- * using `parseEffortLevel`, which returns the 'high' default for unrecognized
- * input — that would turn a typo ('mid') into a silent, plausible-looking
- * choice the caller never made.
- */
-function validateRequestedEffortLevel(value: string | undefined): EffortLevel | undefined {
-  if (value === undefined || value === null || value === '') {
-    return undefined;
-  }
-  const match = EFFORT_LEVELS.find((entry) => entry.key === value);
-  if (!match) {
-    throw new Error(
-      `Invalid effortLevel "${value}". Expected one of: ${EFFORT_LEVELS.map((entry) => entry.key).join(', ')}`
-    );
-  }
-  return match.key;
 }
 
 function normalizeStoredChildModelIdentifier(
@@ -147,13 +118,6 @@ interface SpawnSessionArgs {
    * caller's workstream.
    */
   isolated?: boolean;
-  /**
-   * Reasoning effort for the new session (e.g. spawn an
-   * `openai-codex:gpt-6-astra` session at 'medium'). Clamped to the resolved
-   * model's ceiling. Omit to leave the child on the app-wide default; unlike
-   * `model` there is no inherit-from-caller mode.
-   */
-  effortLevel?: string;
 }
 
 interface NotifyUserArgs {
@@ -165,21 +129,17 @@ interface NotifyUserArgs {
   urgency?: 'normal' | 'critical' | 'low';
 }
 
+interface SendPromptNowArgs {
+  sessionId: string;
+  prompt: string;
+  idempotencyKey?: string;
+  controlOperation?: string;
+  interruptWaitingForInput?: boolean;
+}
+
 type ShowNotificationWithResult = (
   options: NotificationOptions
 ) => Promise<NotificationResult>;
-
-/**
- * Injected rather than imported: `SyncManager` pulls in the runtime barrel, the
- * window manager and the Stytch client, and this service is imported by a lot of
- * tests that have no business loading any of that.
- */
-type RequestMobilePush = (
-  sessionId: string,
-  title: string,
-  body: string,
-  options: { force?: boolean; reason?: string }
-) => Promise<MobilePushResult | null>;
 
 export class MetaAgentService {
   private static instance: MetaAgentService | null = null;
@@ -192,7 +152,6 @@ export class MetaAgentService {
   private notificationSignatures = new Map<string, string>();
   private ipcHandlersRegistered = false;
   private showNotificationWithResult: ShowNotificationWithResult | null = null;
-  private requestMobilePush: RequestMobilePush | null = null;
 
   private constructor() {}
 
@@ -233,8 +192,7 @@ export class MetaAgentService {
 
   public async start(
     aiService: AIService,
-    showNotificationWithResult: ShowNotificationWithResult,
-    requestMobilePush?: RequestMobilePush
+    showNotificationWithResult: ShowNotificationWithResult
   ): Promise<void> {
     if (this.started) {
       return;
@@ -248,7 +206,6 @@ export class MetaAgentService {
     this.starting = (async () => {
       this.aiService = aiService;
       this.showNotificationWithResult = showNotificationWithResult;
-      this.requestMobilePush = requestMobilePush ?? null;
       this.sessionManager = new SessionManager();
       await this.sessionManager.initialize();
 
@@ -265,8 +222,10 @@ export class MetaAgentService {
           this.getSessionResultJson(targetSessionId, workspaceId, options),
         listQueuedPrompts: (_metaSessionId, workspaceId, targetSessionId, options) =>
           this.listQueuedPromptsJson(targetSessionId, workspaceId, options),
-        sendPrompt: (metaSessionId, workspaceId, targetSessionId, prompt, interrupt, messageKind) =>
-          this.sendPromptToSession(metaSessionId, targetSessionId, workspaceId, prompt, interrupt, messageKind),
+        sendPrompt: (metaSessionId, workspaceId, targetSessionId, prompt) =>
+          this.sendPromptToSession(metaSessionId, targetSessionId, workspaceId, prompt),
+        sendPromptNow: (metaSessionId, workspaceId, args) =>
+          this.sendPromptNowToSession(metaSessionId, workspaceId, args),
         notifyUser: (callerSessionId, workspaceId, args) =>
           this.notifyUserJson(callerSessionId, workspaceId, args),
         respondToPrompt: (_metaSessionId, workspaceId, args) =>
@@ -452,8 +411,6 @@ export class MetaAgentService {
     createdBySessionId: string;
     queuedInitialPrompt: boolean;
     parentSessionId: string | null;
-    /** Effort actually applied, after clamping; null when left on the app default. */
-    effortLevel: string | null;
   }> {
     if (!this.aiService) {
       throw new Error('AI service not initialized');
@@ -461,10 +418,6 @@ export class MetaAgentService {
     if (args.useWorktree && args.worktreeId) {
       throw new Error('useWorktree and worktreeId cannot be combined');
     }
-
-    // Validate before any side effect, so a bad effortLevel can't leave a
-    // half-created worktree or session row behind.
-    const requestedEffortLevel = validateRequestedEffortLevel(args.effortLevel);
 
     // Defense-in-depth: a child-completion notification (built in
     // buildNotificationMessage) starts literally with '[Child Session Update]'.
@@ -675,20 +628,6 @@ export class MetaAgentService {
       await AISessionsRepository.updateMetadata(sessionId, { metadata: { toolScope: childToolScope } });
     }
 
-    // Reasoning effort: every turn reads it back out of session metadata
-    // (MessageStreamingHandler for codex/others, buildClaudeCodeRuntimeConfig
-    // for claude-code), so writing it here is all that's needed. Clamp to the
-    // resolved model's ceiling so the child's effort selector displays the same
-    // level the provider will actually run at, rather than a level the
-    // transport would silently lower. Writing nothing leaves the child on the
-    // app-wide default.
-    const childEffortLevel = requestedEffortLevel
-      ? clampEffortLevel(requestedEffortLevel, normalizedModel)
-      : undefined;
-    if (childEffortLevel) {
-      await AISessionsRepository.updateMetadata(sessionId, { metadata: { effortLevel: childEffortLevel } });
-    }
-
     const initialPrompt = args.prompt?.trim();
     const shouldBypassExecution = this.shouldBypassChildAgentExecutionForTests();
 
@@ -745,7 +684,6 @@ export class MetaAgentService {
       createdBySessionId: metaSessionId,
       queuedInitialPrompt: !!initialPrompt,
       parentSessionId: args.parentSessionIdOverride ?? null,
-      effortLevel: childEffortLevel ?? null,
     };
   }
 
@@ -799,7 +737,6 @@ export class MetaAgentService {
       useWorktree: !!args.useWorktree,
       worktreeId: inheritedWorktreeId,
       model: effectiveModel,
-      effortLevel: args.effortLevel,
       parentSessionIdOverride: workstreamId,
     });
 
@@ -979,7 +916,28 @@ export class MetaAgentService {
       includeCompleted: options.includeCompleted === true,
       prompts: prompts.map((prompt) => ({
         id: prompt.id,
+        clientSubmissionId: prompt.clientSubmissionId ?? prompt.id,
+        sourceSessionId: prompt.sourceSessionId ?? prompt.sessionId,
+        sourceRoomId: prompt.sourceRoomId ?? prompt.sessionId,
+        submissionSequence: prompt.submissionSequence ?? null,
+        producer: prompt.producer ?? null,
+        payloadReceipt: prompt.payloadReceipt ?? null,
+        claimTrigger: prompt.claimTrigger ?? null,
+        claimTriggeredAt: prompt.claimTriggeredAt ?? null,
+        turnId: prompt.turnId ?? null,
+        providerInputMessageId: prompt.providerInputMessageId ?? null,
+        providerOutputMessageId: prompt.providerOutputMessageId ?? null,
+        terminalStatus: prompt.terminalStatus ?? null,
+        terminalAt: prompt.terminalAt ?? null,
         status: prompt.status,
+        deliveryClass: prompt.deliveryClass,
+        priorityRank: prompt.priorityRank,
+        deliveryReady: prompt.deliveryReady,
+        claimTokenPresent: Boolean(prompt.claimToken),
+        dispatchStartedAt: prompt.dispatchStartedAt ?? null,
+        settlementProvenance: prompt.settlementProvenance ?? null,
+        interruptTargetGeneration: prompt.interruptTargetGeneration ?? null,
+        interruptReceipt: prompt.interruptReceipt ?? null,
         createdAt: prompt.createdAt,
         claimedAt: prompt.claimedAt ?? null,
         completedAt: prompt.completedAt ?? null,
@@ -992,23 +950,11 @@ export class MetaAgentService {
     }, null, 2);
   }
 
-  /**
-   * Queue a prompt for another session, optionally stopping whatever that
-   * session is doing first.
-   *
-   * `interrupt` is the tool-side twin of the transcript's send-now lightning
-   * bolt (SessionTranscript.handleSendNowQueuedPrompt): stop the turn, then
-   * drive the queue. Like the button, it drains FIFO -- if the target already
-   * has pending rows, the interrupt delivers the oldest one, not necessarily
-   * this prompt.
-   */
   private async sendPromptToSession(
     originSessionId: string,
     sessionId: string,
     workspaceId: string,
     prompt: string,
-    interrupt = false,
-    messageKind: OrchestrationMessageKind = 'instruction',
   ): Promise<string> {
     if (!this.aiService) {
       throw new Error('AI service not initialized');
@@ -1022,14 +968,14 @@ export class MetaAgentService {
       throw new Error(`Session ${sessionId} not found`);
     }
 
-    const normalizedPrompt = prompt.trim();
+    // Whitespace validation above is not payload normalization.
+    const normalizedPrompt = prompt;
     const shouldBypassExecution = this.shouldBypassChildAgentExecutionForTests();
     const statusRow = await this.getSessionStatusRow(sessionId, workspaceId);
     const statusBeforeQueue = (statusRow?.status || 'idle') as SessionStatusValue;
     const promptProvenance: PromptProvenance = {
       actor: 'agent',
       origin: 'session-orchestration',
-      messageKind,
       originSessionId,
     };
 
@@ -1041,14 +987,10 @@ export class MetaAgentService {
         prompt: normalizedPrompt,
         statusBeforeQueue,
         processingTriggered: false,
-        interrupted: false,
         bypassedExecutionForTest: true,
       }, null, 2);
     }
 
-    // Queue before interrupting: the drive that follows the interrupt has to
-    // find this row, and an interrupt that lands first would just idle the
-    // session with nothing waiting for it.
     const queued = await this.aiService.queuePromptForSession(
       sessionId,
       normalizedPrompt,
@@ -1056,36 +998,12 @@ export class MetaAgentService {
       { promptProvenance },
     );
     const status = (statusRow?.status || 'idle') as SessionStatusValue;
-    const workspaceForDrive = session.worktreePath || session.workspacePath || workspaceId;
-    const idleEnoughToDrive = status === 'idle' || status === 'interrupted' || status === 'error';
-    const interruptSkippedReason = interrupt
-      ? this.reasonToSkipInterrupt(status, session.provider)
-      : null;
-    const shouldInterrupt = interrupt && !interruptSkippedReason;
+    const processingTriggered = status === 'idle' || status === 'interrupted' || status === 'error';
 
-    let processingTriggered = idleEnoughToDrive;
-    let interrupted = false;
-    let interruptMethod: string | null = null;
-    let driveOutcome: string | null = null;
-
-    if (shouldInterrupt) {
-      const result = await this.aiService.interruptCurrentTurn(sessionId);
-      interrupted = result.success;
-      interruptMethod = result.method ?? null;
-      // The drive runs even when the interrupt found no live provider: a session
-      // that only nominally reports running has nothing else coming to trigger it.
-      //
-      // 'send-now' rather than 'meta-agent' so a closed project window can be
-      // opened to receive the prompt, matching the lightning bolt.
-      const outcome = await this.aiService.driveQueuedPrompts(sessionId, workspaceForDrive, 'send-now');
-      driveOutcome = outcome.kind;
-      // A deferred drive is not a failure: the interrupt may not have settled
-      // yet, and the driver arms a session-idle wake to dispatch when it does.
-      processingTriggered = outcome.kind === 'dispatched';
-    } else if (idleEnoughToDrive) {
+    if (processingTriggered) {
       await this.aiService.triggerQueuedPromptProcessingForSession(
         sessionId,
-        workspaceForDrive,
+        session.worktreePath || session.workspacePath || workspaceId,
         'meta-agent'
       );
     }
@@ -1096,32 +1014,69 @@ export class MetaAgentService {
       prompt: queued.prompt,
       statusBeforeQueue: status,
       processingTriggered,
-      interrupted,
-      ...(interruptMethod ? { interruptMethod } : {}),
-      ...(interruptSkippedReason ? { interruptSkippedReason } : {}),
-      ...(driveOutcome ? { driveOutcome } : {}),
     }, null, 2);
   }
 
-  /**
-   * Why an `interrupt: true` request must not actually interrupt.
-   *
-   * - `waiting_for_input`: the session is parked on an interactive prompt.
-   *   Interrupting aborts the question instead of answering it; the caller
-   *   wants respond_to_prompt.
-   * - `claude-code-cli`: a terminal-backed session drains its queue through the
-   *   CLI flush path, not the provider queue driver. The transcript hides the
-   *   lightning bolt for these for the same reason.
-   * - Already idle: there is no turn in the way, so the ordinary drive applies.
-   */
-  private reasonToSkipInterrupt(
-    status: SessionStatusValue,
-    provider: string | undefined,
-  ): string | null {
-    if (provider === 'claude-code-cli') return 'terminal-session';
-    if (status === 'waiting_for_input') return 'waiting-for-input';
-    if (status === 'idle' || status === 'interrupted' || status === 'error') return 'session-not-running';
-    return null;
+  private async getPriorityTargetState(sessionId: string, workspaceId: string): Promise<PriorityTargetState> {
+    const row = await this.getSessionStatusRow(sessionId, workspaceId);
+    if (!row) {
+      return { status: 'missing', generation: createPriorityTargetGeneration('missing', null, null), lastActivity: null, updatedAt: null };
+    }
+    const status = (['idle', 'running', 'waiting_for_input', 'error', 'interrupted'].includes(row.status)
+      ? row.status
+      : 'error') as PriorityTargetState['status'];
+    const lastActivity = toMillis(row.last_activity);
+    const updatedAt = toMillis(row.updated_at);
+    return { status, generation: createPriorityTargetGeneration(status, lastActivity, updatedAt), lastActivity, updatedAt };
+  }
+
+  private async sendPromptNowToSession(
+    callerSessionId: string,
+    workspaceId: string,
+    args: SendPromptNowArgs,
+  ): Promise<string> {
+    if (!this.aiService) throw new Error('AI service not initialized');
+    const sessionId = args.sessionId?.trim();
+    const prompt = args.prompt?.trim();
+    if (!sessionId) throw new Error('sessionId is required');
+    if (!prompt) throw new Error('prompt is required');
+    const session = await AISessionsRepository.get(sessionId);
+    if (!session || session.workspacePath !== workspaceId) throw new Error(`Session ${sessionId} not found`);
+
+    const { getQueuedPromptsStore } = await import('./RepositoryManager');
+    const queueStore = getQueuedPromptsStore();
+    const priorityService = createPriorityPromptDeliveryService({
+      createControlPrompt: async (input) => {
+        const created = await queueStore.createPriorityControlPrompt(input);
+        return { row: created.row as unknown as PriorityControlPrompt, replayed: created.replayed };
+      },
+      getTargetState: (targetSessionId, targetWorkspaceId) => this.getPriorityTargetState(targetSessionId, targetWorkspaceId),
+      hasStructuredPendingPrompt: async (targetSessionId) => (await this.getPendingInteractivePrompt(targetSessionId)) !== null,
+      reserveInterrupt: async (input) => {
+        const reserved = await queueStore.reservePriorityInterrupt(input);
+        return { row: reserved.row as unknown as PriorityControlPrompt, reserved: reserved.reserved };
+      },
+      recordInterruptReceipt: async (input) =>
+        await queueStore.recordPriorityInterruptReceipt(input) as unknown as PriorityControlPrompt,
+      interruptCurrentTurn: (targetSessionId, expectedState) =>
+        this.aiService!.interruptCurrentTurnForPriorityDelivery(targetSessionId, expectedState.generation),
+      triggerProcessing: (targetSessionId, targetWorkspaceId) => {
+        this.aiService!.releasePriorityQueueHandoffForDelivery(targetSessionId);
+        return this.aiService!.triggerQueuedPromptProcessingForSession(targetSessionId, targetWorkspaceId, 'meta-agent');
+      },
+      getControlPrompt: async (promptId) =>
+        await queueStore.get(promptId) as unknown as PriorityControlPrompt | null,
+    });
+    const receipt = await priorityService.deliver({
+      sessionId,
+      workspacePath: session.worktreePath || session.workspacePath || workspaceId,
+      prompt,
+      idempotencyKey: args.idempotencyKey?.trim() || `send_prompt_now:${callerSessionId}:${randomUUID()}`,
+      producer: `send_prompt_now:${callerSessionId}`,
+      controlOperation: args.controlOperation?.trim() || 'agent_priority_prompt',
+      interruptWaitingForInput: args.interruptWaitingForInput === true,
+    });
+    return JSON.stringify(receipt, null, 2);
   }
 
   private async notifyUserJson(
@@ -1154,7 +1109,6 @@ export class MetaAgentService {
     const result = await this.showNotificationWithResult({
       title: composeNotificationTitle(sourceLabel, title),
       body: boundedBody,
-      kind: 'agent-complete',
       sessionId: targetSessionId,
       workspacePath: session.workspacePath,
       sourceLabel,
@@ -1164,27 +1118,10 @@ export class MetaAgentService {
       urgency: args.urgency || 'normal',
     });
 
-    // Forced (#1268): `urgency: 'critical'` is the agent saying the human is
-    // needed now, which is exactly the case the server's presence suppression
-    // must not swallow. Anything below critical stays desktop-only.
-    const isUrgent = args.urgency === 'critical';
-    let mobilePush: MobilePushResult | null = null;
-    if (isUrgent && this.requestMobilePush) {
-      try {
-        mobilePush = await this.requestMobilePush(targetSessionId, sourceLabel, boundedBody, {
-          force: true,
-          reason: 'notify_urgent',
-        });
-      } catch (err) {
-        console.warn('[MetaAgentService] notify_user mobile push failed:', err);
-      }
-    }
-
     return JSON.stringify({
       tool: 'notify_user',
-      deliveryChannel: mobilePush ? 'os_notification+mobile_push' : 'os_notification',
-      mobilePushAttempted: mobilePush !== null,
-      mobilePush: mobilePush ?? undefined,
+      deliveryChannel: 'os_notification',
+      mobilePushAttempted: false,
       sessionId: targetSessionId,
       bypassFocusCheck: args.bypassFocusCheck === true,
       result,
@@ -1346,19 +1283,6 @@ export class MetaAgentService {
       }
 
       const notification = this.buildNotificationMessage(eventType, result);
-
-      // Supersede rather than append. The signature dedup above only collapses
-      // duplicates within a single child turn (it resets on
-      // session:started/session:streaming), so a child that cycles
-      // idle -> running -> idle emits a fresh session:completed every cycle and
-      // the parent accumulates one row per cycle per child. Those rows are not
-      // independent facts: each is a snapshot of the same child, and the newest
-      // is the only one still true by the time the parent reads it. Dropping the
-      // stale pending row keeps the parent's queue proportional to the number of
-      // children rather than to the number of turns they take.
-      //
-      await deletePendingChildUpdates(session.createdBySessionId, session.id);
-
       await this.aiService.queuePromptForSession(
         session.createdBySessionId,
         notification,
@@ -1367,7 +1291,6 @@ export class MetaAgentService {
           promptProvenance: {
             actor: 'agent',
             origin: 'child-session-update',
-            messageKind: eventType === 'session:completed' ? 'report' : eventType === 'session:waiting' ? 'question' : 'error',
             originSessionId: session.id,
           },
         },
@@ -1398,13 +1321,9 @@ export class MetaAgentService {
       `Event: ${eventType}`,
     ];
 
-    // The original task is deliberately not repeated here. This notification is
-    // only ever queued to the child's `createdBySessionId`, which is the session
-    // that wrote that prompt in the first place -- it is already in the parent's
-    // own transcript. Re-embedding up to 2,000 characters of it in every update
-    // was the largest part of each row, repeated once per child turn. The title
-    // and session id above are enough to identify the child; `get_session_result`
-    // returns the full prompt when a parent genuinely needs it.
+    if (result.originalPrompt) {
+      lines.push(`Original task: ${result.originalPrompt}`);
+    }
     if (result.recentMessages.length > 0) {
       lines.push('Recent messages:');
       for (const message of result.recentMessages) {
@@ -1522,13 +1441,7 @@ export class MetaAgentService {
     let editedFiles: string[] = [];
     try {
       const fileLinks = await SessionFilesRepository.getFilesBySession(sessionId, 'edited');
-      // #1244: these rows are the per-edit-EVENT history (deduped upstream on
-      // toolUseId, not on path), so a file edited twenty times appears twenty
-      // times. Consumers here want the set of files touched -- collapse to
-      // unique paths, keeping first-edit order.
-      editedFiles = [
-        ...new Set(fileLinks.map((file: any) => this.stripWorkspacePath(file.filePath, workspaceId))),
-      ];
+      editedFiles = fileLinks.map((file: any) => this.stripWorkspacePath(file.filePath, workspaceId));
     } catch {
       editedFiles = [];
     }

@@ -89,6 +89,14 @@ type NotifyUserArgs = {
   urgency?: "normal" | "critical" | "low";
 };
 
+type SendPromptNowArgs = {
+  sessionId: string;
+  prompt: string;
+  idempotencyKey?: string;
+  controlOperation?: string;
+  interruptWaitingForInput?: boolean;
+};
+
 interface MetaAgentToolFns {
   listWorktrees: (
     metaSessionId: string,
@@ -128,6 +136,11 @@ interface MetaAgentToolFns {
     prompt: string,
     interrupt?: boolean,
     messageKind?: OrchestrationMessageKind
+  ) => Promise<string>;
+  sendPromptNow: (
+    metaSessionId: string,
+    workspaceId: string,
+    args: SendPromptNowArgs,
   ) => Promise<string>;
   notifyUser: (
     metaSessionId: string,
@@ -381,6 +394,21 @@ export const META_AGENT_TOOL_DEFS: Array<{
     },
   },
   {
+    name: "send_prompt_now",
+    description: "Durably queue a priority control prompt and, when authorized, interrupt the target's current ordinary turn. Use FIFO send_prompt for ordinary delivery; structured interactive prompts must use respond_to_prompt.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: { type: "string", description: "The target child session ID." },
+        prompt: { type: "string", description: "The priority control prompt." },
+        idempotencyKey: { type: "string", description: "Optional stable request key for durable replay." },
+        controlOperation: { type: "string", description: "Optional audit label for the control action." },
+        interruptWaitingForInput: { type: "boolean", description: "Explicit authority to interrupt an ordinary-text waiting session." },
+      },
+      required: ["sessionId", "prompt"],
+    },
+  },
+  {
     name: "notify_user",
     description:
       "Show a local OS/system notification to get the human's attention. Use this for explicitly authorized asynchronous attention signals when chat may be missed. This is separate from voice mode; it respects the user's OS notification setting and returns JSON explaining whether the notification was shown or skipped.",
@@ -487,6 +515,7 @@ const EXTENSION_META_AGENT_ALLOWED_TOOLS = new Set<string>([
   "get_session_result",
   "list_queued_prompts",
   "send_prompt",
+  "send_prompt_now",
   "notify_user",
   "respond_to_prompt",
   "list_spawned_sessions",
@@ -571,6 +600,8 @@ export async function dispatchMetaAgentTool(
         args?.interrupt === true,
         (args?.messageKind as OrchestrationMessageKind | undefined) ?? 'instruction'
       );
+    case "send_prompt_now":
+      return toolFns.sendPromptNow(aiSessionId, effectiveWorkspaceId, (args ?? {}) as SendPromptNowArgs);
     case "notify_user":
       return toolFns.notifyUser(aiSessionId, effectiveWorkspaceId, (args ?? {}) as NotifyUserArgs);
     case "respond_to_prompt":

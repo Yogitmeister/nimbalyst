@@ -1,4 +1,3 @@
-import { isRetainedSession, sessionActivityAt, SESSION_TRANSCRIPT_TTL_MS } from '@nimbalyst/collab-protocol';
 /**
  * CollabV3 Sync Provider
  *
@@ -6,9 +5,9 @@ import { isRetainedSession, sessionActivityAt, SESSION_TRANSCRIPT_TTL_MS } from 
  * Uses WebSocket connections to Durable Objects with DO SQLite storage.
  *
  * Authentication:
- * - Uses personal Stytch JWTs or personal node access tokens
- * - User ID is extracted from the credential's 'sub' claim
- * - Credential is sent via the WebSocket URL's token query parameter
+ * - Uses Stytch session JWTs for all WebSocket connections
+ * - User ID is extracted from the JWT 'sub' claim
+ * - JWT is sent in the Authorization header (with protocol workaround for WebSocket)
  *
  * Key differences from Y.js sync (CollabV2):
  * - Simple append-only message protocol (no CRDTs)
@@ -18,29 +17,11 @@ import { isRetainedSession, sessionActivityAt, SESSION_TRANSCRIPT_TTL_MS } from 
  */
 
 import type { AgentMessage } from '../ai/server/types';
-import type { PersonalJwt, PersonalMemberId } from '../auth/jwtScopes';
 import { shouldSyncMessageForSessionRoom, truncateContentForSync } from './syncContentTruncator';
-import { appendSyncClientParams, redactSyncUrl } from './syncClientInfo';
-import { decodeNodeAccessTokenClaims, isNodeAccessToken } from './nodeCredentialToken';
+import { appendSyncClientParams } from './syncClientInfo';
 import { buildSyncedSessionIndexFields } from './sessionIndexEntryFields';
 import { resolveIndexSortTimestamp } from './sessionSortTimestamp';
-import {
-  createIndexPublicationGate,
-  createKeyedSerialQueue,
-  createPublishSequencer,
-  indexPatchSignature,
-} from './indexPublication';
-import {
-  bootstrapIndexMirror,
-  createIndexReplicationMirror,
-  deltaSyncIndexMirror,
-  type DecryptedIndexChange,
-  type IndexPageRequestInput,
-} from './indexReplicationClient';
 import { deriveTrackerPersonalStateKey } from './trackerPersonalStateKey';
-import { hasPublishableConfig } from './projectConfig';
-import { IndexEntryDecryptionError } from './indexEntryDecryptionError';
-import { createPersonalSyncWriteGate, type PersonalSyncWriteGateSnapshot } from './personalSyncWriteGate';
 import type {
   SyncConfig,
   SyncStatus,
@@ -65,31 +46,9 @@ import type {
   SessionControlMessage,
   EncryptedAttachment,
   FileIndexData,
-  MobilePushOptions,
-  MobilePushResult,
-  PushChangeOutcome,
 } from './types';
 import { filterSessionsForPersonalSync } from './types';
-import type { FleetActivitySnapshot, PushRejectionCause } from '@nimbalyst/collab-protocol';
 import type { SyncedReadReceipt } from '../readReceipts/readReceipts';
-
-/**
- * `readyState` values, spelled out rather than read off the global
- * `WebSocket` constructor.
- *
- * These are fixed by the WHATWG spec, and every implementation a host might
- * inject through `SyncConfig.createWebSocket` uses the same numbers. Reading
- * them from the global would make a host with no global `WebSocket` throw
- * `ReferenceError` on the hot path even though it supplied its own socket.
- */
-const WS_CONNECTING = 0;
-const WS_OPEN = 1;
-
-/**
- * How long to wait for the server's `mobilePushResult` before giving up. Older
- * servers never send one, so this is also the ceiling on a no-op await.
- */
-const MOBILE_PUSH_ACK_TIMEOUT_MS = 10_000;
 
 // ============================================================================
 // CollabV3 Protocol Types (matches server)
@@ -112,13 +71,28 @@ interface EncryptedMessage {
 
 /** Encrypted queued prompt for wire protocol */
 interface EncryptedQueuedPrompt {
-  options?: import("./types").RemoteTurnOptions;
   id: string;
   /** Encrypted prompt text (base64) */
   encryptedPrompt: string;
   /** IV for prompt decryption (base64) */
   iv: string;
   timestamp: number;
+  clientSubmissionId?: string;
+  sourceSessionId?: string;
+  sourceRoomId?: string;
+  submissionSequence?: number;
+  producer?: string;
+  payloadUtf8Bytes?: number;
+  payloadUnicodeScalars?: number;
+  payloadSha256?: string;
+  claimTrigger?: string;
+  claimTriggeredAt?: number;
+  turnId?: string;
+  providerInputMessageId?: string;
+  providerOutputMessageId?: string;
+  streamEventSequence?: number;
+  terminalStatus?: 'streaming' | 'completed' | 'failed';
+  terminalAt?: number;
   /** Encrypted image attachments from mobile (each independently encrypted) */
   encryptedAttachments?: WireEncryptedAttachment[];
 }
@@ -140,10 +114,25 @@ interface WireEncryptedAttachment {
 
 /** Plaintext queued prompt (after decryption) */
 interface PlaintextQueuedPrompt {
-  options?: import("./types").RemoteTurnOptions;
   id: string;
   prompt: string;
   timestamp: number;
+  clientSubmissionId?: string;
+  sourceSessionId?: string;
+  sourceRoomId?: string;
+  submissionSequence?: number;
+  producer?: string;
+  payloadUtf8Bytes?: number;
+  payloadUnicodeScalars?: number;
+  payloadSha256?: string;
+  claimTrigger?: string;
+  claimTriggeredAt?: number;
+  turnId?: string;
+  providerInputMessageId?: string;
+  providerOutputMessageId?: string;
+  streamEventSequence?: number;
+  terminalStatus?: 'streaming' | 'completed' | 'failed';
+  terminalAt?: number;
   /** Decrypted image attachments from mobile */
   attachments?: EncryptedAttachment[];
 }
@@ -164,19 +153,6 @@ interface SessionMetadata {
   projectIdIv: string;
   createdAt: number;
   updatedAt: number;
-  /**
-   * Dead field. Nothing anywhere assigns it: no producer in runtime, electron,
-   * iOS or the collab server, and `@nimbalyst/collab-protocol` does not declare
-   * it at all. The server has never persisted it; iOS decodes it once
-   * (`SyncProtocol.swift`) and never reads it. Every reference in this file is
-   * a pass-through copy of a value that is always `undefined`.
-   *
-   * Deliberately NOT part of the v2 parity set: it needs no clear contract
-   * (`null` vs absent vs object) and no server persistence, because there is
-   * nothing to clear. Left in place rather than removed so the legacy wire
-   * shape is untouched. If a real producer ever appears, define the clear
-   * semantics THEN, together with the consumer that needs them.
-   */
   pendingExecution?: {
     messageId: string;
     sentAt: number;
@@ -212,8 +188,6 @@ interface SessionIndexEntry {
   parentSessionId?: string;
   /** Worktree ID for git worktree association (plaintext UUID) */
   worktreeId?: string;
-  /** Stable device ID of the host that owns this session. */
-  hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'). Plaintext - drives mobile meta-agent grouping. */
   agentRole?: string;
   /** Meta-agent parent session ID for spawned children (plaintext UUID). Drives mobile meta-agent grouping. */
@@ -228,12 +202,7 @@ interface SessionIndexEntry {
   branchPointMessageId?: number;
   /** When this session was branched (unix ms) */
   branchedAt?: number;
-  /**
-   * Omitted when the sender does not know the count. The server COALESCEs an
-   * omitted count with the stored one, so a metadata-only publish no longer
-   * overwrites the real count with a synthetic zero.
-   */
-  messageCount?: number;
+  messageCount: number;
   lastMessageAt: number;
   createdAt: number;
   updatedAt: number;
@@ -259,11 +228,9 @@ interface SessionIndexEntry {
 }
 
 /** Decrypted session index entry with required title and projectId - used for return values */
-type DecryptedSessionIndexEntry = Omit<SessionIndexEntry, 'title' | 'encryptedTitle' | 'titleIv' | 'encryptedProjectId' | 'projectIdIv' | 'encryptedQueuedPrompts' | 'encryptedClientMetadata' | 'clientMetadataIv' | 'messageCount'> & {
+type DecryptedSessionIndexEntry = Omit<SessionIndexEntry, 'title' | 'encryptedTitle' | 'titleIv' | 'encryptedProjectId' | 'projectIdIv' | 'encryptedQueuedPrompts' | 'encryptedClientMetadata' | 'clientMetadataIv'> & {
   title: string;  // Required after decryption
   projectId: string;  // Decrypted project ID
-  /** Optional on the wire (omitted = "keep what you have"); always concrete here. */
-  messageCount: number;
   queuedPrompts?: PlaintextQueuedPrompt[];  // Decrypted queued prompts
   currentContext?: { tokens: number; contextWindow: number };  // Decrypted from client metadata
   hasBeenNamed?: boolean;  // Decrypted from client metadata
@@ -357,88 +324,19 @@ type ClientMessage =
   | { type: 'indexBatchUpdate'; sessions: SessionIndexEntry[] }
   | { type: 'indexDelete'; sessionId: string }
   | { type: 'deviceAnnounce'; device: DeviceInfo }
-  | { type: 'createSessionRequest'; request: EncryptedCreateSessionRequest; targetDeviceId?: string }
+  | { type: 'createSessionRequest'; request: EncryptedCreateSessionRequest }
   | { type: 'createSessionResponse'; response: EncryptedCreateSessionResponse }
-  | { type: 'createWorktreeRequest'; request: EncryptedCreateWorktreeRequest; targetDeviceId?: string }
+  | { type: 'createWorktreeRequest'; request: EncryptedCreateWorktreeRequest }
   | { type: 'createWorktreeResponse'; response: EncryptedCreateWorktreeResponse }
   | { type: 'voiceToolRequest'; request: EncryptedVoiceToolRequest }
   | { type: 'voiceToolResponse'; response: EncryptedVoiceToolResponse }
-  | { type: 'sessionControl'; message: { sessionId: string; messageType: string; payload?: Record<string, unknown>; timestamp: number; sentBy: 'desktop' | 'mobile'; sentByDeviceId?: string; targetDeviceId?: string } }
-  | {
-      type: 'requestMobilePush';
-      sessionId: string;
-      title: string;
-      body: string;
-      requestingDeviceId?: string;
-      requestId?: string;
-      force?: boolean;
-      reason?: string;
-    }
-  | { type: 'fleetActivityUpdate'; activity: FleetActivitySnapshot; shownOnDesktop?: boolean }
+  | { type: 'sessionControl'; message: { sessionId: string; messageType: string; payload?: Record<string, unknown>; timestamp: number; sentBy: 'desktop' | 'mobile' } }
+  | { type: 'requestMobilePush'; sessionId: string; title: string; body: string; requestingDeviceId?: string }
   | { type: 'settingsSync'; settings: EncryptedSettingsPayload }
   | { type: 'readReceipt'; receipt: EncryptedReadReceiptPayload }
   | { type: 'trackerPersonalState'; state: EncryptedTrackerPersonalStatePayload }
   | { type: 'fileIndexUpdate'; file: EncryptedFileIndexEntry }
-  | { type: 'fileIndexDelete'; docId: string }
-  | ({ type: 'indexPageRequest'; protocolVersion: 2; requestId: string } & IndexPageRequestInput)
-  | { type: 'personalStatePageRequest'; requestId: string; pageToken?: string; limit?: number };
-
-/**
- * One row of a v2 index page, still encrypted. Shape is fixed by
- * `@nimbalyst/collab-protocol/indexReplication.ts`; spelled out here against
- * this file's own wire types the same way the rest of `ServerMessage` is.
- */
-interface IndexChangeWire {
-  removalReason?: 'expired' | 'deleted';
-  entity: 'session' | 'project' | 'file';
-  id: string;
-  revision: number;
-  deleted: boolean;
-  session?: SessionIndexEntry;
-  project?: ServerProjectEntry;
-  file?: EncryptedFileIndexEntry;
-}
-
-/**
- * Independent bounded replay of the personal-state streams. Shape is fixed by
- * `@nimbalyst/collab-protocol/indexReplication.ts`; these pages carry no
- * revisions and never establish index coverage.
- */
-interface PersonalStatePageResponseWire {
-  type: 'personalStatePageResponse';
-  requestId: string;
-  entries: Array<
-    | { type: 'readReceiptBroadcast'; receipt: EncryptedReadReceiptPayload; fromConnectionId?: string }
-    | { type: 'trackerPersonalStateBroadcast'; state: EncryptedTrackerPersonalStatePayload; fromConnectionId?: string }
-  >;
-  nextPageToken?: string;
-  complete: boolean;
-}
-
-interface IndexPageResponseWire {
-  type: 'indexPageResponse';
-  protocolVersion: 2;
-  requestId: string;
-  mode: 'bootstrap' | 'delta' | 'recent' | 'lookup';
-  entries: IndexChangeWire[];
-  nextPageToken?: string;
-  cursor?: number;
-  complete: boolean;
-  resetRequired?: boolean;
-}
-
-/**
- * Thrown when the server does not understand `indexPageRequest`. Distinct from
- * every other failure because it -- and only it -- authorizes the legacy
- * full-index fallback. A transport error or a partial bootstrap must never be
- * laundered into "use the old path and carry on".
- */
-class IndexProtocolUnsupportedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'IndexProtocolUnsupportedError';
-  }
-}
+  | { type: 'fileIndexDelete'; docId: string };
 
 /** Encrypted file index entry for wire protocol */
 interface EncryptedFileIndexEntry {
@@ -468,7 +366,6 @@ interface ServerProjectEntry {
 }
 
 type ServerMessage =
-  | { type: 'indexSessionExpired'; sessionId: string; activityAt: number }
   | { type: 'syncResponse'; messages: EncryptedMessage[]; metadata: SessionMetadata | null; hasMore: boolean; cursor: string | null }
   | { type: 'messageBroadcast'; message: EncryptedMessage; fromConnectionId?: string }
   | { type: 'metadataBroadcast'; metadata: Partial<SessionMetadata>; fromConnectionId?: string }
@@ -478,24 +375,17 @@ type ServerMessage =
   | { type: 'devicesList'; devices: DeviceInfo[] }
   | { type: 'deviceJoined'; device: DeviceInfo }
   | { type: 'deviceLeft'; deviceId: string }
-  | { type: 'createSessionRequestBroadcast'; request: EncryptedCreateSessionRequest; targetDeviceId?: string; fromConnectionId?: string }
+  | { type: 'createSessionRequestBroadcast'; request: EncryptedCreateSessionRequest; fromConnectionId?: string }
   | { type: 'createSessionResponseBroadcast'; response: EncryptedCreateSessionResponse; fromConnectionId?: string }
-  | { type: 'createWorktreeRequestBroadcast'; request: EncryptedCreateWorktreeRequest; targetDeviceId?: string; fromConnectionId?: string }
+  | { type: 'createWorktreeRequestBroadcast'; request: EncryptedCreateWorktreeRequest; fromConnectionId?: string }
   | { type: 'createWorktreeResponseBroadcast'; response: EncryptedCreateWorktreeResponse; fromConnectionId?: string }
   | { type: 'voiceToolRequestBroadcast'; request: EncryptedVoiceToolRequest; fromConnectionId?: string }
   | { type: 'voiceToolResponseBroadcast'; response: EncryptedVoiceToolResponse; fromConnectionId?: string }
-  | { type: 'sessionControlBroadcast'; message: { sessionId: string; messageType: string; payload?: Record<string, unknown>; timestamp: number; sentBy: 'desktop' | 'mobile'; sentByDeviceId?: string; targetDeviceId?: string }; fromConnectionId?: string }
+  | { type: 'sessionControlBroadcast'; message: { sessionId: string; messageType: string; payload?: Record<string, unknown>; timestamp: number; sentBy: 'desktop' | 'mobile' }; fromConnectionId?: string }
   | { type: 'settingsSyncBroadcast'; settings: EncryptedSettingsPayload; fromConnectionId?: string }
   | { type: 'readReceiptBroadcast'; receipt: EncryptedReadReceiptPayload; fromConnectionId?: string }
   | { type: 'trackerPersonalStateBroadcast'; state: EncryptedTrackerPersonalStatePayload; fromConnectionId?: string }
-  | ({ type: 'mobilePushResult'; requestId: string; sessionId: string } & MobilePushResult)
-  | IndexPageResponseWire
-  | PersonalStatePageResponseWire
-  // Wake-up hint only. It carries the server's newest revision so the client can
-  // skip a pointless poll; it is never an applied cursor and never evidence
-  // that the local mirror covers that revision.
-  | { type: 'indexChangesAvailable'; revision: number }
-  | { type: 'error'; code: string; message: string; requestId?: string };
+  | { type: 'error'; code: string; message: string };
 
 // ============================================================================
 // JWT Utilities
@@ -503,8 +393,6 @@ type ServerMessage =
 
 interface JwtClaims {
   sub: string;
-  /** Node access-token expiry in UNIX seconds; Stytch refresh is owned by getJwt. */
-  exp?: number;
   /** Stytch B2B organization_id claim. Personal-scoped JWTs carry the personal orgId; team-scoped JWTs carry the team orgId. */
   organization_id?: string;
 }
@@ -513,11 +401,7 @@ interface JwtClaims {
  * Decode a JWT's payload claims. Does not verify the signature -- the server does that.
  * The JWT is a base64url encoded string in the format: header.payload.signature
  */
-function decodeJwtClaims(jwt: PersonalJwt): JwtClaims {
-  if (isNodeAccessToken(jwt)) {
-    const { sub, org, exp } = decodeNodeAccessTokenClaims(jwt);
-    return { sub, organization_id: org, exp };
-  }
+function decodeJwtClaims(jwt: string): JwtClaims {
   try {
     const parts = jwt.split('.');
     if (parts.length !== 3) {
@@ -653,8 +537,22 @@ async function encryptQueuedPrompts(
         encryptedPrompt: encrypted,
         iv,
         timestamp: prompt.timestamp,
-        ...(prompt.attachments?.length ? { encryptedAttachments: prompt.attachments } : {}),
-        ...(prompt.options ? {options: prompt.options} : {}),
+        clientSubmissionId: prompt.clientSubmissionId,
+        sourceSessionId: prompt.sourceSessionId,
+        sourceRoomId: prompt.sourceRoomId,
+        submissionSequence: prompt.submissionSequence,
+        producer: prompt.producer,
+        payloadUtf8Bytes: prompt.payloadUtf8Bytes,
+        payloadUnicodeScalars: prompt.payloadUnicodeScalars,
+        payloadSha256: prompt.payloadSha256,
+        claimTrigger: prompt.claimTrigger,
+        claimTriggeredAt: prompt.claimTriggeredAt,
+        turnId: prompt.turnId,
+        providerInputMessageId: prompt.providerInputMessageId,
+        providerOutputMessageId: prompt.providerOutputMessageId,
+        streamEventSequence: prompt.streamEventSequence,
+        terminalStatus: prompt.terminalStatus,
+        terminalAt: prompt.terminalAt,
       };
     })
   );
@@ -675,8 +573,23 @@ async function decryptQueuedPrompts(
         id: prompt.id,
         prompt: decryptedPrompt,
         timestamp: prompt.timestamp,
+        clientSubmissionId: prompt.clientSubmissionId,
+        sourceSessionId: prompt.sourceSessionId,
+        sourceRoomId: prompt.sourceRoomId,
+        submissionSequence: prompt.submissionSequence,
+        producer: prompt.producer,
+        payloadUtf8Bytes: prompt.payloadUtf8Bytes,
+        payloadUnicodeScalars: prompt.payloadUnicodeScalars,
+        payloadSha256: prompt.payloadSha256,
+        claimTrigger: prompt.claimTrigger,
+        claimTriggeredAt: prompt.claimTriggeredAt,
+        turnId: prompt.turnId,
+        providerInputMessageId: prompt.providerInputMessageId,
+        providerOutputMessageId: prompt.providerOutputMessageId,
+        streamEventSequence: prompt.streamEventSequence,
+        terminalStatus: prompt.terminalStatus,
+        terminalAt: prompt.terminalAt,
       };
-      if (prompt.options) result.options = prompt.options;
       // Pass through encrypted attachments (desktop decrypts them when processing)
       if (prompt.encryptedAttachments && prompt.encryptedAttachments.length > 0) {
         result.attachments = prompt.encryptedAttachments;
@@ -826,20 +739,6 @@ function buildClientMetadataFromCacheEntry(entry: Pick<
 }
 
 /**
- * Signature of everything an `indexClientMetadataPatch` would actually put on
- * the wire for this entry. Computed from plaintext, before encryption: AES-GCM
- * uses a fresh nonce per call, so comparing ciphertext would report a change
- * every single time. See `indexPublication.ts`.
- */
-function indexPatchSignatureForEntry(entry: CachedSessionIndex): string {
-  return indexPatchSignature({
-    isExecuting: entry.isExecuting,
-    lastReadAt: entry.lastReadAt,
-    clientMetadata: buildClientMetadataFromCacheEntry(entry) as Record<string, unknown> | undefined,
-  });
-}
-
-/**
  * Encrypt client metadata for wire transmission.
  */
 async function encryptClientMetadata(
@@ -909,275 +808,6 @@ async function decryptProjectId(
 }
 
 /**
- * Turn a wire `SessionIndexEntry` into the pair the client keeps: the decrypted
- * entry handed to callers of `fetchIndex`, and the cache row the rest of the
- * provider reads.
- *
- * ANY decryption failure throws `IndexEntryDecryptionError`, on every path. A
- * v2 page is the unit that advances the replication cursor, so silently
- * dropping a field -- or a whole row -- would mark coverage complete over data
- * we never read. The legacy full response and live broadcasts are held to the
- * same rule because the alternative was GitHub #1117: the legacy path used to
- * treat an unreadable row as something to delete from the server and republish
- * under this device's key, which wiped every other device's index. A row this
- * key cannot read is a key problem on this device, never server state to fix.
- *
- * Shared by all paths so they cannot drift in what they carry off the wire.
- */
-
-/**
- * Contract check for one row of a v2 page, run BEFORE any decryption.
- *
- * Everything here fails the page rather than skipping the row. A page is the
- * unit that advances the replication cursor: a row we quietly ignore is a row
- * the cursor claims coverage over and the local side never saw. That includes
- * files, whose payload we treat as opaque -- opaque is not the same as
- * unvalidated, and the identity still has to line up.
- */
-function assertValidIndexChange(change: IndexChangeWire): void {
-  if (change.removalReason !== undefined && (!change.deleted || change.entity !== 'session'
-    || !['expired', 'deleted'].includes(change.removalReason))) {
-    throw new IndexEntryDecryptionError('Invalid session removal reason');
-  }
-  if (change.entity !== 'session' && change.entity !== 'project' && change.entity !== 'file') {
-    throw new IndexEntryDecryptionError(`Unknown index entity '${String((change as { entity?: unknown }).entity)}' for ${String(change.id)}`);
-  }
-  if (typeof change.id !== 'string' || change.id.length === 0) {
-    throw new IndexEntryDecryptionError(`Index change for ${change.entity} carried no id`);
-  }
-  if (!Number.isSafeInteger(change.revision) || change.revision < 0) {
-    throw new IndexEntryDecryptionError(`Index change ${change.entity}:${change.id} carried an unusable revision: ${String(change.revision)}`);
-  }
-  if (typeof change.deleted !== 'boolean') {
-    throw new IndexEntryDecryptionError(`Index change ${change.entity}:${change.id} carried a non-boolean deleted flag`);
-  }
-
-  const payloads = [change.session, change.project, change.file].filter((p) => p !== undefined);
-  if (change.deleted) {
-    // A tombstone with a payload is ambiguous: delete or upsert?
-    if (payloads.length > 0) {
-      throw new IndexEntryDecryptionError(`Tombstone ${change.entity}:${change.id} carried a payload`);
-    }
-    return;
-  }
-  if (payloads.length !== 1) {
-    throw new IndexEntryDecryptionError(`Index change ${change.entity}:${change.id} carried ${payloads.length} payloads; expected exactly 1`);
-  }
-
-  // The payload has to be the one the entity names, and it has to describe the
-  // same row the change id does -- otherwise the mirror would key a row by one
-  // identity while holding another's data.
-  if (change.entity === 'session') {
-    if (!change.session) throw new IndexEntryDecryptionError(`Session change ${change.id} carried a non-session payload`);
-    if (change.session.sessionId !== change.id) {
-      throw new IndexEntryDecryptionError(`Session change ${change.id} carries payload for ${String(change.session.sessionId)}`);
-    }
-    return;
-  }
-  if (change.entity === 'project') {
-    if (!change.project) throw new IndexEntryDecryptionError(`Project change ${change.id} carried a non-project payload`);
-    // Project identity on the wire is the ENCRYPTED project id.
-    if (change.project.encryptedProjectId !== change.id) {
-      throw new IndexEntryDecryptionError(`Project change ${change.id} carries payload for a different encrypted project id`);
-    }
-    return;
-  }
-  if (!change.file) throw new IndexEntryDecryptionError(`File change ${change.id} carried a non-file payload`);
-  if (change.file.docId !== change.id) {
-    throw new IndexEntryDecryptionError(`File change ${change.id} carries payload for ${String(change.file.docId)}`);
-  }
-}
-
-async function decryptSessionIndexEntry(
-  entry: SessionIndexEntry,
-  key: CryptoKey | undefined,
-): Promise<{ decrypted: DecryptedSessionIndexEntry; cacheEntry: CachedSessionIndex }> {
-  let projectId: string;
-  if (entry.encryptedProjectId && entry.projectIdIv && key) {
-    try {
-      projectId = await decryptProjectId(entry.encryptedProjectId, entry.projectIdIv, key);
-    } catch {
-      throw new IndexEntryDecryptionError(`Cannot decrypt projectId for session ${entry.sessionId}`);
-    }
-  } else {
-    projectId = 'unknown';
-  }
-
-  let title: string;
-  if (entry.encryptedTitle && entry.titleIv && key) {
-    try {
-      title = await decryptTitle(entry.encryptedTitle, entry.titleIv, key);
-    } catch {
-      throw new IndexEntryDecryptionError(`Cannot decrypt title for session ${entry.sessionId}`);
-    }
-  } else {
-    title = 'Untitled';
-  }
-
-  let queuedPrompts: Array<{ id: string; prompt: string; timestamp: number }> | undefined;
-  if (entry.encryptedQueuedPrompts && entry.encryptedQueuedPrompts.length > 0 && key) {
-    try {
-      queuedPrompts = await decryptQueuedPrompts(entry.encryptedQueuedPrompts, key);
-    } catch {
-      throw new IndexEntryDecryptionError(`Cannot decrypt queued prompts for session ${entry.sessionId}`);
-    }
-  } else if (entry.queuedPromptCount === 0 || Array.isArray(entry.encryptedQueuedPrompts)) {
-    queuedPrompts = [];
-  }
-
-  let currentContext: CachedSessionIndex['currentContext'];
-  let hasPendingPrompt: boolean | undefined;
-  let phase: string | undefined;
-  let tags: string[] | undefined;
-  let draftInput: string | undefined;
-  let draftUpdatedAt: number | undefined;
-  let hasBeenNamed: boolean | undefined;
-  if (entry.encryptedClientMetadata && entry.clientMetadataIv && key) {
-    try {
-      const clientMeta = await decryptClientMetadata(entry.encryptedClientMetadata, entry.clientMetadataIv, key);
-      currentContext = clientMeta.currentContext;
-      hasPendingPrompt = clientMeta.hasPendingPrompt;
-      phase = clientMeta.phase;
-      tags = clientMeta.tags;
-      // An empty string is a real value: it is how "clear draft" reaches the
-      // renderer from another device.
-      draftInput = clientMeta.draftInput;
-      draftUpdatedAt = clientMeta.draftUpdatedAt;
-      hasBeenNamed = clientMeta.hasBeenNamed;
-    } catch {
-      throw new IndexEntryDecryptionError(`Cannot decrypt client metadata for session ${entry.sessionId}`);
-    }
-  }
-
-  const decrypted: DecryptedSessionIndexEntry = {
-    sessionId: entry.sessionId,
-    projectId,
-    title,
-    provider: entry.provider,
-    model: entry.model,
-    mode: entry.mode,
-    sessionType: entry.sessionType,
-    parentSessionId: entry.parentSessionId,
-    worktreeId: entry.worktreeId,
-    hostDeviceId: entry.hostDeviceId,
-    agentRole: entry.agentRole,
-    createdBySessionId: entry.createdBySessionId,
-    isArchived: entry.isArchived,
-    isPinned: entry.isPinned,
-    branchedFromSessionId: entry.branchedFromSessionId,
-    branchPointMessageId: entry.branchPointMessageId,
-    branchedAt: entry.branchedAt,
-    messageCount: entry.messageCount ?? 0,
-    lastMessageAt: entry.lastMessageAt,
-    createdAt: entry.createdAt,
-    updatedAt: entry.updatedAt,
-    pendingExecution: entry.pendingExecution,
-    isExecuting: entry.isExecuting,
-    queuedPromptCount: entry.queuedPromptCount,
-    queuedPrompts,
-    hasPendingPrompt: hasPendingPrompt ?? entry.hasPendingPrompt,
-    currentContext,
-    lastReadAt: entry.lastReadAt,
-  };
-
-  const cacheEntry: CachedSessionIndex = {
-    ...decrypted,
-    phase,
-    tags,
-    draftInput,
-    draftUpdatedAt,
-    hasBeenNamed,
-  };
-
-  return { decrypted, cacheEntry };
-}
-
-/** Decrypted project row, as returned to `fetchIndex` callers. */
-interface DecryptedProjectIndexEntry {
-  projectId: string;
-  name: string;
-  sessionCount: number;
-  lastActivityAt: number;
-  syncEnabled: boolean;
-  gitRemoteHash?: string;
-}
-
-/**
- * Decrypt a wire `ProjectIndexEntry`. Throws `IndexEntryDecryptionError` when
- * the projectId was written under a different key; the name falls back to the
- * path tail when only the name fails, since the id alone still identifies the
- * project.
- */
-async function decryptProjectIndexEntry(
-  proj: ServerProjectEntry,
-  key: CryptoKey | undefined,
-): Promise<DecryptedProjectIndexEntry> {
-  let projectId: string;
-  if (proj.encryptedProjectId && proj.projectIdIv && key) {
-    try {
-      projectId = await decryptProjectId(proj.encryptedProjectId, proj.projectIdIv, key);
-    } catch {
-      throw new IndexEntryDecryptionError('Cannot decrypt projectId for a project index entry');
-    }
-  } else {
-    projectId = 'unknown';
-  }
-
-  let name: string;
-  if (proj.encryptedName && proj.nameIv && key) {
-    try {
-      name = await decryptProjectName(proj.encryptedName, proj.nameIv, key);
-    } catch {
-      name = projectId.split('/').pop() ?? 'Unknown';
-    }
-  } else {
-    name = projectId.split('/').pop() ?? 'Unknown';
-  }
-
-  return {
-    projectId,
-    name,
-    sessionCount: proj.sessionCount,
-    lastActivityAt: proj.lastActivityAt,
-    syncEnabled: proj.syncEnabled,
-    gitRemoteHash: proj.gitRemoteHash,
-  };
-}
-
-/** One fully decrypted legacy row: the fetch result and the cache row. */
-type DecryptedLegacyIndexRow = { decrypted: DecryptedSessionIndexEntry; cacheEntry: CachedSessionIndex };
-
-/**
- * Decrypt a legacy full-index response in its entirety before any of it is
- * committed. Rows are decrypted independently so the failure carries counts
- * instead of stopping at the first unreadable row, and there is deliberately
- * no per-row logging: the #1117 reporter saw hundreds of lines a minute.
- */
-async function decodeLegacyIndexSnapshot(
-  sessions: SessionIndexEntry[],
-  projects: ServerProjectEntry[],
-  key: CryptoKey | undefined,
-): Promise<{ rows: DecryptedLegacyIndexRow[]; projects: DecryptedProjectIndexEntry[] }> {
-  const unreadable = (err: unknown): null => {
-    if (err instanceof IndexEntryDecryptionError) return null;
-    throw err;
-  };
-  const rowResults = await Promise.all(sessions.map((entry) => decryptSessionIndexEntry(entry, key).catch(unreadable)));
-  const projectResults = await Promise.all(projects.map((proj) => decryptProjectIndexEntry(proj, key).catch(unreadable)));
-
-  const rows = rowResults.filter((row): row is DecryptedLegacyIndexRow => row !== null);
-  const decryptedProjects = projectResults.filter((proj): proj is DecryptedProjectIndexEntry => proj !== null);
-  const unreadableSessions = sessions.length - rows.length;
-  const unreadableProjects = projects.length - decryptedProjects.length;
-  if (unreadableSessions > 0 || unreadableProjects > 0) {
-    throw new IndexEntryDecryptionError(
-      `Legacy index snapshot cannot be decrypted with this device's sync key: ${unreadableSessions} of ${sessions.length} session rows and ${unreadableProjects} of ${projects.length} project rows were written under a different key`,
-    );
-  }
-  return { rows, projects: decryptedProjects };
-}
-
-/**
  * Encrypt a project name for wire transmission.
  */
 async function encryptProjectName(
@@ -1242,13 +872,6 @@ interface SessionConnection {
   cachedMetadata?: Partial<SessionMetadata>;
   /** Timestamp of last activity (send/receive) for LRU eviction */
   lastActivity: number;
-  /** A node socket retains its opening credential even after index rotation. */
-  nodeCredentialExpiresAt?: number;
-}
-
-function sessionTransportUsable(session: SessionConnection | undefined): session is SessionConnection {
-  return !!session?.status.connected && session.ws.readyState === WS_OPEN
-    && (session.nodeCredentialExpiresAt === undefined || session.nodeCredentialExpiresAt > Date.now() + 30_000);
 }
 
 // Only a genuinely terminal room state disables a session's message sync. The
@@ -1294,8 +917,6 @@ interface CachedSessionIndex {
   parentSessionId?: string;
   /** Worktree ID for git worktree association */
   worktreeId?: string;
-  /** Stable device ID of the host that owns this session. */
-  hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'); drives mobile meta-agent grouping. */
   agentRole?: string;
   /** Meta-agent parent session ID for spawned children; drives mobile meta-agent grouping. */
@@ -1346,52 +967,31 @@ interface CachedSessionIndex {
 // ============================================================================
 
 export function createCollabV3Sync(config: SyncConfig): SyncProvider {
-  /**
-   * This client's own device identity, read fresh on every call.
-   *
-   * `getDeviceInfo` exists so presence fields (focus, status, lastActiveAt)
-   * reflect the moment they are read rather than the moment the provider was
-   * constructed; `config.deviceInfo` is the static fallback for callers that
-   * never supplied one. Every read of "who am I" goes through here — the
-   * self-broadcast filters, device-targeted routing, and host attribution all
-   * have to agree on the answer, and they had drifted into eight hand-copied
-   * expressions of it.
-   */
-  const localDeviceInfo = (): DeviceInfo | undefined =>
-    config.getDeviceInfo?.() ?? config.deviceInfo;
-  const localDeviceId = (): string | undefined => localDeviceInfo()?.deviceId;
-
-  /**
-   * The single place this provider constructs a socket. Hosts without a usable
-   * global `WebSocket` (or that need one proxied) pass `config.createWebSocket`.
-   */
-  const openWebSocket = (url: string): WebSocket =>
-    config.createWebSocket ? config.createWebSocket(url) : new WebSocket(url);
-
   // We need to get the initial JWT synchronously for setup, but will refresh before each connection
   // The getJwt function is called before each WebSocket connection to ensure fresh JWT
-  let currentJwt: PersonalJwt | null = null;
-  let currentPersonalMemberId: PersonalMemberId | null = null;
+  let currentJwt: string | null = null;
+  let currentUserId: string | null = null;
 
   // Helper to get fresh JWT and extract user ID.
-  // Uses config.personalMemberId as the authoritative room routing ID.
-  // The JWT sub claim is validated against config.personalMemberId -- if they differ,
+  // Uses config.userId as the authoritative room routing ID.
+  // The JWT sub claim is validated against config.userId -- if they differ,
   // the JWT is from a different org (e.g., team) and the caller's getJwt()
-  // should be returning a personal-org-scoped credential. Refuse mismatches
-  // before connecting so desktop and mobile cannot route to different rooms.
-  async function ensureFreshJwt(): Promise<{ jwt: PersonalJwt; personalMemberId: PersonalMemberId }> {
+  // should be returning a personal-org-scoped JWT. Log a warning so the
+  // mismatch is visible but still use config.userId for routing to ensure
+  // desktop and mobile always connect to the same index room.
+  async function ensureFreshJwt(): Promise<{ jwt: string; userId: string }> {
     const jwt = await config.getJwt();
     const claims = decodeJwtClaims(jwt);
     const jwtUserId = claims.sub;
     currentJwt = jwt;
 
-    // Use config.personalMemberId from SyncManager as the canonical
+    // Use config.userId (personalUserId from SyncManager) as the canonical
     // room routing ID. This must match iOS which also uses the personal
     // member ID. If the JWT sub doesn't match, the server WILL reject the
     // WebSocket auth (it validates JWT sub === room URL userId) -- but
     // routing to the wrong room is worse because it silently breaks
     // cross-device sync (prompts, drafts, etc.).
-    if (jwtUserId !== config.personalMemberId) {
+    if (config.userId && jwtUserId !== config.userId) {
       const jwtIsTeamScoped =
         !!claims.organization_id && !!config.orgId && claims.organization_id !== config.orgId;
       // Rate-limit: this used to log every 2s forever once the loop kicked in.
@@ -1399,11 +999,11 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       if (now - lastJwtMismatchLogAt > JWT_MISMATCH_LOG_INTERVAL_MS) {
         lastJwtMismatchLogAt = now;
         console.warn(
-          '[CollabV3] JWT sub does not match sync config personalMemberId -- refusing to connect (would be server-rejected and throttle the client).',
+          '[CollabV3] JWT sub does not match sync config userId -- refusing to connect (would be server-rejected and throttle the client).',
           {
             jwtSub: jwtUserId,
             jwtOrgId: claims.organization_id ?? null,
-            configPersonalMemberId: config.personalMemberId,
+            configUserId: config.userId, // personalUserId from SyncManager
             configOrgId: config.orgId,   // personalOrgId from SyncManager
             likelyCause: jwtIsTeamScoped
               ? 'JWT is team-scoped (organization_id differs from personal orgId). getJwt() should return a personal-org-scoped JWT -- check StytchAuthService.refreshPersonalSession / getPersonalSessionJwt.'
@@ -1414,108 +1014,27 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       // Don't even attempt the connection -- the server will reject it and the
       // tight retry loop got us throttled in the past. Caller will set
       // `indexAuthBlocked` and stop scheduling reconnects.
-      const err = new Error('CollabV3 JWT/personal-member mismatch -- connection refused locally to avoid server throttling');
+      const err = new Error('CollabV3 JWT/userId mismatch -- connection refused locally to avoid server throttling');
       (err as any).code = 'AUTH_MISMATCH';
       throw err;
     }
-    if (claims.exp !== undefined && Date.now() >= claims.exp * 1000) {
-      throw new Error('CollabV3 node access token expired; getJwt must refresh it before connecting');
-    }
-    currentPersonalMemberId = config.personalMemberId;
-    return { jwt, personalMemberId: currentPersonalMemberId };
+    currentUserId = config.userId || jwtUserId;
+    return { jwt, userId: currentUserId };
   }
 
   function isAuthMismatchError(err: unknown): boolean {
     return !!err && typeof err === 'object' && (err as any).code === 'AUTH_MISMATCH';
   }
 
-  // Get the personal member id synchronously after the JWT/config match is established.
-  function getPersonalMemberId(): PersonalMemberId {
-    if (currentPersonalMemberId) return currentPersonalMemberId;
-    if (config.personalMemberId) return config.personalMemberId;
+  // Get user ID synchronously if we have a cached JWT, otherwise use config.userId
+  function getUserId(): string {
+    if (currentUserId) return currentUserId;
+    if (config.userId) return config.userId;
     throw new Error('JWT not initialized - call ensureFreshJwt first');
   }
 
   const sessions = new Map<string, SessionConnection>();
-  const sessionConnectionsInFlight = new Map<string, Promise<void>>();
-  const sessionStatusListeners = new Map<string, Set<(status: SyncStatus) => void>>();
-  const sessionChangeListeners = new Map<string, Set<(change: SessionChange) => void>>();
   const sessionIndexCache = new Map<string, CachedSessionIndex>();
-  /**
-   * Connection-scoped record of what the server is believed to hold for each
-   * session's patch-projected fields. Suppresses the per-message
-   * `{ updatedAt }` burst, whose patch payload carries nothing the server does
-   * not already have. Reset on every index disconnect. See
-   * `indexPublication.ts`.
-   */
-  const indexPublicationGate = createIndexPublicationGate();
-  /**
-   * Whether this device may publish personal-sync ciphertext at all. Opens
-   * only after a complete index read decrypts under this key; closes on any
-   * row this key cannot read, or when the server refuses this client build.
-   * See `personalSyncWriteGate.ts` and GitHub #1117.
-   */
-  const personalSyncWriteGate = createPersonalSyncWriteGate();
-  const loggedWithheldWrites = new Set<string>();
-  personalSyncWriteGate.onChange(() => loggedWithheldWrites.clear());
-  /** True when a personal-sync write must be withheld. Logs once per kind per gate state. */
-  function withholdPersonalSyncWrite(kind: string): boolean {
-    if (personalSyncWriteGate.canWrite()) return false;
-    const snapshot = personalSyncWriteGate.snapshot();
-    if (!loggedWithheldWrites.has(kind)) {
-      loggedWithheldWrites.add(kind);
-      const why = snapshot.reason ? `${snapshot.state} (${snapshot.reason})` : snapshot.state;
-      console.warn(`[CollabV3] Withholding ${kind}: personal-sync writes are ${why}.${snapshot.detail ? ` ${snapshot.detail}` : ''}`);
-    }
-    return true;
-  }
-  /** Serializes index publications per session so gate check + send stay atomic. */
-  // Negative acknowledgments are versioned by content activity, never by UI
-  // edits. Bound this connection-local optimization; the server still enforces TTL.
-  const rejectedIndexActivity = new Map<string, number>();
-  function wasIndexActivityRejected(id: string, activity: number | undefined): boolean {
-    return activity !== undefined && rejectedIndexActivity.get(id) === activity;
-  }
-
-  const indexPublishQueue = createKeyedSerialQueue();
-  /**
-   * Guards the window between reading the cache and sending. The bulk
-   * reconciliation path encrypts hundreds of entries outside the per-session
-   * queue, so a live patch can overtake it; whichever build is stale by send
-   * time drops its payload rather than overwriting the newer one.
-   */
-  const publishSequencer = createPublishSequencer();
-
-  /** Sending is not acceptance: a server can refuse an expired publication. */
-  function noteSessionRowPublished(sessionId: string): void {
-    publishSequencer.bump(sessionId);
-    // Only a versioned upsert received from the server retires its tombstone.
-  }
-
-  /**
-   * True when a payload built before an `await` may still be published: same
-   * socket, same connection generation, and no newer publication for this
-   * session in the meantime.
-   */
-  function isPublishStillCurrent(
-    sessionId: string,
-    socket: WebSocket,
-    generation: number,
-    capturedSeq: number,
-    what: string,
-  ): boolean {
-    if (generation !== indexConnectionGeneration || indexWs !== socket || !indexConnected) {
-      // The socket we read at build time is gone. Publishing here would record
-      // a gate signature for a server connection that never saw the payload.
-      console.warn(`[CollabV3] Dropping ${what} for ${sessionId}: index connection changed during encryption`);
-      return false;
-    }
-    if (publishSequencer.isStale(sessionId, capturedSeq)) {
-      console.warn(`[CollabV3] Dropping ${what} for ${sessionId}: a newer publication landed first`);
-      return false;
-    }
-    return true;
-  }
   const disabledMessageSyncSessions = new Set<string>();
   /**
    * Session IDs the caller has explicitly asked us to keep connected. Populated
@@ -1535,16 +1054,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
    */
   let indexReady = false;
   let indexReadyListeners = new Set<() => void>();
-  /**
-   * Persistent subscribers to "the index socket is usable again".
-   *
-   * Distinct from `indexReadyListeners`, which is one-shot and cleared on every
-   * fire because it backs `waitForIndexReady()`. These survive, because the
-   * thing they exist for -- retrying work that could not be sent on the socket
-   * that just went away -- has to happen on EVERY reconnect, not on the one the
-   * caller happened to be awaiting.
-   */
-  const connectionGenerationListeners = new Set<(generation: number) => void>();
   const INDEX_STABILITY_MS = 500;
   let indexStabilityTimer: ReturnType<typeof setTimeout> | null = null;
   let deviceAnnounceInterval: ReturnType<typeof setInterval> | null = null;
@@ -1555,14 +1064,14 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
    * `onopen`). Distinct from `indexReconnectAttempts` so we can keep the first
    * few retries fast (handles legitimate "network just came up" races) while
    * still ramping into a real backoff if the failures keep coming. Without this,
-   * a permanent server-side rejection (e.g. JWT/personal-member mismatch) used to hammer
+   * a permanent server-side rejection (e.g. JWT/userId mismatch) used to hammer
    * the server at 2s forever and get us throttled.
    */
   let indexPreOpenFailures = 0;
   let indexReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * When `ensureFreshJwt` detects that the JWT cannot possibly succeed against
-   * the configured room (JWT `sub` does not match `config.personalMemberId`), we set this
+   * the configured room (JWT `sub` does not match `config.userId`), we set this
    * flag and stop scheduling reconnects entirely. The server would only reject
    * us anyway, and repeated rejections get the client IP throttled. Cleared by
    * an explicit `reconnectIndex()` (network change / user toggles sync / app
@@ -1595,17 +1104,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         cb();
       } catch (err) {
         console.error('[CollabV3] indexReady listener threw:', err);
-      }
-    }
-
-    // A usable socket under the current generation. Fired here rather than at
-    // the disconnect that bumped the counter, because this is the moment at
-    // which a caller retrying withheld work can actually succeed.
-    for (const cb of Array.from(connectionGenerationListeners)) {
-      try {
-        cb(indexConnectionGeneration);
-      } catch (err) {
-        console.error('[CollabV3] connectionGeneration listener threw:', err);
       }
     }
   }
@@ -1673,7 +1171,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
    *     rejection (e.g. stale JWT) would hammer the server at 2s forever and
    *     get the client throttled.
    *
-   * If `indexAuthBlocked` is set (JWT/personal-member mismatch detected), we don't
+   * If `indexAuthBlocked` is set (JWT/userId mismatch detected), we don't
    * schedule a reconnect at all. Recovery happens only via an explicit
    * `reconnectIndex()` call (network change, user toggles sync, app focus).
    */
@@ -1711,7 +1209,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         connectToIndex().catch(err => {
           if (isAuthMismatchError(err)) {
             // ensureFreshJwt already set indexAuthBlocked. Do not reschedule.
-            console.warn('[CollabV3] Index reconnect blocked: JWT/personal-member mismatch. Waiting for explicit reconnect trigger.');
+            console.warn('[CollabV3] Index reconnect blocked: JWT/userId mismatch. Waiting for explicit reconnect trigger.');
             return;
           }
           console.error('[CollabV3] Failed to reconnect to index:', err);
@@ -1753,13 +1251,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
   // Settings sync listeners (for receiving synced settings from other devices)
   const settingsSyncListeners = new Set<(settings: SyncedSettings) => void>();
-
-  // In-flight mobile push requests, keyed by requestId so concurrent requests
-  // resolve to their own acknowledgements.
-  const pendingMobilePushes = new Map<string, {
-    resolve: (result: MobilePushResult) => void;
-    timer: ReturnType<typeof setTimeout>;
-  }>();
 
   // Read-receipt listeners (unread-indicator state arriving from other devices)
   const readReceiptListeners = new Set<(receipt: SyncedReadReceipt) => void>();
@@ -1806,24 +1297,11 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     indexEntry.encryptedQueuedPrompts = await encryptQueuedPrompts(queuedPrompts, config.encryptionKey);
   }
 
-  function sendIndexUpdate(baseEntry: CachedSessionIndex): Promise<void> {
-    return indexPublishQueue.run(baseEntry.sessionId, () => doSendIndexUpdate(baseEntry));
-  }
-
-  async function doSendIndexUpdate(baseEntry: CachedSessionIndex): Promise<void> {
-    if (!isRetainedSession(sessionActivityAt(baseEntry)) || wasIndexActivityRejected(baseEntry.sessionId, sessionActivityAt(baseEntry))) return;
+  async function sendIndexUpdate(baseEntry: CachedSessionIndex): Promise<void> {
     if (!indexWs || !config.encryptionKey) {
       console.error('[CollabV3] Cannot send session update: index socket or encryption key missing');
       return;
     }
-    if (withholdPersonalSyncWrite('index update')) return;
-    // Capture the socket and connection generation BEFORE the encryption
-    // awaits. `indexWs` is module state: by the time we come back it may be a
-    // different socket (reconnect), and publishing this payload on it would
-    // record a gate signature for a server that never saw it.
-    const socket = indexWs;
-    const generation = indexConnectionGeneration;
-    const publishSeq = publishSequencer.read(baseEntry.sessionId);
 
     const { encryptedProjectId, projectIdIv } = await encryptProjectId(baseEntry.projectId, config.encryptionKey);
 
@@ -1837,7 +1315,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       sessionType: baseEntry.sessionType,
       parentSessionId: baseEntry.parentSessionId,
       worktreeId: baseEntry.worktreeId,
-      hostDeviceId: baseEntry.hostDeviceId,
       agentRole: baseEntry.agentRole,
       createdBySessionId: baseEntry.createdBySessionId,
       isArchived: baseEntry.isArchived,
@@ -1870,87 +1347,36 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       indexEntry.clientMetadataIv = clientMetadataIv;
     }
 
-    if (!isPublishStillCurrent(baseEntry.sessionId, socket, generation, publishSeq, 'index update')) return;
-
-    const publishedEntry: CachedSessionIndex = {
+    sessionIndexCache.set(baseEntry.sessionId, {
       ...baseEntry,
       queuedPromptCount: baseEntry.queuedPrompts?.length ?? baseEntry.queuedPromptCount,
-    };
-    sessionIndexCache.set(baseEntry.sessionId, publishedEntry);
+    });
     const indexMsg: ClientMessage = { type: 'indexUpdate', session: indexEntry };
-    socket.send(JSON.stringify(indexMsg));
-    // A full indexUpdate carries a superset of the patch projection, so the
-    // server now holds these values and a following timestamp-only patch has
-    // nothing to add. Recorded only after the send actually succeeded.
-    indexPublicationGate.recordPublished(baseEntry.sessionId, indexPatchSignatureForEntry(publishedEntry));
-    noteSessionRowPublished(baseEntry.sessionId);
+    indexWs.send(JSON.stringify(indexMsg));
   }
 
-  function sendIndexClientMetadataPatch(baseEntry: CachedSessionIndex): Promise<void> {
-    return indexPublishQueue.run(baseEntry.sessionId, () => doSendIndexClientMetadataPatch(baseEntry));
-  }
-
-  async function doSendIndexClientMetadataPatch(baseEntry: CachedSessionIndex): Promise<void> {
-    if (!isRetainedSession(sessionActivityAt(baseEntry)) || wasIndexActivityRejected(baseEntry.sessionId, sessionActivityAt(baseEntry))) return;
+  async function sendIndexClientMetadataPatch(baseEntry: CachedSessionIndex): Promise<void> {
     if (!indexWs || !config.encryptionKey) {
       console.error('[CollabV3] Cannot send index metadata patch: index socket or encryption key missing');
       return;
     }
-    if (withholdPersonalSyncWrite('index metadata patch')) return;
-    // See doSendIndexUpdate: socket and generation are captured before the
-    // encryption await so a reconnect cannot be published onto.
-    const socket = indexWs;
-    const generation = indexConnectionGeneration;
-    const publishSeq = publishSequencer.read(baseEntry.sessionId);
-
-    // The patch wire message carries no `updatedAt`. Caching the caller's newer
-    // local timestamp anyway would tell the next bulk publish that the server
-    // already has it, and `resolveIndexSortTimestamp`'s mid-turn hold would leak
-    // the drifted value onto the phone -- reordering the list mid-turn, which is
-    // exactly what the hold exists to prevent. Keep the last value we actually
-    // published; `lastMessageAt` still advances so unread state stays live.
-    const previous = sessionIndexCache.get(baseEntry.sessionId);
-    const publishedEntry: CachedSessionIndex = {
-      ...baseEntry,
-      updatedAt: previous?.updatedAt ?? baseEntry.updatedAt,
-    };
-
-    // Compare the projected plaintext before encrypting: a per-message
-    // `{ updatedAt }` push projects to exactly what the server already holds,
-    // and every such packet costs an IndexRoom write plus an iOS list re-sort.
-    const signature = indexPatchSignatureForEntry(publishedEntry);
-    const shouldSend = indexPublicationGate.shouldPublish(baseEntry.sessionId, signature);
 
     const patch: IndexClientMetadataPatch = {
       sessionId: baseEntry.sessionId,
-      isExecuting: publishedEntry.isExecuting,
-      lastReadAt: publishedEntry.lastReadAt,
+      isExecuting: baseEntry.isExecuting,
+      lastReadAt: baseEntry.lastReadAt,
     };
 
-    const clientMeta = shouldSend ? buildClientMetadataFromCacheEntry(publishedEntry) : undefined;
+    const clientMeta = buildClientMetadataFromCacheEntry(baseEntry);
     if (clientMeta) {
       const { encryptedClientMetadata, clientMetadataIv } = await encryptClientMetadata(clientMeta, config.encryptionKey);
       patch.encryptedClientMetadata = encryptedClientMetadata;
       patch.clientMetadataIv = clientMetadataIv;
     }
 
-    if (!isPublishStillCurrent(baseEntry.sessionId, socket, generation, publishSeq, 'metadata patch')) return;
-    sessionIndexCache.set(baseEntry.sessionId, publishedEntry);
-    if (!shouldSend) return;
-
+    sessionIndexCache.set(baseEntry.sessionId, baseEntry);
     const patchMsg: ClientMessage = { type: 'indexClientMetadataPatch', patch };
-    try {
-      socket.send(JSON.stringify(patchMsg));
-    } catch (err) {
-      // Nothing reached the server, so the gate must not remember this
-      // projection or the retry would be suppressed as a no-op. Reconciliation
-      // (or the next real change) re-publishes it.
-      indexPublicationGate.invalidate(baseEntry.sessionId);
-      console.error('[CollabV3] Failed to send index metadata patch:', err);
-      return;
-    }
-    indexPublicationGate.recordPublished(baseEntry.sessionId, signature);
-    publishSequencer.bump(baseEntry.sessionId);
+    indexWs.send(JSON.stringify(patchMsg));
   }
 
   /**
@@ -1981,7 +1407,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       sessionType: 'sessionType' in pending ? pending.sessionType : cached.sessionType,
       parentSessionId: 'parentSessionId' in pending ? pending.parentSessionId : cached.parentSessionId,
       worktreeId: 'worktreeId' in pending ? pending.worktreeId : cached.worktreeId,
-      hostDeviceId: 'hostDeviceId' in pending ? pending.hostDeviceId : cached.hostDeviceId,
       agentRole: cached.agentRole,
       createdBySessionId: cached.createdBySessionId,
       isArchived: 'isArchived' in pending ? pending.isArchived : cached.isArchived,
@@ -2015,470 +1440,16 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
   // Pending fetch index request (resolves when index_sync_response is received)
   let pendingIndexFetch: {
-    resolve: (result: { complete?: boolean; indexProtocolVersion?: 1 | 2; deletedSessionIds?: string[]; sessions: DecryptedSessionIndexEntry[]; projects: Array<{ projectId: string; name: string; sessionCount: number; lastActivityAt: number; syncEnabled: boolean }> }) => void;
+    resolve: (result: { sessions: DecryptedSessionIndexEntry[]; projects: Array<{ projectId: string; name: string; sessionCount: number; lastActivityAt: number; syncEnabled: boolean }> }) => void;
     reject: (error: Error) => void;
   } | null = null;
-
-  // ==========================================================================
-  // Versioned (v2) index replication -- bootstrap pages, then a delta cursor
-  // ==========================================================================
-
-  /**
-   * Whether this server speaks `indexPageRequest`. Latched per index
-   * connection: an old server answers `unknown_message_type`, and only that
-   * explicit rejection falls back to the legacy full-index request, which
-   * behaves exactly as it always did -- the fallback restores old behavior, it
-   * does not make the legacy path bounded. A timeout is a failure, not a
-   * downgrade; see the probe below.
-   */
-  let indexProtocolCapability: 'unknown' | 'v2' | 'legacy' = 'unknown';
-  const indexMirror = createIndexReplicationMirror<
-    DecryptedSessionIndexEntry,
-    DecryptedProjectIndexEntry,
-    EncryptedFileIndexEntry
-  >();
-  /** Account the mirror was filled for. A different personal member invalidates it. */
-  let indexMirrorMemberId: PersonalMemberId | undefined;
-  /** Bumped on every index disconnect so a late page response is dropped. */
-  let indexConnectionGeneration = 0;
-  let pendingIndexPage: {
-    requestId: string;
-    generation: number;
-    mode: IndexPageRequestInput['mode'];
-    resolve: (response: IndexPageResponseWire) => void;
-    reject: (error: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  } | null = null;
-  /** Serializes drains so a hint-driven poll and a fetchIndex never interleave pages. */
-  const indexDrainQueue = createKeyedSerialQueue();
-  const INDEX_PAGE_TIMEOUT_MS = 30_000;
-  /**
-   * Shorter deadline for the first request on a connection. Capability is
-   * decided by the server's answer, not by this timer -- it only keeps a dead
-   * connection from holding up the first reconciliation for the full 30s.
-   */
-  const INDEX_V2_PROBE_TIMEOUT_MS = 5_000;
-
-  /**
-   * Highest revision the server has hinted at, across every hint on this
-   * connection. A hint that lands while the mirror is still being built (for
-   * instance between the terminal bootstrap page arriving and its rows being
-   * decrypted and applied) would otherwise be dropped and never replayed until
-   * some unrelated mutation produced another hint.
-   */
-  let maxHintedRevision: number | undefined;
-  /** One pending catch-up drain at a time; repeated hints coalesce into it. */
-  let hintDrainScheduled = false;
-
-  /** Connection generation whose personal-state replay has completed. */
-  let personalStateReplayGeneration: number | undefined;
-  let pendingPersonalStatePage: {
-    requestId: string;
-    generation: number;
-    resolve: (response: PersonalStatePageResponseWire) => void;
-    reject: (error: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  } | null = null;
-
-  function sendPersonalStatePageRequest(input: { pageToken?: string; limit?: number }): Promise<PersonalStatePageResponseWire> {
-    if (!indexWs || !indexConnected) {
-      return Promise.reject(new Error('[CollabV3] Index connection not available for personal state page'));
-    }
-    if (pendingPersonalStatePage) {
-      return Promise.reject(new Error('[CollabV3] A personal state page request is already in flight'));
-    }
-    const requestId = newIndexRequestId();
-    const generation = indexConnectionGeneration;
-    return new Promise<PersonalStatePageResponseWire>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (pendingPersonalStatePage?.requestId !== requestId) return;
-        pendingPersonalStatePage = null;
-        reject(new Error('[CollabV3] Timed out waiting for personalStatePageResponse'));
-      }, INDEX_PAGE_TIMEOUT_MS);
-      pendingPersonalStatePage = { requestId, generation, resolve, reject, timer };
-      const msg: ClientMessage = { type: 'personalStatePageRequest', requestId, ...input };
-      try {
-        indexWs!.send(JSON.stringify(msg));
-      } catch (err) {
-        clearTimeout(timer);
-        pendingPersonalStatePage = null;
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
-    });
-  }
-
-  function cancelPendingPersonalStatePage(reason: string): void {
-    if (!pendingPersonalStatePage) return;
-    const pending = pendingPersonalStatePage;
-    pendingPersonalStatePage = null;
-    clearTimeout(pending.timer);
-    pending.reject(new Error(`[CollabV3] ${reason}`));
-  }
-
-  function newIndexRequestId(): string {
-    return typeof crypto?.randomUUID === 'function'
-      ? crypto.randomUUID()
-      : `idx-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  }
-
-  function cancelPendingIndexPage(reason: string): void {
-    if (!pendingIndexPage) return;
-    const pending = pendingIndexPage;
-    pendingIndexPage = null;
-    clearTimeout(pending.timer);
-    pending.reject(new Error(`[CollabV3] ${reason}`));
-  }
-
-  function sendIndexPageRequest(input: IndexPageRequestInput): Promise<IndexPageResponseWire> {
-    if (!indexWs || !indexConnected) {
-      return Promise.reject(new Error('[CollabV3] Index connection not available for page request'));
-    }
-    if (pendingIndexPage) {
-      return Promise.reject(new Error('[CollabV3] An index page request is already in flight'));
-    }
-    const requestId = newIndexRequestId();
-    const generation = indexConnectionGeneration;
-    const timeoutMs = indexProtocolCapability === 'unknown'
-      ? INDEX_V2_PROBE_TIMEOUT_MS
-      : INDEX_PAGE_TIMEOUT_MS;
-
-    return new Promise<IndexPageResponseWire>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (pendingIndexPage?.requestId !== requestId) return;
-        pendingIndexPage = null;
-        // A timeout is a failure, never evidence that the server lacks v2. A
-        // server that does not understand the frame says so with
-        // `unknown_message_type`; falling back on silence would quietly
-        // downgrade a v2 server that was merely slow or unreachable.
-        reject(new Error('[CollabV3] Timed out waiting for indexPageResponse'));
-      }, timeoutMs);
-
-      pendingIndexPage = { requestId, generation, mode: input.mode, resolve, reject, timer };
-      const msg: ClientMessage = { type: 'indexPageRequest', protocolVersion: 2, requestId, ...input };
-      try {
-        indexWs!.send(JSON.stringify(msg));
-      } catch (err) {
-        clearTimeout(timer);
-        pendingIndexPage = null;
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
-    });
-  }
-
-  /**
-   * The count to put on the wire for a bulk-published session, or `undefined`
-   * to leave the server's stored count alone.
-   *
-   * `messageCountKnown === false` means the local query deliberately did not
-   * count (see `getAllSessionsForSync`). On v2 that means: send nothing. On a
-   * legacy server, which overwrites whatever it is given, the least-wrong value
-   * is the count the server last reported to us.
-   */
-  function resolvePublishedMessageCount(
-    session: SessionIndexData,
-    existingCache: CachedSessionIndex | undefined,
-  ): number | undefined {
-    if (session.messageCountKnown !== false) return session.messageCount;
-    if (indexProtocolCapability === 'v2') return undefined;
-    return existingCache?.messageCount;
-  }
-
-  type PreparedIndexChange = DecryptedIndexChange<
-    DecryptedSessionIndexEntry,
-    DecryptedProjectIndexEntry,
-    EncryptedFileIndexEntry
-  >;
-
-  /**
-   * Decrypts a page's rows without touching local state. Cache rows are stashed
-   * per `${id}:${revision}` so only the changes the mirror actually accepts get
-   * applied locally -- a stale page must not overwrite the live cache.
-   */
-  function createIndexPageApplier(options: { generation: number; notifyListeners: boolean }) {
-    // Per-page, cleared on every prepare: a long bootstrap must not accumulate
-    // every decrypted row before anything is applied.
-    let cacheEntries = new Map<string, CachedSessionIndex>();
-
-    const assertSameConnection = (what: string) => {
-      // Checked around the decrypt AND the apply, not just around the network
-      // round trip: both are async, and a reconnect during either means this
-      // page belongs to a connection whose cursor no longer applies.
-      if (options.generation !== indexConnectionGeneration) {
-        throw new Error(`[CollabV3] Index connection changed during ${what}; abandoning this drain`);
-      }
-    };
-
-    return {
-      prepare: async (entries: IndexChangeWire[]): Promise<PreparedIndexChange[]> => {
-        assertSameConnection('page decryption');
-        cacheEntries = new Map<string, CachedSessionIndex>();
-        const changes: PreparedIndexChange[] = [];
-        for (const change of entries) {
-          // Contract first, decryption second: nothing here is skipped, because
-          // the page's cursor would claim coverage over whatever we skipped.
-          assertValidIndexChange(change);
-          const base = {
-            entity: change.entity,
-            id: change.id,
-            revision: change.revision,
-            deleted: change.deleted,
-            removalReason: change.removalReason,
-          };
-          if (change.deleted) {
-            changes.push(base);
-            continue;
-          }
-          if (change.entity === 'session') {
-            // strict: a row we cannot fully read must fail the page rather than
-            // be skipped. The mirror, the cursor and the local cache are all
-            // left alone; the fetch reports failure and the caller skips
-            // reconciliation for this cycle.
-            const row = await decryptSessionIndexEntry(change.session!, config.encryptionKey);
-            cacheEntries.set(`${change.id}:${change.revision}`, row.cacheEntry);
-            changes.push({ ...base, session: row.decrypted });
-          } else if (change.entity === 'project') {
-            const project = await decryptProjectIndexEntry(change.project!, config.encryptionKey);
-            changes.push({ ...base, project });
-          } else {
-            // File payloads stay opaque to this client (document sync owns the
-            // file UI), but they are carried in the same stream under the same
-            // cursor, so their identity is validated like everything else.
-            changes.push({ ...base, file: change.file });
-          }
-        }
-        assertSameConnection('page decryption');
-        return changes;
-      },
-      commitPage: async (applied: PreparedIndexChange[]): Promise<void> => {
-        assertSameConnection('page application');
-        applyIndexChangesLocally(applied, cacheEntries, { notifyListeners: options.notifyListeners });
-        cacheEntries = new Map<string, CachedSessionIndex>();
-      },
-    };
-  }
-
-  /**
-   * Mirror the accepted session changes into the local cache. `notifyListeners`
-   * is on for live (delta) drains only: under v2 the server sends a bare
-   * `indexChangesAvailable` hint instead of `indexBroadcast`, so this is where
-   * the existing index-change callbacks now come from. A cold bootstrap stays
-   * silent rather than replaying thousands of rows through the UI.
-   */
-  function applyIndexChangesLocally(
-    applied: PreparedIndexChange[],
-    cacheEntries: Map<string, CachedSessionIndex>,
-    options: { notifyListeners: boolean },
-  ): void {
-    for (const change of applied) {
-      if (change.entity !== 'session') continue;
-      if (change.deleted) {
-        sessionIndexCache.delete(change.id);
-        indexPublicationGate.invalidate(change.id);
-        continue;
-      }
-      const cacheEntry = cacheEntries.get(`${change.id}:${change.revision}`);
-      if (!cacheEntry) continue;
-      sessionIndexCache.set(change.id, cacheEntry);
-      indexPublicationGate.recordPublished(change.id, indexPatchSignatureForEntry(cacheEntry));
-      if (!options.notifyListeners) continue;
-
-      applyPendingMetadataUpdates(change.id).catch(err => {
-        console.error('[CollabV3] Error applying pending metadata updates:', err);
-      });
-      indexChangeListeners.forEach((callback) => {
-        try {
-          callback(change.id, cacheEntry);
-        } catch (err) {
-          console.error('[CollabV3] Error in index change listener:', err);
-        }
-      });
-    }
-  }
-
-  /**
-   * A read receipt from another device -- live, or replayed on connect. Personal
-   * single-user channel: decrypt and hand to the listeners, which merge
-   * advance-only into local state.
-   */
-  async function handleReadReceiptBroadcast(payload: EncryptedReadReceiptPayload): Promise<void> {
-    const ourDeviceId = localDeviceId();
-    if (ourDeviceId && payload.deviceId === ourDeviceId) return;
-    if (!config.encryptionKey) {
-      console.error('[CollabV3] Cannot decrypt read receipt - no encryption key');
-      return;
-    }
-    try {
-      const json = await decrypt(payload.encryptedReceipt, payload.receiptIv, config.encryptionKey);
-      const receipt: SyncedReadReceipt = JSON.parse(json);
-      readReceiptListeners.forEach((callback) => {
-        try {
-          callback(receipt);
-        } catch (err) {
-          console.error('[CollabV3] Error in read receipt listener:', err);
-        }
-      });
-    } catch (err) {
-      console.error('[CollabV3] Failed to decrypt read receipt:', err);
-    }
-  }
-
-  async function handleTrackerPersonalStateBroadcast(payload: EncryptedTrackerPersonalStatePayload): Promise<void> {
-    const ourDeviceId = localDeviceId();
-    if (ourDeviceId && payload.deviceId === ourDeviceId) return;
-    if (!config.encryptionKey) {
-      console.error('[CollabV3] Cannot decrypt tracker personal state - no encryption key');
-      return;
-    }
-    try {
-      const json = await decrypt(payload.encryptedState, payload.stateIv, config.encryptionKey);
-      const change: SyncedTrackerPersonalStateChange = JSON.parse(json);
-      trackerPersonalStateListeners.forEach((callback) => {
-        try { callback(change); }
-        catch (err) { console.error('[CollabV3] Error in tracker personal state listener:', err); }
-      });
-    } catch (err) {
-      console.error('[CollabV3] Failed to decrypt tracker personal state:', err);
-    }
-  }
-
-  /**
-   * Replay read receipts and tracker personal state once per v2 connection.
-   *
-   * The legacy `indexSyncRequest` made the server replay both streams as
-   * ordinary per-row broadcasts. v2 does not, so without this a v2 client would
-   * silently lose cross-device read state and tracker personal state on every
-   * reconnect. These pages are their own bounded stream: they carry no
-   * revisions and never touch the index cursor or coverage.
-   */
-  async function replayPersonalState(): Promise<void> {
-    if (personalStateReplayGeneration === indexConnectionGeneration) return;
-    const generation = indexConnectionGeneration;
-    let pageToken: string | undefined;
-    let pages = 0;
-
-    while (pages < 1_000) {
-      const response = await sendPersonalStatePageRequest({ pageToken });
-      pages++;
-      if (generation !== indexConnectionGeneration) return;
-
-      for (const entry of response.entries) {
-        if (entry.type === 'readReceiptBroadcast') {
-          await handleReadReceiptBroadcast(entry.receipt);
-        } else {
-          await handleTrackerPersonalStateBroadcast(entry.state);
-        }
-      }
-
-      if (response.complete) {
-        // Only a completed replay counts, so an interrupted one is retried on
-        // the next drain instead of leaving a half-applied gap forever.
-        personalStateReplayGeneration = generation;
-        return;
-      }
-      if (!response.nextPageToken) {
-        console.warn('[CollabV3] Personal state replay ended without completing; will retry');
-        return;
-      }
-      pageToken = response.nextPageToken;
-    }
-    console.warn('[CollabV3] Personal state replay exceeded its page budget; will retry');
-  }
-
-  /**
-   * Bring the mirror up to date: a delta from the committed cursor when we
-   * already have coverage, otherwise a full bootstrap. A server-side cursor
-   * reset drops coverage and re-bootstraps; it never means rows were deleted.
-   */
-  async function runIndexReplication(options: { notifyListeners: boolean }): Promise<void> {
-    const memberId = currentPersonalMemberId ?? config.personalMemberId;
-    if (indexMirrorMemberId !== undefined && memberId !== undefined && indexMirrorMemberId !== memberId) {
-      // Account switch: the previous account's rows, revisions and cursor are
-      // meaningless here and must not leak into this account's snapshot.
-      indexMirror.reset();
-    }
-    indexMirrorMemberId = memberId;
-
-    const generation = indexConnectionGeneration;
-
-    if (indexMirror.isComplete() && indexMirror.cursor !== undefined) {
-      const applier = createIndexPageApplier({ generation, notifyListeners: options.notifyListeners });
-      const delta = await deltaSyncIndexMirror({
-        mirror: indexMirror,
-        request: sendIndexPageRequest,
-        prepare: applier.prepare,
-        commitPage: applier.commitPage,
-      });
-      if (!delta.resetRequired) return;
-      console.warn('[CollabV3] Index cursor expired on the server; re-bootstrapping the mirror (absent rows are NOT deletions)');
-    }
-
-    // A cold bootstrap does not notify: replaying thousands of rows through the
-    // UI is not a live update.
-    const bootApplier = createIndexPageApplier({ generation, notifyListeners: false });
-    await bootstrapIndexMirror({
-      mirror: indexMirror,
-      request: sendIndexPageRequest,
-      prepare: bootApplier.prepare,
-      commitPage: bootApplier.commitPage,
-    });
-  }
-
-  /**
-   * Run a catch-up drain if the server has hinted at a revision we have not
-   * reached. Coalesces: repeated hints collapse into the one pending drain
-   * rather than queueing a drain per hint. Called again after every completed
-   * replication, which is what closes the race where a hint arrives while the
-   * mirror is mid-bootstrap and therefore cannot be delta-synced yet.
-   */
-  function scheduleHintedDrain(): void {
-    if (indexProtocolCapability === 'legacy') return;
-    if (hintDrainScheduled) return;
-    if (maxHintedRevision === undefined) return;
-    // No coverage yet: a bootstrap is running or is about to. It calls back
-    // here when it finishes, and the hint is still recorded.
-    if (!indexMirror.isComplete() || indexMirror.cursor === undefined) return;
-    if (indexMirror.cursor >= maxHintedRevision) return;
-
-    hintDrainScheduled = true;
-    void indexDrainQueue
-      .run('index', () => {
-        // Cleared as the drain starts, so a hint arriving mid-drain schedules
-        // one follow-up instead of being swallowed.
-        hintDrainScheduled = false;
-        return runIndexReplicationWithPersonalState({ notifyListeners: true });
-      })
-      .catch(err => {
-        hintDrainScheduled = false;
-        if (err instanceof IndexEntryDecryptionError) {
-          personalSyncWriteGate.markBlocked('decryption-failed', err.message);
-        }
-        console.warn('[CollabV3] Index delta poll failed:', err?.message || err);
-      });
-  }
-
-  /**
-   * Index replication, then the personal-state replay this connection still
-   * owes -- on its own queue key, so it neither blocks nor fails the index
-   * work. A complete mirror must not wait on read receipts, and losing them is
-   * a degraded state rather than a reason to refuse the mirror.
-   */
-  async function runIndexReplicationWithPersonalState(options: { notifyListeners: boolean }): Promise<void> {
-    await runIndexReplication(options);
-    // A hint that arrived while the mirror was incomplete (or mid-drain) is
-    // still recorded; now that coverage exists it can be acted on.
-    scheduleHintedDrain();
-    if (personalStateReplayGeneration === indexConnectionGeneration) return;
-    void indexDrainQueue.run('personal-state', replayPersonalState).catch(err => {
-      console.warn('[CollabV3] Personal state replay failed; read receipts and tracker personal state may be stale until the next sync:', (err as Error)?.message || err);
-    });
-  }
 
   // Helper to announce device to the index server
   function announceDevice(): void {
     // Get current device info (prefer callback for dynamic presence, fallback to static)
-    const deviceInfo = localDeviceInfo();
+    const deviceInfo = config.getDeviceInfo?.() ?? config.deviceInfo;
     // Check both our flag AND the actual WebSocket readyState to avoid "Sent before connected" errors
-    if (deviceInfo && indexWs && indexConnected && indexWs.readyState === WS_OPEN) {
+    if (deviceInfo && indexWs && indexConnected && indexWs.readyState === WebSocket.OPEN) {
       const announceMsg: ClientMessage = {
         type: 'deviceAnnounce',
         device: {
@@ -2515,7 +1486,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
   function startPingInterval(): void {
     stopPingInterval();
     pingInterval = setInterval(() => {
-      if (indexWs && indexWs.readyState === WS_OPEN) {
+      if (indexWs && indexWs.readyState === WebSocket.OPEN) {
         try {
           indexWs.send(JSON.stringify({ type: 'ping' }));
         } catch {
@@ -2532,16 +1503,16 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     }
   }
 
-  function buildRoomId(personalMemberId: PersonalMemberId, suffix: string): string {
-    return `org:${config.orgId}:user:${personalMemberId}:${suffix}`;
+  function buildRoomId(userId: string, suffix: string): string {
+    return `org:${config.orgId}:user:${userId}:${suffix}`;
   }
 
   function getRoomId(sessionId: string): string {
-    return buildRoomId(getPersonalMemberId(), `session:${sessionId}`);
+    return buildRoomId(getUserId(), `session:${sessionId}`);
   }
 
   function getIndexRoomId(): string {
-    return buildRoomId(getPersonalMemberId(), 'index');
+    return buildRoomId(getUserId(), 'index');
   }
 
   function getWebSocketUrl(roomId: string): string {
@@ -2638,10 +1609,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     const parsed = JSON.parse(decrypted);
 
     return {
-      // Wire IDs are opaque hashes or provider UUIDs, not local row numbers.
-      // The room's sequence is numeric and stable across history and replay.
-      id: encrypted.sequence,
-      providerMessageId: encrypted.id,
+      id: parseInt(encrypted.id, 10) || 0,
       sessionId: '', // Filled in by caller
       source: encrypted.source,
       direction: encrypted.direction,
@@ -2908,7 +1876,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     if (indexAuthBlocked) {
       // Auth is known-bad; throwing here lets callers (e.g. ad-hoc
       // sendSessionControlMessage) skip work that would never succeed.
-      const err = new Error('CollabV3 index connection blocked: JWT/personal-member mismatch');
+      const err = new Error('CollabV3 index connection blocked: JWT/userId mismatch');
       (err as any).code = 'AUTH_MISMATCH';
       throw err;
     }
@@ -2927,7 +1895,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
     // Get fresh JWT before connecting. Throws AUTH_MISMATCH if the JWT cannot
     // succeed against the configured room (caught below to set indexAuthBlocked).
-    let jwt: PersonalJwt;
+    let jwt: string;
     try {
       ({ jwt } = await ensureFreshJwt());
     } catch (err) {
@@ -2942,12 +1910,12 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     }
 
     const indexRoomId = getIndexRoomId();
-    console.log('[CollabV3] connectToIndex() roomId:', indexRoomId, 'orgId:', config.orgId, 'personalMemberId:', getPersonalMemberId());
+    console.log('[CollabV3] connectToIndex() roomId:', indexRoomId, 'orgId:', config.orgId, 'userId:', getUserId());
     const url = getWebSocketUrl(indexRoomId);
     // Pass JWT via query parameter (WebSocket doesn't support custom headers in browsers)
     const wsUrl = appendSyncClientParams(`${url}?token=${encodeURIComponent(jwt)}`);
 
-    indexWs = openWebSocket(wsUrl);
+    indexWs = new WebSocket(wsUrl);
 
     /**
      * Tracks whether THIS WebSocket instance ever fired `onopen`. Pre-open
@@ -2997,19 +1965,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       stopPingInterval();
       indexConnected = false;
       indexWs = null;
-      // A new connection is no proof of what survived on the server side, so
-      // nothing may be suppressed as "already published" across it.
-      indexPublicationGate.reset();
-      // Drop any in-flight page request and make late responses unusable. The
-      // mirror itself survives: revisions are server-owned, so a reconnect
-      // resumes with a delta instead of re-bootstrapping. Capability is
-      // re-probed because the server on the other end may have been upgraded.
-      indexConnectionGeneration++;
-      indexProtocolCapability = 'unknown';
-      cancelPendingIndexPage('Index connection closed while a page request was in flight');
-      maxHintedRevision = undefined;
-      hintDrainScheduled = false;
-      cancelPendingPersonalStatePage('Index connection closed while a personal state page was in flight');
       clearIndexReady();
       stopDeviceAnnounceInterval();
 
@@ -3036,7 +1991,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       const errorInfo = typeof ErrorEvent !== 'undefined' && event instanceof ErrorEvent
         ? { message: event.message, error: event.error }
         : { type: event.type };
-      console.error('[CollabV3] Index WebSocket error:', errorInfo, 'URL:', redactSyncUrl(wsUrl));
+      console.error('[CollabV3] Index WebSocket error:', errorInfo, 'URL:', wsUrl);
     };
 
     indexWs.onmessage = async (event) => {
@@ -3054,70 +2009,330 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               // console.log(`[CollabV3] Received indexSyncResponse: ${message.sessions.length} sessions (server total: ${totalCount ?? 'unknown'})`);
             }
             if (pendingIndexFetch) {
-              const pending = pendingIndexFetch;
-              pendingIndexFetch = null;
-              try {
-                const snapshot = await decodeLegacyIndexSnapshot(message.sessions, message.projects, config.encryptionKey);
-                // Commit only once every row decrypted. A partial commit would
-                // hand reconciliation a view the server never held, and
-                // reconciliation republishes whatever it believes is missing.
-                for (const row of snapshot.rows) {
-                  sessionIndexCache.set(row.decrypted.sessionId, row.cacheEntry);
-                  // The server just told us what it holds; that is the value a
-                  // subsequent patch has to differ from to be worth sending.
-                  indexPublicationGate.recordPublished(row.decrypted.sessionId, indexPatchSignatureForEntry(row.cacheEntry));
+              // Track sessions that fail decryption so we can delete them from the
+              // server index. The next sync cycle will re-push them from the local
+              // PGLite database with the correct encryption key.
+              const decryptionFailedSessionIds: string[] = [];
+
+              // Decrypt sensitive fields before returning
+              const decryptedSessions: DecryptedSessionIndexEntry[] = (await Promise.all(
+                message.sessions.map(async (entry): Promise<DecryptedSessionIndexEntry | null> => {
+                  // Start with base fields that don't need transformation
+                  let title: string;
+                  let projectId: string;
+                  let queuedPrompts: Array<{ id: string; prompt: string; timestamp: number }> | undefined;
+
+                  // Decrypt projectId - encrypted projectId is required
+                  if (entry.encryptedProjectId && entry.projectIdIv && config.encryptionKey) {
+                    try {
+                      projectId = await decryptProjectId(entry.encryptedProjectId, entry.projectIdIv, config.encryptionKey);
+                    } catch (err) {
+                      console.warn(`[CollabV3] Cannot decrypt session ${entry.sessionId} (wrong encryption key, likely from before userId migration). Deleting from server index so it re-syncs with correct key.`);
+                      decryptionFailedSessionIds.push(entry.sessionId);
+                      return null;
+                    }
+                  } else {
+                    // No encrypted projectId - use placeholder
+                    projectId = 'unknown';
+                  }
+
+                  // Decrypt title - encrypted titles are required
+                  if (entry.encryptedTitle && entry.titleIv && config.encryptionKey) {
+                    try {
+                      title = await decryptTitle(entry.encryptedTitle, entry.titleIv, config.encryptionKey);
+                    } catch (err) {
+                      console.warn(`[CollabV3] Cannot decrypt session ${entry.sessionId} title (wrong encryption key). Deleting from server index so it re-syncs with correct key.`);
+                      decryptionFailedSessionIds.push(entry.sessionId);
+                      return null;
+                    }
+                  } else {
+                    // No encrypted title - show as untitled until resynced
+                    title = 'Untitled';
+                  }
+
+                  // Decrypt queued prompts - encrypted prompts are required
+                  if (entry.encryptedQueuedPrompts && entry.encryptedQueuedPrompts.length > 0 && config.encryptionKey) {
+                    try {
+                      queuedPrompts = await decryptQueuedPrompts(entry.encryptedQueuedPrompts, config.encryptionKey);
+                    } catch (err) {
+                      // Non-fatal: queued prompts are transient, just skip
+                      console.warn(`[CollabV3] Failed to decrypt queued prompts for session ${entry.sessionId}, skipping`);
+                    }
+                  } else if (
+                    entry.queuedPromptCount === 0 ||
+                    Array.isArray(entry.encryptedQueuedPrompts)
+                  ) {
+                    queuedPrompts = [];
+                  }
+
+                  // Decrypt client metadata (context usage, pending prompt state, phase, tags, draft, etc.)
+                  let currentContext: CachedSessionIndex['currentContext'];
+                  let hasPendingPrompt: boolean | undefined;
+                  let phase: string | undefined;
+                  let tags: string[] | undefined;
+                  let draftInput: string | undefined;
+                  let draftUpdatedAt: number | undefined;
+                  let hasBeenNamed: boolean | undefined;
+                  if (entry.encryptedClientMetadata && entry.clientMetadataIv && config.encryptionKey) {
+                    try {
+                      const clientMeta = await decryptClientMetadata(entry.encryptedClientMetadata, entry.clientMetadataIv, config.encryptionKey);
+                      currentContext = clientMeta.currentContext;
+                      hasPendingPrompt = clientMeta.hasPendingPrompt;
+                      phase = clientMeta.phase;
+                      tags = clientMeta.tags;
+                      draftInput = clientMeta.draftInput || undefined;
+                      draftUpdatedAt = clientMeta.draftUpdatedAt;
+                      hasBeenNamed = clientMeta.hasBeenNamed;
+                    } catch (err) {
+                      // Non-fatal: metadata is supplementary, just skip
+                      console.warn(`[CollabV3] Failed to decrypt client metadata for session ${entry.sessionId}, skipping`);
+                    }
+                  }
+
+                  const decrypted: DecryptedSessionIndexEntry = {
+                    sessionId: entry.sessionId,
+                    projectId: projectId,
+                    title,
+                    provider: entry.provider,
+                    model: entry.model,
+                    mode: entry.mode,
+                    sessionType: entry.sessionType,
+                    parentSessionId: entry.parentSessionId,
+                    worktreeId: entry.worktreeId,
+                    agentRole: entry.agentRole,
+                    createdBySessionId: entry.createdBySessionId,
+                    isArchived: entry.isArchived,
+                    isPinned: entry.isPinned,
+                    branchedFromSessionId: entry.branchedFromSessionId,
+                    branchPointMessageId: entry.branchPointMessageId,
+                    branchedAt: entry.branchedAt,
+                    messageCount: entry.messageCount,
+                    lastMessageAt: entry.lastMessageAt,
+                    createdAt: entry.createdAt,
+                    updatedAt: entry.updatedAt,
+                    pendingExecution: entry.pendingExecution,
+                    isExecuting: entry.isExecuting,
+                    queuedPromptCount: entry.queuedPromptCount,
+                    queuedPrompts,
+                    hasPendingPrompt: hasPendingPrompt ?? entry.hasPendingPrompt,
+                    currentContext,
+                    lastReadAt: entry.lastReadAt,
+                  };
+
+                  // Cache the decrypted entry
+                  const cacheEntry: CachedSessionIndex = {
+                    sessionId: decrypted.sessionId,
+                    projectId: decrypted.projectId,
+                    title: decrypted.title,
+                    provider: decrypted.provider,
+                    model: decrypted.model,
+                    mode: decrypted.mode,
+                    sessionType: decrypted.sessionType,
+                    parentSessionId: decrypted.parentSessionId,
+                    worktreeId: decrypted.worktreeId,
+                    agentRole: decrypted.agentRole,
+                    createdBySessionId: decrypted.createdBySessionId,
+                    isArchived: decrypted.isArchived,
+                    isPinned: decrypted.isPinned,
+                    branchedFromSessionId: decrypted.branchedFromSessionId,
+                    branchPointMessageId: decrypted.branchPointMessageId,
+                    branchedAt: decrypted.branchedAt,
+                    messageCount: decrypted.messageCount,
+                    lastMessageAt: decrypted.lastMessageAt,
+                    createdAt: decrypted.createdAt,
+                    updatedAt: decrypted.updatedAt,
+                    pendingExecution: decrypted.pendingExecution,
+                    isExecuting: decrypted.isExecuting,
+                    queuedPrompts: decrypted.queuedPrompts,
+                    queuedPromptCount: decrypted.queuedPromptCount,
+                    currentContext: decrypted.currentContext,
+                    phase,
+                    tags,
+                    draftInput,
+                    draftUpdatedAt,
+                    hasBeenNamed,
+                    lastReadAt: decrypted.lastReadAt,
+                  };
+                  sessionIndexCache.set(entry.sessionId, cacheEntry);
+
+                  return decrypted;
+                })
+              )).filter((s): s is DecryptedSessionIndexEntry => s !== null);
+
+              // Delete server-side index entries that couldn't be decrypted.
+              // They were encrypted with a different key (e.g., before userId migration).
+              // The next sync cycle will re-push them from the local PGLite database
+              // with the correct encryption key.
+              if (decryptionFailedSessionIds.length > 0 && indexWs && indexWs.readyState === WebSocket.OPEN) {
+                console.log(`[CollabV3] Deleting ${decryptionFailedSessionIds.length} undecryptable index entries from server (will re-sync with correct key)`);
+                for (const badSessionId of decryptionFailedSessionIds) {
+                  sessionIndexCache.delete(badSessionId);
+                  const deleteMsg: ClientMessage = { type: 'indexDelete', sessionId: badSessionId };
+                  indexWs.send(JSON.stringify(deleteMsg));
                 }
-                personalSyncWriteGate.markVerified();
-                pending.resolve({
-                  // The legacy response IS the complete snapshot -- that has
-                  // always been its meaning, and absence-based reconciliation has
-                  // always relied on it. It carries no tombstones, so the caller
-                  // cannot distinguish a remote delete from a never-published row
-                  // on this path; that is why v2 exists.
-                  complete: true,
-                  indexProtocolVersion: 1,
-                  sessions: snapshot.rows.map((row) => row.decrypted),
-                  projects: snapshot.projects,
-                });
-              } catch (err) {
-                if (err instanceof IndexEntryDecryptionError) {
-                  // #1117: a row this key cannot read is a key problem on this
-                  // device, not server state to clean up. Nothing is deleted,
-                  // nothing is cached, and publication stays closed until a
-                  // complete read succeeds.
-                  personalSyncWriteGate.markBlocked('decryption-failed', err.message);
-                  console.warn(`[CollabV3] ${err.message}. The server index is left untouched and personal-sync writes are paused on this device.`);
-                }
-                pending.reject(err instanceof Error ? err : new Error(String(err)));
               }
+
+              // Decrypt project entries (skip entries encrypted with the wrong key)
+              const decryptedProjectsRaw = await Promise.all(
+                message.projects.map(async (proj) => {
+                  let projectId: string;
+                  let name: string;
+
+                  // Decrypt projectId - if this fails, the entry is corrupted/wrong-key
+                  if (proj.encryptedProjectId && proj.projectIdIv && config.encryptionKey) {
+                    try {
+                      projectId = await decryptProjectId(proj.encryptedProjectId, proj.projectIdIv, config.encryptionKey);
+                    } catch (err) {
+                      // Encrypted with a different key - skip this entry entirely.
+                      // The underlying sessions were already cleaned up by the session
+                      // decryption cleanup above. The orphaned project entry will be
+                      // cascade-deleted by the server's 24-hour TTL alarm.
+                      return null;
+                    }
+                  } else {
+                    projectId = 'unknown';
+                  }
+
+                  // Decrypt name
+                  if (proj.encryptedName && proj.nameIv && config.encryptionKey) {
+                    try {
+                      name = await decryptProjectName(proj.encryptedName, proj.nameIv, config.encryptionKey);
+                    } catch (err) {
+                      // Name failed but projectId succeeded - use fallback name
+                      name = projectId.split('/').pop() ?? 'Unknown';
+                    }
+                  } else {
+                    name = projectId.split('/').pop() ?? 'Unknown';
+                  }
+
+                  return {
+                    projectId: projectId,
+                    name,
+                    sessionCount: proj.sessionCount,
+                    lastActivityAt: proj.lastActivityAt,
+                    syncEnabled: proj.syncEnabled,
+                    gitRemoteHash: proj.gitRemoteHash,
+                  };
+                })
+              );
+              const decryptedProjects = decryptedProjectsRaw.filter((p): p is NonNullable<typeof p> => p !== null);
+              if (decryptedProjectsRaw.length !== decryptedProjects.length) {
+                // console.log(`[CollabV3] Filtered out ${decryptedProjectsRaw.length - decryptedProjects.length} undecryptable project entries (will be cleaned up by server TTL)`);
+              }
+
+              pendingIndexFetch.resolve({
+                sessions: decryptedSessions,
+                projects: decryptedProjects,
+              });
+              pendingIndexFetch = null;
             }
             break;
           }
 
           case 'indexBroadcast': {
-            // Another device updated a session. The row is decrypted in full
-            // before anything local changes: a broadcast this key cannot read
-            // keeps the last good cached row and closes publication (#1117),
-            // instead of writing 'unknown' / 'Untitled' placeholders into the
-            // cache and out to the renderer.
+            // Another device updated a session - decrypt sensitive fields first
             const entry = message.session;
-            let row: DecryptedLegacyIndexRow;
-            try {
-              row = await decryptSessionIndexEntry(entry, config.encryptionKey);
-            } catch (err) {
-              if (!(err instanceof IndexEntryDecryptionError)) throw err;
-              personalSyncWriteGate.markBlocked('decryption-failed', err.message);
-              console.warn(`[CollabV3] Ignoring index broadcast for session ${entry.sessionId}: ${err.message}. The cached row is preserved and personal-sync writes are paused on this device.`);
-              break;
+            // console.log('[CollabV3] DEBUG indexBroadcast received for session:', entry.sessionId, 'hasClientMeta:', !!entry.encryptedClientMetadata, 'fromConnectionId:', message.fromConnectionId);
+
+            // Decrypt projectId - encrypted projectId is required
+            let projectId: string;
+            if (entry.encryptedProjectId && entry.projectIdIv && config.encryptionKey) {
+              try {
+                projectId = await decryptProjectId(entry.encryptedProjectId, entry.projectIdIv, config.encryptionKey);
+              } catch (err) {
+                console.error('[CollabV3] Failed to decrypt index entry projectId:', err);
+                projectId = 'unknown';
+              }
+            } else {
+              projectId = 'unknown';
             }
-            const decryptedEntry = row.cacheEntry;
+
+            const decryptedEntry: CachedSessionIndex = {
+              sessionId: entry.sessionId,
+              projectId: projectId,
+              title: 'Untitled', // Will be overwritten if encrypted title present
+              provider: entry.provider,
+              model: entry.model,
+              mode: entry.mode,
+              sessionType: entry.sessionType,
+              parentSessionId: entry.parentSessionId,
+              worktreeId: entry.worktreeId,
+              // Carry the meta-agent grouping fields off the wire so an
+              // incremental broadcast keeps the local cache groupable (parity
+              // with the indexResponse decrypt path above).
+              agentRole: entry.agentRole,
+              createdBySessionId: entry.createdBySessionId,
+              isArchived: entry.isArchived,
+              isPinned: entry.isPinned,
+              branchedFromSessionId: entry.branchedFromSessionId,
+              branchPointMessageId: entry.branchPointMessageId,
+              branchedAt: entry.branchedAt,
+              messageCount: entry.messageCount,
+              lastMessageAt: entry.lastMessageAt,
+              createdAt: entry.createdAt,
+              updatedAt: entry.updatedAt,
+              pendingExecution: entry.pendingExecution,
+              isExecuting: entry.isExecuting,
+              queuedPromptCount: entry.queuedPromptCount,
+              hasPendingPrompt: entry.hasPendingPrompt,
+              lastReadAt: entry.lastReadAt,
+            };
+
+            // Decrypt client metadata (context usage, pending prompt state, draft, etc.)
+            if (entry.encryptedClientMetadata && entry.clientMetadataIv && config.encryptionKey) {
+              try {
+                const clientMeta = await decryptClientMetadata(entry.encryptedClientMetadata, entry.clientMetadataIv, config.encryptionKey);
+                decryptedEntry.currentContext = clientMeta.currentContext;
+                if (clientMeta.hasPendingPrompt !== undefined) {
+                  decryptedEntry.hasPendingPrompt = clientMeta.hasPendingPrompt;
+                }
+                if (clientMeta.phase) decryptedEntry.phase = clientMeta.phase;
+                if (clientMeta.tags) decryptedEntry.tags = clientMeta.tags;
+                // Allow empty string through so "clear draft" propagates to renderer
+                if (clientMeta.draftInput !== undefined) decryptedEntry.draftInput = clientMeta.draftInput;
+                if (clientMeta.draftUpdatedAt !== undefined) decryptedEntry.draftUpdatedAt = clientMeta.draftUpdatedAt;
+                if (clientMeta.hasBeenNamed !== undefined) decryptedEntry.hasBeenNamed = clientMeta.hasBeenNamed;
+              } catch (err) {
+                console.error('[CollabV3] Failed to decrypt client metadata:', err);
+              }
+            }
+
+            // Decrypt title - encrypted titles are required
+            if (entry.encryptedTitle && entry.titleIv && config.encryptionKey) {
+              try {
+                decryptedEntry.title = await decryptTitle(entry.encryptedTitle, entry.titleIv, config.encryptionKey);
+              } catch (err) {
+                console.error('[CollabV3] Failed to decrypt index entry title:', err);
+                decryptedEntry.title = 'Untitled';
+              }
+            }
+            // If no encrypted title, keep as 'Untitled'
+
+            // Decrypt queued prompts - encrypted prompts are required
+            if (entry.encryptedQueuedPrompts && entry.encryptedQueuedPrompts.length > 0 && config.encryptionKey) {
+              try {
+                console.log('[CollabV3] DEBUG decrypting queued prompts:', entry.encryptedQueuedPrompts.length);
+                decryptedEntry.queuedPrompts = await decryptQueuedPrompts(entry.encryptedQueuedPrompts, config.encryptionKey);
+                console.log('[CollabV3] DEBUG decrypted:', decryptedEntry.queuedPrompts?.length, 'prompts');
+              } catch (err) {
+                console.error('[CollabV3] Failed to decrypt index entry queued prompts:', err);
+              }
+            } else if (
+              entry.queuedPromptCount === 0 ||
+              Array.isArray(entry.encryptedQueuedPrompts)
+            ) {
+              decryptedEntry.queuedPrompts = [];
+            } else {
+              // console.log('[CollabV3] DEBUG no encrypted prompts to decrypt:', {
+              //   hasEncryptedPrompts: !!entry.encryptedQueuedPrompts,
+              //   length: entry.encryptedQueuedPrompts?.length ?? 0,
+              //   hasEncryptionKey: !!config.encryptionKey,
+              // });
+            }
+            // If no encrypted prompts, queuedPrompts stays undefined
 
             // Cache the decrypted entry
             sessionIndexCache.set(entry.sessionId, decryptedEntry);
-            // Broadcast rows are the server's own view of the row (ours echoed
-            // back, or another device's write). Track it so the gate compares
-            // against current server state rather than a stale local send.
-            indexPublicationGate.recordPublished(entry.sessionId, indexPatchSignatureForEntry(decryptedEntry));
             // console.log('[CollabV3] Received indexBroadcast for session:', entry.sessionId,
             //   'queuedPrompts:', decryptedEntry.queuedPrompts?.length ?? 0,
             //   'pendingExecution:', decryptedEntry.pendingExecution,
@@ -3172,31 +2387,8 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             notifyDeviceStatusChange();
             break;
 
-          case 'mobilePushResult': {
-            const pending = pendingMobilePushes.get(message.requestId);
-            if (!pending) break;
-            clearTimeout(pending.timer);
-            pendingMobilePushes.delete(message.requestId);
-            pending.resolve({
-              accepted: message.accepted,
-              attemptedCount: message.attemptedCount,
-              deliveredCount: message.deliveredCount,
-              skipped: message.skipped,
-              rejection: message.rejection,
-            });
-            break;
-          }
-
           case 'createSessionRequestBroadcast': {
             // Another device (mobile) requested session creation
-            const ourDeviceId = localDeviceId();
-            if (message.targetDeviceId && message.targetDeviceId !== ourDeviceId) break;
-            // Captured BEFORE the decryption awaits below. The server binds this
-            // claim to the socket that delivered the broadcast, and a listener
-            // that samples the generation after the await reads whatever socket
-            // exists by then -- so a disconnect mid-decrypt looks, from the
-            // listener's side, like a claim it still holds.
-            const receiptGeneration = indexConnectionGeneration;
             // Decrypt projectId - required for encrypted wire protocol
             let projectId: string;
             if (message.request.encryptedProjectId && message.request.projectIdIv && config.encryptionKey) {
@@ -3229,9 +2421,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               provider: message.request.provider,
               model: message.request.model,
               agentRole: message.request.agentRole,
-              targetDeviceId: message.targetDeviceId,
               timestamp: message.request.timestamp,
-              receiptGeneration,
             };
 
             // Notify all listeners (desktop will handle this)
@@ -3346,8 +2536,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
           case 'createWorktreeRequestBroadcast': {
             // Another device (mobile) requested worktree creation
-            const ourDeviceId = localDeviceId();
-            if (message.targetDeviceId && message.targetDeviceId !== ourDeviceId) break;
             let projectId: string;
             if (message.request.encryptedProjectId && message.request.projectIdIv && config.encryptionKey) {
               try {
@@ -3363,7 +2551,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             const decryptedRequest: CreateWorktreeRequest = {
               requestId: message.request.requestId,
               projectId,
-              targetDeviceId: message.targetDeviceId,
               timestamp: message.request.timestamp,
             };
 
@@ -3387,16 +2574,12 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
           case 'sessionControlBroadcast': {
             // Generic session control message from another device
-            const ourDeviceId = localDeviceId();
-            if (message.message.targetDeviceId && message.message.targetDeviceId !== ourDeviceId) break;
             const controlMessage: SessionControlMessage = {
               sessionId: message.message.sessionId,
               type: message.message.messageType,
               payload: message.message.payload,
               timestamp: message.message.timestamp,
               sentBy: message.message.sentBy,
-              sentByDeviceId: message.message.sentByDeviceId,
-              targetDeviceId: message.message.targetDeviceId,
             };
 
             console.log('[CollabV3] Received sessionControl:', controlMessage.sessionId, controlMessage.type);
@@ -3417,7 +2600,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             const payload = message.settings;
 
             // Don't process our own broadcasts
-            const ourDeviceId = localDeviceId();
+            const ourDeviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId;
             if (ourDeviceId && payload.deviceId === ourDeviceId) {
               break;
             }
@@ -3452,122 +2635,63 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             break;
           }
 
-          case 'readReceiptBroadcast':
-            await handleReadReceiptBroadcast(message.receipt);
-            break;
+          case 'readReceiptBroadcast': {
+            // A read receipt from another device (or the server replay on
+            // connect). Personal, single-user channel — decrypt + hand to
+            // listeners which merge advance-only into local state.
+            const payload = message.receipt;
 
-          case 'trackerPersonalStateBroadcast':
-            await handleTrackerPersonalStateBroadcast(message.state);
-            break;
-
-          case 'indexPageResponse': {
-            const pending = pendingIndexPage;
-            if (!pending || pending.requestId !== message.requestId) {
-              // A response for a request we are not waiting on (cancelled,
-              // timed out, or from a previous connection). Applying it would
-              // merge rows into a mirror whose drain has moved on.
-              console.warn('[CollabV3] Ignoring indexPageResponse for unknown requestId:', message.requestId);
+            const ourDeviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId;
+            if (ourDeviceId && payload.deviceId === ourDeviceId) {
               break;
             }
-            clearTimeout(pending.timer);
-            pendingIndexPage = null;
-            if (pending.generation !== indexConnectionGeneration) {
-              pending.reject(new Error('[CollabV3] Index page response arrived after a reconnect; discarding'));
+            if (!config.encryptionKey) {
+              console.error('[CollabV3] Cannot decrypt read receipt - no encryption key');
               break;
             }
-            // Answering at all proves the server speaks v2.
-            indexProtocolCapability = 'v2';
-            // Envelope has to match what we asked for: a bootstrap page applied
-            // as a delta (or vice versa) would be merged under the wrong
-            // coverage rules.
-            if (message.protocolVersion !== 2) {
-              pending.reject(new Error(`[CollabV3] indexPageResponse declared protocol version ${String(message.protocolVersion)}`));
-              break;
-            }
-            if (message.mode !== pending.mode) {
-              pending.reject(new Error(`[CollabV3] indexPageResponse mode '${String(message.mode)}' does not match the requested '${pending.mode}'`));
-              break;
-            }
-            if (!Array.isArray(message.entries)) {
-              pending.reject(new Error('[CollabV3] indexPageResponse carried no entries array'));
-              break;
-            }
-            pending.resolve(message);
-            break;
-          }
-
-          case 'personalStatePageResponse': {
-            const pending = pendingPersonalStatePage;
-            if (!pending || pending.requestId !== message.requestId) {
-              console.warn('[CollabV3] Ignoring personalStatePageResponse for unknown requestId:', message.requestId);
-              break;
-            }
-            clearTimeout(pending.timer);
-            pendingPersonalStatePage = null;
-            if (pending.generation !== indexConnectionGeneration) {
-              pending.reject(new Error('[CollabV3] Personal state page arrived after a reconnect; discarding'));
-              break;
-            }
-            pending.resolve(message);
-            break;
-          }
-
-          case 'indexSessionExpired': {
-            const expired = message as unknown as { sessionId: string; activityAt: number };
-            if (!Number.isFinite(expired.activityAt) || typeof expired.sessionId !== 'string') break;
-            rejectedIndexActivity.set(expired.sessionId, expired.activityAt);
-            if (rejectedIndexActivity.size > 1000) rejectedIndexActivity.delete(rejectedIndexActivity.keys().next().value!);
-            const cached = sessionIndexCache.get(expired.sessionId);
-            if (cached && sessionActivityAt(cached) === expired.activityAt) {
-              sessionIndexCache.delete(expired.sessionId);
-              indexPublicationGate.invalidate(expired.sessionId);
+            try {
+              const json = await decrypt(
+                payload.encryptedReceipt,
+                payload.receiptIv,
+                config.encryptionKey,
+              );
+              const receipt: SyncedReadReceipt = JSON.parse(json);
+              readReceiptListeners.forEach((callback) => {
+                try {
+                  callback(receipt);
+                } catch (err) {
+                  console.error('[CollabV3] Error in read receipt listener:', err);
+                }
+              });
+            } catch (err) {
+              console.error('[CollabV3] Failed to decrypt read receipt:', err);
             }
             break;
           }
 
-          case 'indexChangesAvailable': {
-            // A hint, not a cursor. Remember the high-water mark unconditionally
-            // -- including while a bootstrap is still in flight -- then let the
-            // scheduler decide when a drain can actually run.
-            if (typeof message.revision === 'number') {
-              maxHintedRevision = Math.max(maxHintedRevision ?? 0, message.revision);
+          case 'trackerPersonalStateBroadcast': {
+            const payload = message.state;
+            const ourDeviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId;
+            if (ourDeviceId && payload.deviceId === ourDeviceId) break;
+            if (!config.encryptionKey) {
+              console.error('[CollabV3] Cannot decrypt tracker personal state - no encryption key');
+              break;
             }
-            scheduleHintedDrain();
+            try {
+              const json = await decrypt(payload.encryptedState, payload.stateIv, config.encryptionKey);
+              const change: SyncedTrackerPersonalStateChange = JSON.parse(json);
+              trackerPersonalStateListeners.forEach((callback) => {
+                try { callback(change); }
+                catch (err) { console.error('[CollabV3] Error in tracker personal state listener:', err); }
+              });
+            } catch (err) {
+              console.error('[CollabV3] Failed to decrypt tracker personal state:', err);
+            }
             break;
           }
 
           case 'error':
             console.error('[CollabV3] Index error:', message.code, message.message);
-            if (message.code === 'update_required') {
-              // The server refuses personal-sync writes from this build. Only a
-              // newer build clears this; reads and presence continue.
-              personalSyncWriteGate.markBlocked('update-required', message.message);
-            }
-            if (pendingPersonalStatePage
-              && (message.requestId === undefined || message.requestId === pendingPersonalStatePage.requestId)) {
-              const pending = pendingPersonalStatePage;
-              pendingPersonalStatePage = null;
-              clearTimeout(pending.timer);
-              // An old server has no personalStatePageRequest handler. The
-              // replay is skipped rather than failing the connection: v2 index
-              // replication is unaffected, and legacy servers replay these
-              // streams on indexSyncRequest anyway.
-              pending.reject(new Error(`${message.code}: ${message.message}`));
-            }
-            if (pendingIndexPage
-              && (message.requestId === undefined || message.requestId === pendingIndexPage.requestId)) {
-              // The server has no handler for `indexPageRequest`. This is the
-              // only error that authorizes the legacy fallback.
-              const unsupported = message.code === 'unknown_message_type'
-                || message.code === 'unsupported_message'
-                || message.code === 'unsupported_protocol_version';
-              const pending = pendingIndexPage;
-              pendingIndexPage = null;
-              clearTimeout(pending.timer);
-              pending.reject(unsupported
-                ? new IndexProtocolUnsupportedError(`${message.code}: ${message.message}`)
-                : new Error(message.message));
-            }
             if (pendingIndexFetch) {
               pendingIndexFetch.reject(new Error(message.message));
               pendingIndexFetch = null;
@@ -3583,11 +2707,11 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
   // Log the config being used
   // console.log('[CollabV3] Initializing with config:', {
   //   serverUrl: config.serverUrl,
-  //   personalMemberId: config.personalMemberId,
+  //   userId: config.userId,
   //   hasEncryptionKey: !!config.encryptionKey,
   // });
 
-  // Start index connection. If the JWT mismatches the configured personalMemberId,
+  // Start index connection. If the JWT mismatches the configured userId,
   // ensureFreshJwt sets indexAuthBlocked and throws -- we swallow it here so we
   // don't fire an unhandled promise rejection at startup. A later explicit
   // reconnectIndex() (network change / settings update / auth refresh) will
@@ -3595,7 +2719,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
   // existing scheduleIndexReconnect path via the onclose handler.
   connectToIndex().catch(err => {
     if (isAuthMismatchError(err)) {
-      console.warn('[CollabV3] Initial index connect blocked: JWT/personal-member mismatch. Waiting for explicit reconnect trigger.');
+      console.warn('[CollabV3] Initial index connect blocked: JWT/userId mismatch. Waiting for explicit reconnect trigger.');
       return;
     }
     console.error('[CollabV3] Initial index connect failed:', err);
@@ -3609,13 +2733,10 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     metadata?: { title?: string; provider?: string; model?: string; mode?: string }
   ): Promise<void> {
     if (isMessageSyncDisabled(sessionId)) return;
-    const replayActivityAt = messages.reduce((latest, message) => Math.max(latest, message.createdAt instanceof Date ? message.createdAt.getTime() : typeof message.createdAt === 'number' ? message.createdAt : 0), 0);
-    if (!isRetainedSession(replayActivityAt, Date.now(), SESSION_TRANSCRIPT_TTL_MS)) return;
     if (!config.encryptionKey) {
       console.error('[CollabV3] Cannot sync messages - no encryption key');
       return;
     }
-    if (withholdPersonalSyncWrite('transcript upload')) return;
 
     // console.log('[CollabV3] syncSessionMessages() - CREATING TEMP WebSocket for session', sessionId, 'with', messages.length, 'messages');
 
@@ -3629,7 +2750,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     const wsUrl = appendSyncClientParams(`${url}?token=${encodeURIComponent(jwt)}`);
 
     return new Promise((resolve, reject) => {
-      const ws = openWebSocket(wsUrl);
+      const ws = new WebSocket(wsUrl);
       let resolved = false;
 
       const timeout = setTimeout(() => {
@@ -3649,10 +2770,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             resolve();
             return;
           }
-
-          // Retain the original message order. The replay declaration grants
-          // only this connection permission to send older rows for current work.
-          ws.send(JSON.stringify({ type: 'beginSessionReplay', activityAt: replayActivityAt }));
 
           // First update metadata if provided
           if (metadata) {
@@ -3678,7 +2795,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
           // Send each message
           for (const message of messages) {
-            if (resolved || isMessageSyncDisabled(sessionId)) break;
+            if (isMessageSyncDisabled(sessionId)) break;
             if (!shouldSyncMessageForSessionRoom(message.source, message.metadata, message.content)) {
               continue;
             }
@@ -3721,13 +2838,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           const message: ServerMessage = JSON.parse(
             typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data)
           );
-          if (message.type === 'error' && message.code === 'session_expired') {
-            clearTimeout(timeout);
-            resolved = true;
-            ws.close();
-            resolve();
-            return;
-          }
           if (message.type !== 'error' || !isFatalMessageSyncErrorCode(message.code)) return;
 
           disableMessageSync(sessionId, message.code, message.message);
@@ -3765,13 +2875,12 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     if (messageSyncRequests && getMessagesForSync) {
       const requestMap = new Map(messageSyncRequests.map(r => [r.sessionId, r]));
       const sessionMap = new Map(sessionsData.map(s => [s.id, s]));
-      const sessionIds = messageSyncRequests.map(r => r.sessionId).filter(id => sessionMap.has(id));
+      const sessionIds = messageSyncRequests.map(r => r.sessionId);
 
       // console.log('[CollabV3] Lazy batch syncing messages for', sessionIds.length, 'sessions in batches of', batchSize);
 
       for (let i = 0; i < sessionIds.length; i += batchSize) {
-        const batchIds = sessionIds.slice(i, i + batchSize).filter(id => isRetainedSession(sessionMap.get(id)?.updatedAt, Date.now(), SESSION_TRANSCRIPT_TTL_MS));
-        if (!batchIds.length) continue;
+        const batchIds = sessionIds.slice(i, i + batchSize);
         const batchRequests = batchIds.map(id => requestMap.get(id)!);
 
         // Load messages for just this batch
@@ -3831,42 +2940,17 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       console.error('[CollabV3] doSyncSessionsToIndex called but not connected!');
       return;
     }
-    if (withholdPersonalSyncWrite('bulk index publish')) return;
-
-    sessionsData = sessionsData.filter(session => isRetainedSession(session.updatedAt) && !wasIndexActivityRejected(session.id, session.updatedAt));
-    if (!sessionsData.length) return;
 
     // console.log('[CollabV3] Syncing', sessionsData.length, 'sessions to index');
 
-    // The socket and connection generation this batch was built against. The
-    // encryption below can take seconds for a large batch, and `indexWs` is
-    // module state that a reconnect replaces underneath us.
-    const socket = indexWs;
-    const generation = indexConnectionGeneration;
-
-    // Nothing here touches the cache or the gate until after the send: this
-    // path runs OUTSIDE the per-session publish queue, so a live metadata patch
-    // can be built, sent, and cached while this batch is still encrypting.
-    // Whichever build is stale at send time drops its entry instead of
-    // overwriting the newer one on the server and in the cache.
-    const built: Array<{
-      sessionId: string;
-      entry: SessionIndexEntry;
-      cacheEntry: CachedSessionIndex;
-      signature: string;
-      publishSeq: number;
-    }> = [];
-
     // Build all entries, encrypting sensitive fields
-    await Promise.all(sessionsData.map(async session => {
+    const entries: SessionIndexEntry[] = await Promise.all(sessionsData.map(async session => {
       const projectId = session.workspaceId ?? 'default';
 
       // Encrypt projectId - encryption is required
       if (!config.encryptionKey) {
         throw new Error('[CollabV3] Cannot send session: no encryption key for projectId');
       }
-      // Captured before the first await, alongside the cache read it is built from.
-      const publishSeq = publishSequencer.read(session.id);
       const { encryptedProjectId, projectIdIv } = await encryptProjectId(projectId, config.encryptionKey);
 
       // Check if we have cached execution/prompt state for this session
@@ -3890,22 +2974,8 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         // Plaintext relationship/flag fields (incl. agentRole + createdBySessionId
         // for mobile meta-agent grouping). Single source of truth + regression lock:
         // sessionIndexEntryFields.ts / __tests__/sessionIndexEntryFields.test.ts.
-        //
-        // hostDeviceId comes from the row and only from the row. A session
-        // written before host attribution existed stays unattributed: publishing
-        // a row is not evidence of owning it, and two upgraded installs holding
-        // the same pre-upgrade session would otherwise each claim it in turn.
         ...buildSyncedSessionIndexFields(session),
-        // The bulk reconciliation query does not count messages (the COUNT join
-        // cost seconds on a large database), so `session.messageCount` is a
-        // placeholder zero unless the caller says otherwise. Publishing that
-        // zero overwrote the server's real count on every metadata-only sync.
-        // v2 omits it and the server keeps what it has; a legacy server has no
-        // COALESCE, so send the last count the server itself told us, falling
-        // back to the local value only when we have never seen one.
-        ...(resolvePublishedMessageCount(session, existingCache) !== undefined
-          ? { messageCount: resolvePublishedMessageCount(session, existingCache) }
-          : {}),
+        messageCount: session.messageCount,
         // lastMessageAt keeps advancing per message so mobile unread state
         // (Session.hasUnread: lastMessageAt > lastReadAt) stays live mid-turn.
         lastMessageAt: session.updatedAt,
@@ -3976,7 +3046,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         sessionType: session.sessionType,
         parentSessionId: session.parentSessionId,
         worktreeId: session.worktreeId,
-        hostDeviceId: entry.hostDeviceId,
         agentRole: session.agentRole,
         createdBySessionId: session.createdBySessionId ?? undefined,
         isArchived: session.isArchived,
@@ -3984,9 +3053,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         branchedFromSessionId: session.branchedFromSessionId,
         branchPointMessageId: session.branchPointMessageId,
         branchedAt: session.branchedAt,
-        messageCount: session.messageCountKnown === false
-          ? existingCache?.messageCount ?? session.messageCount
-          : session.messageCount,
+        messageCount: session.messageCount,
         lastMessageAt: session.updatedAt,
         createdAt: session.createdAt,
         // Mirror the value actually sent, not the local one -- otherwise the
@@ -4005,41 +3072,26 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         draftUpdatedAt: clientMeta?.draftUpdatedAt,
         hasBeenNamed: clientMeta?.hasBeenNamed,
       };
-      built.push({
-        sessionId: session.id,
-        entry,
-        cacheEntry,
-        signature: indexPatchSignatureForEntry(cacheEntry),
-        publishSeq,
-      });
-    }));
+      sessionIndexCache.set(session.id, cacheEntry);
 
-    const fresh = built.filter(item =>
-      isPublishStillCurrent(item.sessionId, socket, generation, item.publishSeq, 'bulk index entry'));
-    const entries = fresh.map(item => item.entry);
+      // Apply any pending metadata updates (e.g., isExecuting set before cache was populated)
+      // Note: This is fire-and-forget since we're already sending the encrypted entry
+      applyPendingMetadataUpdates(session.id).catch(err => {
+        console.error('[CollabV3] Error applying pending metadata updates:', err);
+      });
+
+      return entry;
+    }));
 
     // Use batch API if we have multiple sessions, otherwise single update
     if (entries.length > 1) {
       const msg: ClientMessage = { type: 'indexBatchUpdate', sessions: entries };
       const msgStr = JSON.stringify(msg);
       console.log('[CollabV3] Sending batch index update:', entries.length, 'sessions, message length:', msgStr.length);
-      socket.send(msgStr);
+      indexWs.send(msgStr);
     } else if (entries.length === 1) {
       const msg: ClientMessage = { type: 'indexUpdate', session: entries[0] };
-      socket.send(JSON.stringify(msg));
-    }
-    // Only now, after the batch is actually on the wire, does local state move:
-    // the cache, the suppression signature, and the publish sequence.
-    for (const item of fresh) {
-      sessionIndexCache.set(item.sessionId, item.cacheEntry);
-      indexPublicationGate.recordPublished(item.sessionId, item.signature);
-      noteSessionRowPublished(item.sessionId);
-
-      // Apply any pending metadata updates (e.g., isExecuting set before the
-      // cache was populated). Fire-and-forget: the encrypted entry is already sent.
-      applyPendingMetadataUpdates(item.sessionId).catch(err => {
-        console.error('[CollabV3] Error applying pending metadata updates:', err);
-      });
+      indexWs.send(JSON.stringify(msg));
     }
 
     // Sync messages if requested (fire-and-forget, catch errors to avoid unhandled rejections)
@@ -4058,13 +3110,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
   // Create provider object
   const provider: SyncProvider = {
     async connect(sessionId: string): Promise<void> {
-      const pending = sessionConnectionsInFlight.get(sessionId);
-      if (pending) return pending;
-      const existing = sessions.get(sessionId);
-      if (existing && !sessionTransportUsable(existing)) this.disconnect(sessionId);
-      // Register the promise before auth or socket creation can yield. Every
-      // caller must wait for OPEN, including a message racing session creation.
-      const attempt = Promise.resolve().then(async () => {
       if (isMessageSyncDisabled(sessionId)) return;
       // Track this session as wanted so we re-subscribe after reconnects.
       // Do this before the short-circuit so callers resubscribing an already-connected
@@ -4075,7 +3120,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         return; // Already connected
       }
 
-      // Short-circuit when the JWT/personal-member mismatch latch is set. The server
+      // Short-circuit when the JWT/userId mismatch latch is set. The server
       // would reject any session WebSocket against this room, and an active
       // agent streams ~10 messages/sec -- without this guard every message
       // hit `ensureFreshJwt()`, threw AUTH_MISMATCH, and flooded main.log
@@ -4084,7 +3129,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       // signals (network change, settings update, auth refresh) still
       // unblock subsequent connects.
       if (indexAuthBlocked) {
-        const err = new Error('CollabV3 session connection blocked: JWT/personal-member mismatch');
+        const err = new Error('CollabV3 session connection blocked: JWT/userId mismatch');
         (err as any).code = 'AUTH_MISMATCH';
         throw err;
       }
@@ -4128,7 +3173,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       // covers the case where the per-session connect() is the first
       // sync call in the process and connectToIndex() hasn't latched
       // yet).
-      let jwt: PersonalJwt;
+      let jwt: string;
       try {
         ({ jwt } = await ensureFreshJwt());
       } catch (err) {
@@ -4139,35 +3184,29 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       }
 
       const roomId = getRoomId(sessionId);
-      if (sessionConnectionsInFlight.get(sessionId) !== attempt) {
-        throw new Error('Session connection was cancelled');
-      }
       const url = getWebSocketUrl(roomId);
       // Pass JWT via query parameter (WebSocket doesn't support custom headers in browsers)
       const wsUrl = appendSyncClientParams(`${url}?token=${encodeURIComponent(jwt)}`);
 
-      return new Promise<void>((resolve, reject) => {
-        const ws = openWebSocket(wsUrl);
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket(wsUrl);
 
         const session: SessionConnection = {
           ws,
           status: createInitialStatus(),
-          statusListeners: sessionStatusListeners.get(sessionId) ?? new Set(),
-          changeListeners: sessionChangeListeners.get(sessionId) ?? new Set(),
+          statusListeners: new Set(),
+          changeListeners: new Set(),
           lastSequence: 0,
           encryptionKey: config.encryptionKey,
           lastActivity: Date.now(),
-          nodeCredentialExpiresAt: isNodeAccessToken(jwt) ? decodeNodeAccessTokenClaims(jwt).exp * 1000 : undefined,
         };
 
         sessions.set(sessionId, session);
-        sessionStatusListeners.set(sessionId, session.statusListeners);
-        sessionChangeListeners.set(sessionId, session.changeListeners);
 
         const timeout = setTimeout(() => {
           reject(new Error('Connection timeout'));
           ws.close();
-          if (sessions.get(sessionId) === session) sessions.delete(sessionId);
+          sessions.delete(sessionId);
         }, 10000);
 
         ws.onopen = () => {
@@ -4182,9 +3221,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         };
 
         ws.onclose = (event: CloseEvent) => {
-          clearTimeout(timeout);
-          reject(new Error('Session connection closed before opening'));
-          if (sessions.get(sessionId) !== session) return;
           // Auth rejections (expired/invalid JWT) arrive here as a close
           // frame, not as an error event. Logging code/reason makes the
           // root cause visible the next time something goes wrong.
@@ -4193,8 +3229,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           );
           updateStatus(sessionId, { connected: false });
           sessions.delete(sessionId);
-          if (!session.statusListeners.size) sessionStatusListeners.delete(sessionId);
-          if (!session.changeListeners.size) sessionChangeListeners.delete(sessionId);
         };
 
         ws.onerror = (event) => {
@@ -4202,8 +3236,8 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           // the actionable code/reason. Keep this log as a breadcrumb only.
           const errorInfo = typeof ErrorEvent !== 'undefined' && event instanceof ErrorEvent
             ? { message: event.message, error: event.error }
-            : { type: event.type, target: redactSyncUrl((event.target as WebSocket)?.url) };
-          console.error(`[CollabV3] WebSocket error for ${sessionId}:`, errorInfo, 'URL:', redactSyncUrl(wsUrl));
+            : { type: event.type, target: (event.target as WebSocket)?.url };
+          console.error(`[CollabV3] WebSocket error for ${sessionId}:`, errorInfo, 'URL:', wsUrl);
           updateStatus(sessionId, { connected: false, error: 'Connection error' });
         };
 
@@ -4214,19 +3248,12 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           handleServerMessage(sessionId, event.data);
         };
       });
-      });
-      sessionConnectionsInFlight.set(sessionId, attempt);
-      try { await attempt; }
-      finally {
-        if (sessionConnectionsInFlight.get(sessionId) === attempt) sessionConnectionsInFlight.delete(sessionId);
-      }
     },
 
     disconnect(sessionId: string): void {
       // Caller explicitly no longer wants this session -- drop intent so it
       // isn't resubscribed on the next index reconnect.
       wantedSessions.delete(sessionId);
-      sessionConnectionsInFlight.delete(sessionId);
       const session = sessions.get(sessionId);
       if (!session) return;
 
@@ -4236,12 +3263,9 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
     disconnectAll(): void {
       wantedSessions.clear();
-      sessionConnectionsInFlight.clear();
       for (const sessionId of sessions.keys()) {
         this.disconnect(sessionId);
       }
-      sessionStatusListeners.clear();
-      sessionChangeListeners.clear();
 
       if (indexReconnectTimer) {
         clearTimeout(indexReconnectTimer);
@@ -4257,21 +3281,11 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         indexWs = null;
         indexConnected = false;
       }
-      indexPublicationGate.reset();
-      indexConnectionGeneration++;
-      indexProtocolCapability = 'unknown';
-      cancelPendingIndexPage('Sync disconnected while a page request was in flight');
-      maxHintedRevision = undefined;
-      hintDrainScheduled = false;
-      cancelPendingPersonalStatePage('Sync disconnected while a personal state page was in flight');
-      // Full teardown (sign-out / account switch): the replicated mirror and
-      // its cursor belong to that account and must not survive into another.
-      indexMirror.reset();
-      indexMirrorMemberId = undefined;
     },
 
     isConnected(sessionId: string): boolean {
-      return sessionTransportUsable(sessions.get(sessionId));
+      const session = sessions.get(sessionId);
+      return session?.status.connected ?? false;
     },
 
     isAuthMismatched(): boolean {
@@ -4284,37 +3298,25 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     },
 
     onStatusChange(sessionId: string, callback: (status: SyncStatus) => void): () => void {
-      const listeners = sessionStatusListeners.get(sessionId) ?? new Set();
-      sessionStatusListeners.set(sessionId, listeners);
-      listeners.add(callback);
-      return () => {
-        listeners.delete(callback);
-        if (!listeners.size && !sessions.has(sessionId)) sessionStatusListeners.delete(sessionId);
-      };
+      const session = sessions.get(sessionId);
+      if (!session) return () => {};
+
+      session.statusListeners.add(callback);
+      return () => session.statusListeners.delete(callback);
     },
 
     onRemoteChange(sessionId: string, callback: (change: SessionChange) => void): () => void {
-      const listeners = sessionChangeListeners.get(sessionId) ?? new Set();
-      sessionChangeListeners.set(sessionId, listeners);
-      listeners.add(callback);
-      return () => {
-        listeners.delete(callback);
-        if (!listeners.size && !sessions.has(sessionId)) sessionChangeListeners.delete(sessionId);
-      };
+      const session = sessions.get(sessionId);
+      if (!session) return () => {};
+
+      session.changeListeners.add(callback);
+      return () => session.changeListeners.delete(callback);
     },
 
-    /**
-     * Failures are REPORTED, never thrown: every existing caller is
-     * fire-and-forget, and throwing would turn each one into an unhandled
-     * rejection. A caller that has to know (the headless node retains an
-     * unpublished transcript row and retries it on reconnect) reads the outcome.
-     */
-    async pushChange(sessionId: string, change: SessionChange): Promise<PushChangeOutcome> {
-      if (isMessageSyncDisabled(sessionId) && change.type === 'message_added') {
-        return { published: false, reason: 'message sync is disabled for this session', retryable: false };
-      }
+    async pushChange(sessionId: string, change: SessionChange): Promise<void> {
+      if (isMessageSyncDisabled(sessionId) && change.type === 'message_added') return;
       const session = sessions.get(sessionId);
-      const sessionConnected = sessionTransportUsable(session);
+      const sessionConnected = session?.status.connected;
 
       // For metadata-only updates (like hasPendingPrompt, isExecuting), we can push to the
       // index room even without a session room connection. The session room is only opened
@@ -4324,7 +3326,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
       if (!sessionConnected && !canPushIndexOnly) {
         console.warn('[CollabV3] Cannot push change - not connected:', sessionId, 'sessionExists:', !!session, 'indexConnected:', indexConnected, 'hasKey:', !!config.encryptionKey);
-        return { published: false, reason: 'not connected', retryable: true };
+        return;
       }
       // console.log('[CollabV3] pushChange:', sessionId, 'type:', change.type, 'sessionConnected:', sessionConnected, 'indexOnly:', !sessionConnected && canPushIndexOnly);
 
@@ -4334,11 +3336,10 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         case 'message_added': {
           if (!session?.encryptionKey) {
             console.warn('[CollabV3] Cannot push message - no encryption key or session room not connected');
-            return { published: false, reason: 'session room has no encryption key', retryable: true };
+            return;
           }
           if (!shouldSyncMessageForSessionRoom(change.message.source, change.message.metadata, change.message.content, change.message.hidden)) {
-            // Deliberately not sent. Not retryable: it would be filtered again.
-            return { published: false, reason: 'filtered from session-room sync', retryable: false };
+            return;
           }
           try {
             const encrypted = await encryptMessage(change.message, session.encryptionKey);
@@ -4352,8 +3353,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             clientMessage = { type: 'appendMessage', message: encrypted };
           } catch (err) {
             console.error('[CollabV3] Failed to encrypt message:', err);
-            // Deterministic: the same row would fail the same way.
-            return { published: false, reason: 'encryption failed', retryable: false };
+            return;
           }
           break;
         }
@@ -4429,54 +3429,24 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           break;
       }
 
-      // Tracks whether the session-room write actually happened, for the outcome
-      // returned at the end. Only `message_added` has nowhere else to land: a
-      // metadata update still reaches the index below.
-      let sessionRoomOutcome: PushChangeOutcome | undefined;
-
-      // Send to session room (if connected, we have a message to send, and
-      // this device is allowed to publish personal-sync ciphertext at all)
-      if (clientMessage && sessionConnected && !withholdPersonalSyncWrite('session room write')) {
+      // Send to session room (if connected and we have a message to send)
+      if (clientMessage && sessionConnected) {
         try {
           const json = JSON.stringify(clientMessage);
           // console.log('[CollabV3] Sending message, length:', json.length);
-          if (clientMessage.type === 'updateMetadata') {
-            const activity = change.type === 'metadata_updated'
-              ? change.metadata.updatedAt ?? sessionActivityAt(sessionIndexCache.get(sessionId) ?? {})
-              : sessionActivityAt(sessionIndexCache.get(sessionId) ?? {});
-            if (isRetainedSession(activity, Date.now(), SESSION_TRANSCRIPT_TTL_MS)) {
-              session.ws.send(JSON.stringify({ type: 'beginSessionReplay', activityAt: activity }));
-            }
-          }
           session.ws.send(json);
           // Update activity timestamp on message send
           session.lastActivity = Date.now();
         } catch (err) {
           console.error('[CollabV3] Failed to send message:', err);
-          sessionRoomOutcome = { published: false, reason: 'session room send failed', retryable: true };
         }
-      } else if (change.type === 'message_added') {
-        // The only branch where a message row silently goes nowhere: either the
-        // session room is not connected or the personal-sync write gate is
-        // holding writes back. Both clear on reconnect, so this is retryable.
-        sessionRoomOutcome = {
-          published: false,
-          reason: sessionConnected
-            ? 'personal-sync writes are withheld'
-            : 'session room is not connected',
-          retryable: true,
-        };
       }
 
       // Handle index updates based on change type
-      if (indexWs && indexConnected && !withholdPersonalSyncWrite('index change')) {
+      if (indexWs && indexConnected) {
         if (change.type === 'session_deleted') {
           // Delete from index and cache
           sessionIndexCache.delete(sessionId);
-          // A delete/recreate is not an ordinary metadata merge -- the recreated
-          // row must publish in full, never be suppressed against the deleted
-          // row's projection.
-          indexPublicationGate.invalidate(sessionId);
           const indexDeleteMsg: ClientMessage = { type: 'indexDelete', sessionId: sessionId };
           // console.log('[CollabV3] Sending index_delete for session:', sessionId);
           indexWs.send(JSON.stringify(indexDeleteMsg));
@@ -4506,7 +3476,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               sessionType: 'sessionType' in meta ? (meta as any).sessionType : cached.sessionType,
               parentSessionId: 'parentSessionId' in meta ? meta.parentSessionId : cached.parentSessionId,
               worktreeId: 'worktreeId' in meta ? (meta as any).worktreeId : cached.worktreeId,
-              hostDeviceId: 'hostDeviceId' in meta ? meta.hostDeviceId : cached.hostDeviceId,
               // Meta-agent grouping fields: apply when the update carries them,
               // otherwise preserve the cached value (also held by the `...cached`
               // spread above). createdBySessionId is normalized null -> undefined.
@@ -4538,12 +3507,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             }
           } else if (meta.title && meta.provider) {
             // New session - need at least title and provider
-            const now = updatedAt;
-            if (now === undefined || !isRetainedSession(now)) {
-              // Too old to publish to the index. The session-room write above
-              // already happened (or reported why not), so the outcome stands.
-              return sessionRoomOutcome ?? { published: true };
-            }
+            const now = updatedAt ?? Date.now();
             const newEntry: CachedSessionIndex = {
               sessionId: sessionId,
               projectId: meta.workspaceId ?? 'default',
@@ -4554,7 +3518,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               sessionType: meta.sessionType,
               parentSessionId: meta.parentSessionId,
               worktreeId: (meta as any).worktreeId,
-              hostDeviceId: meta.hostDeviceId,
               // Meta-agent grouping fields (parity with bulk path's
               // buildSyncedSessionIndexFields + sendIndexUpdate). Without these a
               // freshly-created meta agent/child reaches the server/phone ungrouped
@@ -4594,7 +3557,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               'sessionType' in meta ||
               'parentSessionId' in meta ||
               'worktreeId' in meta ||
-              'hostDeviceId' in meta ||
               'isArchived' in meta ||
               'isPinned' in meta ||
               'queuedPrompts' in meta ||
@@ -4616,7 +3578,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               if ('sessionType' in meta) existing.sessionType = meta.sessionType;
               if ('parentSessionId' in meta) existing.parentSessionId = meta.parentSessionId;
               if ('worktreeId' in meta) existing.worktreeId = (meta as any).worktreeId;
-              if ('hostDeviceId' in meta) existing.hostDeviceId = meta.hostDeviceId;
               if ('isArchived' in meta) existing.isArchived = meta.isArchived;
               if ('isPinned' in meta) existing.isPinned = (meta as any).isPinned;
               if ('queuedPrompts' in meta) existing.queuedPrompts = meta.queuedPrompts;
@@ -4636,8 +3597,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           }
         }
       }
-
-      return sessionRoomOutcome ?? { published: true };
     },
 
     syncSessionsToIndex(sessionsData: SessionIndexData[], options?: {
@@ -4697,16 +3656,12 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         console.error('[CollabV3] Cannot sync project config: no encryption key');
         return;
       }
-      if (withholdPersonalSyncWrite('project config publish')) return;
 
       // Encrypt project ID (deterministic)
       const { encryptedProjectId, projectIdIv } = await encryptProjectId(projectId, config.encryptionKey);
 
-      // Build message -- only include the encrypted config when it carries
-      // content, so a hash-only call doesn't overwrite existing config with an
-      // empty object. This deliberately checks actions as well as commands: an
-      // actions-only workspace used to publish nothing at all, which was
-      // invisible on any repo that happened to have slash commands.
+      // Build message -- only include encrypted config if there are commands
+      // (skip when just sending gitRemoteHash on startup to avoid overwriting existing config)
       const message: Record<string, unknown> = {
         type: 'projectConfigUpdate',
         encryptedProjectId,
@@ -4714,7 +3669,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         gitRemoteHash: projectConfig.gitRemoteHash,
       };
 
-      if (hasPublishableConfig(projectConfig)) {
+      if (projectConfig.commands.length > 0) {
         const configJson = JSON.stringify(projectConfig);
         const { encrypted: encryptedConfig, iv: configIv } = await encrypt(configJson, config.encryptionKey);
         message.encryptedConfig = encryptedConfig;
@@ -4722,10 +3677,10 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       }
 
       indexWs.send(JSON.stringify(message));
-      // console.log('[CollabV3] Sent projectConfigUpdate with', projectConfig.commands.length, 'commands and', projectConfig.actions?.length ?? 0, 'actions');
+      // console.log('[CollabV3] Sent projectConfigUpdate with', projectConfig.commands.length, 'commands');
     },
 
-    async fetchIndex(): Promise<{ complete?: boolean; indexProtocolVersion?: 1 | 2; deletedSessionIds?: string[]; sessions: DecryptedSessionIndexEntry[]; projects: Array<{ projectId: string; name: string; sessionCount: number; lastActivityAt: number; syncEnabled: boolean; gitRemoteHash?: string }> }> {
+    async fetchIndex(): Promise<{ sessions: DecryptedSessionIndexEntry[]; projects: Array<{ projectId: string; name: string; sessionCount: number; lastActivityAt: number; syncEnabled: boolean; gitRemoteHash?: string }> }> {
       // Wait for connection if not ready
       if (!indexWs || !indexConnected) {
         // console.log('[CollabV3] Waiting for index connection before fetching...');
@@ -4746,40 +3701,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
       if (!indexWs || !indexConnected) {
         throw new Error('Index connection not available');
-      }
-
-      if (indexProtocolCapability !== 'legacy') {
-        try {
-          await indexDrainQueue.run('index', () => runIndexReplicationWithPersonalState({ notifyListeners: false }));
-          // `snapshot()` throws unless coverage is complete. Callers use absence
-          // from this result as "the server is missing it, republish", so a
-          // partial mirror must fail the fetch instead of being returned.
-          const { sessions, projects } = indexMirror.snapshot();
-          // Every row in a complete mirror decrypted under this key.
-          personalSyncWriteGate.markVerified();
-          return {
-            complete: true,
-            indexProtocolVersion: 2,
-            // Explicit server tombstones, retained across a full rebuild. The
-            // caller must NOT republish these: absent-and-tombstoned is a
-            // deletion, absent-and-unknown is something the server never got.
-            deletedSessionIds: indexMirror.deletedIds('session'),
-            sessions,
-            projects,
-          };
-        } catch (err) {
-          if (err instanceof IndexEntryDecryptionError) {
-            personalSyncWriteGate.markBlocked('decryption-failed', err.message);
-          }
-          if (!(err instanceof IndexProtocolUnsupportedError)) {
-            // A real failure (transport, timeout, partial bootstrap) is NOT a
-            // reason to fall back: the legacy path would answer with a complete
-            // snapshot we have no right to claim.
-            throw err;
-          }
-          indexProtocolCapability = 'legacy';
-          console.warn('[CollabV3] Index server does not support the v2 paged protocol; using the legacy full index. Bounded index transport is NOT active on this connection.');
-        }
       }
 
       return new Promise((resolve, reject) => {
@@ -4934,11 +3855,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         }
       }
 
-      const msg: ClientMessage = {
-        type: 'createSessionRequest',
-        request: wireRequest,
-        targetDeviceId: request.targetDeviceId,
-      };
+      const msg: ClientMessage = { type: 'createSessionRequest', request: wireRequest };
       // Debug logging - uncomment if needed
       // console.log('[CollabV3] Sending create_session_request:', request.requestId, 'project:', request.projectId);
       indexWs.send(JSON.stringify(msg));
@@ -5080,11 +3997,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       return Array.from(connectedDevices.values());
     },
 
-    /** Get this client's own current device identity. */
-    getLocalDeviceInfo(): DeviceInfo | undefined {
-      return localDeviceInfo();
-    },
-
     /** Subscribe to device status changes (devices joining/leaving) */
     onDeviceStatusChange(callback: (devices: DeviceInfo[]) => void): () => void {
       deviceStatusListeners.add(callback);
@@ -5126,8 +4038,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           payload: message.payload,
           timestamp: message.timestamp,
           sentBy: message.sentBy,
-          sentByDeviceId: message.sentByDeviceId ?? localDeviceId(),
-          targetDeviceId: message.targetDeviceId,
         },
       };
       console.log('[CollabV3] Sending sessionControl:', message.sessionId, message.type);
@@ -5169,7 +4079,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
       try {
         // Get our device ID
-        const deviceId = localDeviceId() ?? 'unknown';
+        const deviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId ?? 'unknown';
 
         // Encrypt the settings as JSON
         const settingsJson = JSON.stringify(settings);
@@ -5185,7 +4095,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
         const msg: ClientMessage = { type: 'settingsSync', settings: payload };
         // console.log('[CollabV3] Syncing settings, version:', settings.version, 'ws state:', indexWs.readyState);
-        if (indexWs.readyState !== WS_OPEN) {
+        if (indexWs.readyState !== WebSocket.OPEN) {
           console.error('[CollabV3] Cannot sync settings - websocket not open, state:', indexWs.readyState);
           return;
         }
@@ -5214,7 +4124,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           return;
         }
       }
-      if (!indexWs || !indexConnected || indexWs.readyState !== WS_OPEN) {
+      if (!indexWs || !indexConnected || indexWs.readyState !== WebSocket.OPEN) {
         return;
       }
       if (!config.encryptionKey) {
@@ -5222,7 +4132,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         return;
       }
       try {
-        const deviceId = localDeviceId() ?? 'unknown';
+        const deviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId ?? 'unknown';
         const receiptKey = await sha256Hex(
           `${receipt.entityKind}|${receipt.entityId}|${receipt.scope}`,
         );
@@ -5258,13 +4168,13 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           return;
         }
       }
-      if (!indexWs || !indexConnected || indexWs.readyState !== WS_OPEN) return;
+      if (!indexWs || !indexConnected || indexWs.readyState !== WebSocket.OPEN) return;
       if (!config.encryptionKey) {
         console.error('[CollabV3] Cannot sync tracker personal state - no encryption key');
         return;
       }
       try {
-        const deviceId = localDeviceId() ?? 'unknown';
+        const deviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId ?? 'unknown';
         const stateKey = await deriveTrackerPersonalStateKey(change.scope, change.itemId, change.kind);
         const { encrypted, iv } = await encrypt(JSON.stringify(change), config.encryptionKey);
         const version = change.kind === 'favorite' ? change.favoriteUpdatedAt : change.lastOpenedAt;
@@ -5287,40 +4197,8 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       return () => trackerPersonalStateListeners.delete(callback);
     },
 
-    /**
-     * Push the ambient fleet snapshot to the user's Live Activity.
-     *
-     * Unlike `requestMobilePush` this does not reconnect on demand. The lane is
-     * ambient and coalesced, so a disconnected desktop simply misses an update
-     * and the phone's stale date says so -- forcing a reconnect for a card that
-     * nobody may be looking at would be the more expensive mistake, and the next
-     * transition after reconnect carries the full current state anyway.
-     */
-    async sendFleetActivity(activity: FleetActivitySnapshot, shownOnDesktop = false): Promise<void> {
-      if (!indexWs || !indexConnected || indexWs.readyState !== WS_OPEN) return;
-      const msg: ClientMessage = { type: 'fleetActivityUpdate', activity, shownOnDesktop };
-      try {
-        indexWs.send(JSON.stringify(msg));
-      } catch (error) {
-        console.warn('[CollabV3] Failed to send fleet activity update:', error);
-      }
-    },
-
     /** Request the sync server to send a push notification to mobile devices */
-    async requestMobilePush(
-      sessionId: string,
-      title: string,
-      body: string,
-      options?: MobilePushOptions
-    ): Promise<MobilePushResult> {
-      const failed = (rejection: PushRejectionCause): MobilePushResult => ({
-        accepted: false,
-        attemptedCount: 0,
-        deliveredCount: 0,
-        skipped: [],
-        rejection,
-      });
-
+    async requestMobilePush(sessionId: string, title: string, body: string): Promise<void> {
       // Ensure we're connected before sending the request
       if (!indexWs || !indexConnected) {
         console.log('[CollabV3] Not connected to index, attempting to reconnect before requesting mobile push...');
@@ -5328,62 +4206,37 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           await connectToIndex();
         } catch (err) {
           console.error('[CollabV3] Failed to connect to index before requesting mobile push:', err);
-          return failed('no_ack');
+          return;
         }
       }
 
       // Double-check connection and WebSocket state after await
       if (!indexWs || !indexConnected) {
         console.error('[CollabV3] Cannot request mobile push - failed to establish connection');
-        return failed('no_ack');
+        return;
       }
 
       // Check actual WebSocket state
-      if (indexWs.readyState !== WS_OPEN) {
+      if (indexWs.readyState !== WebSocket.OPEN) {
         console.error('[CollabV3] Cannot request mobile push - WebSocket not open, state:', indexWs.readyState);
-        return failed('no_ack');
+        return;
       }
 
-      const deviceId = localDeviceId();
-      const requestId = `push-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      const deviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId;
       const msg: ClientMessage = {
         type: 'requestMobilePush',
         sessionId: sessionId,
         title,
         body,
         requestingDeviceId: deviceId,
-        requestId,
-        force: options?.force === true,
-        reason: options?.reason,
       };
       // console.log('[CollabV3] Requesting mobile push for session:', sessionId, 'deviceId:', deviceId, 'readyState:', indexWs.readyState);
-
-      const ack = new Promise<MobilePushResult>((resolve) => {
-        // A server that never answers must not leave the caller hanging -- and
-        // a silent timeout is itself the signal that something is wrong, which
-        // is exactly what this path used to lack.
-        const timer = setTimeout(() => {
-          pendingMobilePushes.delete(requestId);
-          console.warn('[CollabV3] No mobile push acknowledgement for request:', requestId);
-          resolve(failed('no_ack'));
-        }, MOBILE_PUSH_ACK_TIMEOUT_MS);
-        pendingMobilePushes.set(requestId, { resolve, timer });
-      });
-
       try {
         indexWs.send(JSON.stringify(msg));
         // console.log('[CollabV3] Mobile push message sent successfully');
       } catch (error) {
         console.error('[CollabV3] Failed to send mobile push message:', error);
-        const pending = pendingMobilePushes.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          pendingMobilePushes.delete(requestId);
-        }
-        return failed('no_ack');
       }
-
-      return ack;
     },
 
     syncFileToIndex(file: FileIndexData): void {
@@ -5429,7 +4282,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       // hasn't resolved yet. Don't tear it down -- post-wake the broker fires
       // several network-available events in a ~20s burst and we'd otherwise
       // churn through half-finished sockets.
-      if (indexWs && !indexConnected && indexWs.readyState === WS_CONNECTING) {
+      if (indexWs && !indexConnected && indexWs.readyState === WebSocket.CONNECTING) {
         console.log('[CollabV3] reconnectIndex() - handshake already in flight, skipping');
         return;
       }
@@ -5464,13 +4317,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         indexWs = null;
       }
       indexConnected = false;
-      indexPublicationGate.reset();
-      indexConnectionGeneration++;
-      indexProtocolCapability = 'unknown';
-      cancelPendingIndexPage('Index reconnect requested while a page request was in flight');
-      maxHintedRevision = undefined;
-      hintDrainScheduled = false;
-      cancelPendingPersonalStatePage('Index reconnect requested while a personal state page was in flight');
       clearIndexReady();
       stopPingInterval();
       stopDeviceAnnounceInterval();
@@ -5492,34 +4338,6 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
      */
     isIndexReady(): boolean {
       return indexReady;
-    },
-
-    /**
-     * The index socket's identity, as a counter bumped on every disconnect (see
-     * `indexConnectionGeneration`). A caller holding a claim the server bound to
-     * one socket -- a create-session request -- compares this before answering:
-     * unlike `isIndexReady()`, a full down-and-up cycle cannot hide inside it.
-     */
-    getConnectionGeneration(): number {
-      return indexConnectionGeneration;
-    },
-
-    /**
-     * Called every time the index socket becomes usable, with the generation
-     * then in force. Returns an unsubscribe.
-     */
-    onConnectionGenerationChange(callback: (generation: number) => void): () => void {
-      connectionGenerationListeners.add(callback);
-      return () => connectionGenerationListeners.delete(callback);
-    },
-
-    /** Whether this device may publish personal-sync ciphertext. See GitHub #1117. */
-    getPersonalSyncWriteGate(): PersonalSyncWriteGateSnapshot {
-      return personalSyncWriteGate.snapshot();
-    },
-
-    onPersonalSyncWriteGateChange(callback: (snapshot: PersonalSyncWriteGateSnapshot) => void): () => void {
-      return personalSyncWriteGate.onChange(callback);
     },
 
     /**

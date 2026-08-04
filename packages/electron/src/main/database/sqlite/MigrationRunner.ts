@@ -188,61 +188,19 @@ export function getMigrations(schemaDir: string): Migration[] {
     },
     {
       version: 30,
-      name: 'tracker_type_defs_synced_model',
-      sqlFile: path.join(schemaDir, '0030_tracker_type_defs_synced_model.sql'),
+      name: 'queued_prompt_priority_control',
+      sqlFile: path.join(schemaDir, '0030_queued_prompt_priority_control.sql'),
     },
     {
       version: 31,
-      name: 'session_commits',
-      sqlFile: path.join(schemaDir, '0031_session_commits.sql'),
+      name: 'queued_prompt_dispatch_fencing',
+      sqlFile: path.join(schemaDir, '0031_queued_prompt_dispatch_fencing.sql'),
     },
     {
       version: 32,
-      name: 'feedback_request_cache',
-      sqlFile: path.join(schemaDir, '0032_feedback_request_cache.sql'),
+      name: 'queued_prompt_truth_provenance',
+      sqlFile: path.join(schemaDir, '0032_queued_prompt_truth_provenance.sql'),
     },
-    {
-      version: 33,
-      name: 'tracker_local_key',
-      sqlFile: path.join(schemaDir, '0033_tracker_local_key.sql'),
-    },
-    {
-      version: 34,
-      name: 'feedback_request_index',
-      sqlFile: path.join(schemaDir, '0034_feedback_request_index.sql'),
-    },
-    {
-      version: 35,
-      name: 'github_issues',
-      sqlFile: path.join(schemaDir, '0035_github_issues.sql'),
-    },
-    {
-      version: 36,
-      name: 'history_file_timestamp_index',
-      sqlFile: path.join(schemaDir, '0036_history_file_timestamp_index.sql'),
-    },
-    {
-      version: 37,
-      name: 'drop_unused_message_index',
-      sqlFile: path.join(schemaDir, '0037_drop_unused_message_index.sql'),
-    },
-    {
-      version: 38,
-      name: 'repair_double_quoted_review_status',
-      sqlFile: path.join(schemaDir, '0038_repair_double_quoted_review_status.sql'),
-    },
-    {
-      version: 39,
-      name: 'drop_unique_issue_number_index',
-      sqlFile: path.join(schemaDir, '0039_drop_unique_issue_number_index.sql'),
-    },
-    {
-      version: 40,
-      name: 'worktree_source_folder',
-      sqlFile: path.join(schemaDir, '0040_worktree_source_folder.sql'),
-    },
-    { version: 41, name: 'document_feedback_index', sqlFile: path.join(schemaDir, '0041_document_feedback_index.sql') },
-    { version: 42, name: 'tracker_creation_receipts', sqlFile: path.join(schemaDir, '0042_tracker_creation_receipts.sql') },
   ];
 }
 

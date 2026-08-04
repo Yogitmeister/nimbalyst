@@ -590,6 +590,23 @@ export interface RemoteTurnOptions {
 export interface SyncedQueuedPrompt {
   options?: RemoteTurnOptions;
   id: string;           // Unique ID for this queued item
+  /** Stable producer-side identity; defaults to id for legacy clients. */
+  clientSubmissionId?: string;
+  sourceSessionId?: string;
+  sourceRoomId?: string;
+  submissionSequence?: number;
+  producer?: string;
+  payloadUtf8Bytes?: number;
+  payloadUnicodeScalars?: number;
+  payloadSha256?: string;
+  claimTrigger?: string;
+  claimTriggeredAt?: number;
+  turnId?: string;
+  providerInputMessageId?: string;
+  providerOutputMessageId?: string;
+  streamEventSequence?: number;
+  terminalStatus?: 'streaming' | 'completed' | 'failed';
+  terminalAt?: number;
   prompt: string;       // The user's message
   timestamp: number;    // When queued
   // Note: documentContext is NOT synced - it's device-local
