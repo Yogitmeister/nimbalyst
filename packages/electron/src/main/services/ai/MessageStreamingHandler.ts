@@ -46,9 +46,15 @@ import { isBedrockToolSearchError } from '@nimbalyst/runtime/ai/server/utils/err
 import { resolveEffortLevel, resolveThinkingMode } from '@nimbalyst/runtime/ai/server/effortLevels';
 import type { RawDocumentContext, DocumentContextService } from '@nimbalyst/runtime';
 import { AISessionsRepository, resolveClaudeCodeParentContextWindow } from '@nimbalyst/runtime';
+import {
+  buildMcpSessionStatusSnapshot,
+  type McpSessionStatusInput,
+} from '@nimbalyst/runtime/types/MCPServerConfig';
 import { toolRegistry } from './tools';
+import type { DriveReason } from './QueueDriveService';
 import { resolveExtensionAgentRef } from './providerResolution';
 import { createQueuedStreamTruthBinder } from './queuedPromptTruth';
+import { resolveClaudeCodeCatalogControlContext } from './ClaudeCodeTurnLifecycle';
 import { getAgentProviderRegistry } from '../../extensions/AgentProviderRegistry';
 
 /**
@@ -75,6 +81,7 @@ function resolveExtensionModelDisplayName(
 import { extractFilePath } from './tools/extractFilePath';
 import { SoundNotificationService } from '../SoundNotificationService';
 import { notificationService } from '../NotificationService';
+import { composeNotificationTitle } from '../../../shared/notificationTitle';
 import { TrayManager } from '../../tray/TrayManager';
 import { logger } from '../../utils/logger';
 import { windowStates, findWindowByWorkspace } from '../../window/WindowManager';
@@ -118,6 +125,7 @@ import {
 } from './aiServiceUtils';
 import { disableParentNotificationsAfterDirectTakeover } from './childSessionTakeover';
 import { installScopedProviderListener } from './providerListenerRegistry';
+import { shouldSettleUnterminatedTurn } from './sessionSettlePolicy';
 import type Store from 'electron-store';
 import type { AIService } from './AIService';
 import type { HooklessAgentFileWatcher } from './HooklessAgentFileWatcher';
@@ -499,7 +507,7 @@ interface AIServiceInternal {
     targetWindow: Electron.BrowserWindow | null,
     source: string,
   ): Promise<boolean>;
-  requestQueueDrive(sessionId: string, workspacePath: string, reason: string): void;
+  requestQueueDrive(sessionId: string, workspacePath: string, reason: DriveReason): void;
   runAutoContextCommand(
     session: SessionData,
     workspacePath: string,
@@ -677,7 +685,8 @@ export class MessageStreamingHandler {
       }
 
       // Mark prompt ID as processing
-      // Note: session lock is already set in claimQueuedPrompt handler, no need to check here
+      // Note: session lock is already set via the queue dispatcher's claim/lease
+      // path (queueProcessingLeases), no need to check here
       this.svc.processingQueuedPromptIds.add(queuedPromptId);
       logger.main.info(`[AIService] Processing queued prompt: ${queuedPromptId}, session: ${sessionId}, total prompts in progress: ${this.svc.processingQueuedPromptIds.size}`);
     }
@@ -923,6 +932,7 @@ export class MessageStreamingHandler {
       }
 
       const reinitEffortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
+      const reinitCatalogControlValues = (session.metadata as any)?.catalogControlValues;
       const reinitConfig: any = {
         apiKey,
         maxTokens: (session.providerConfig as any)?.maxTokens,
@@ -930,6 +940,11 @@ export class MessageStreamingHandler {
         // Effort level: explicit session value, else the app-wide default the
         // selector displays (Opus 4.6 adaptive reasoning).
         ...(reinitEffortLevel && { effortLevel: reinitEffortLevel }),
+        ...(reinitCatalogControlValues
+          && typeof reinitCatalogControlValues === 'object'
+          && !Array.isArray(reinitCatalogControlValues)
+          ? { catalogControlValues: reinitCatalogControlValues }
+          : {}),
         ...(isProviderClaudeCode ? {
           thinkingMode: resolveThinkingMode((session.metadata as any)?.thinkingMode, getDefaultThinkingMode()),
         } : {}),
@@ -1150,6 +1165,36 @@ export class MessageStreamingHandler {
     // Replace this handler's previous 'message:logged' subscription only,
     // so other modules subscribing to the same provider event stay wired.
     this.installListener(provider, 'message:logged', onMessageLogged);
+
+    // Per-session MCP health transitions (NIM-2272 / GH #1089). The provider's
+    // 30s poll runs *between* turns as well as during them — mcpQuery outlives
+    // leadQuery specifically so it can — so this listener has to survive turn
+    // boundaries. installScopedProviderListener replaces only its own prior
+    // subscription, so re-running handle() on the next turn rewires without a
+    // gap. Payload is built by the same function the pull handler uses, so a
+    // pushed snapshot and a pulled one are byte-identical.
+    const onMcpServerStatusChanged = (data: {
+      sessionId?: string;
+      servers?: unknown[];
+      lastCheckedAt?: number | null;
+      configuredNames?: string[] | null;
+      withheldNames?: string[] | null;
+    }) => {
+      const mcpSessionId = data?.sessionId || session.id;
+      safeSend(event, 'ai:mcp-status:changed', {
+        ...buildMcpSessionStatusSnapshot({
+          sessionId: mcpSessionId,
+          supported: true,
+          active: true,
+          statuses: (data?.servers || []) as McpSessionStatusInput[],
+          configuredNames: data?.configuredNames ?? null,
+          withheldNames: data?.withheldNames ?? null,
+          lastCheckedAt: data?.lastCheckedAt ?? null,
+        }),
+        workspacePath: effectiveWorkspacePath,
+      });
+    };
+    this.installListener(provider, 'mcpServerStatus:changed', onMcpServerStatusChanged);
 
     // Forward any provider-side title updates to all renderers so the session
     // list updates in real time.
@@ -1579,6 +1624,7 @@ export class MessageStreamingHandler {
       if (isClaudeCode) {
         // Refresh provider config every turn so auth/key changes in settings apply immediately.
         const refreshedConfig = await this.svc.buildClaudeCodeRuntimeConfig(session, effectiveWorkspacePath);
+        refreshedConfig.catalogControlContext = resolveClaudeCodeCatalogControlContext(provider, session);
         await provider.initialize(refreshedConfig);
 
         //   messageLength: message.length,
@@ -1697,6 +1743,11 @@ export class MessageStreamingHandler {
         // Queued orchestration paths provide their own provenance. A direct
         // ai:sendMessage call is a human composer submission. Older queued
         // rows intentionally remain unclassified rather than being guessed.
+        promptProvenance: documentContext?.promptProvenance ?? (
+          queuedPromptId
+            ? undefined
+            : { actor: 'human', origin: 'composer' }
+        ),
       };
 
       // Update MCP document state for Claude Code provider so it knows which tools to show
@@ -2989,10 +3040,11 @@ export class MessageStreamingHandler {
               // });
 
               await notificationService.showNotification({
-                title: `${sessionLabel} -- Response Ready`,
+                title: composeNotificationTitle(sessionLabel, 'Response Ready'),
                 body: notificationBody,
                 sessionId: session.id,
                 workspacePath: workspacePath,
+                sourceLabel: sessionLabel,
                 provider: session.provider
               });
 
@@ -3092,6 +3144,31 @@ export class MessageStreamingHandler {
             }
 
             break;
+        }
+      }
+
+      // A built-in provider can yield an in-band 'error' chunk and then return
+      // normally instead of throwing (the Codex app-server transport catches
+      // RPC failures this way). That reaches neither the 'complete' branch nor
+      // the outer catch, so nothing ended the session and it stayed 'running'
+      // forever -- Cancel then no-ops, because the turn is already gone, while
+      // the renderer's processing reconcile keeps re-asserting the spinner.
+      if (session?.id && shouldSettleUnterminatedTurn({
+        sawComplete: sawCompleteChunk,
+        providerError,
+        alreadySettled: settledOnErrorChunk,
+        queuedChainActive: this.svc.hasActiveQueueLease(session.id),
+      })) {
+        logger.main.warn(
+          `[AIService] Provider stream for ${session.id} ended on an error chunk without completing -- settling session`
+        );
+        try {
+          await stateManager.updateActivity({ sessionId: session.id, status: 'error' });
+          await stateManager.endSession(session.id);
+          await this.svc.hooklessWatcher.stopForSession(session.id);
+          codexEditWindowRegistry.clearSession(session.id);
+        } catch (settleErr) {
+          logger.main.error('[AIService] Failed to settle unterminated provider error:', settleErr);
         }
       }
 

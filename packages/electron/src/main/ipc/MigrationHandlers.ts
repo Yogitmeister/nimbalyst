@@ -27,6 +27,7 @@ import {
 } from '../database/initialize';
 import { legacyPgliteDatabase } from '../database/PGLiteDatabaseWorker';
 import { resolveBackend, readBackendState, commitRollbackToPglite } from '../database/sqlite/BackendSelector';
+import { classifyDatabaseError } from '../database/DatabaseErrorTelemetry';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
 import type { BackupPhysicalGrowthAssessment } from '../services/database/DatabaseBackupService';
 import * as fs from 'fs';
@@ -124,7 +125,7 @@ export function registerMigrationHandlers(): void {
     } catch (err) {
       logger.main.error('[Migration] failed', err);
       AnalyticsService.getInstance().sendEvent('migration_failed', {
-        message: (err as Error).message.slice(0, 500),
+        ...classifyDatabaseError(err),
       });
       return { success: false, error: (err as Error).message };
     } finally {
@@ -163,7 +164,7 @@ export function registerMigrationHandlers(): void {
       return { success: true, result };
     } catch (err) {
       AnalyticsService.getInstance().sendEvent('migration_dry_run_failed', {
-        message: (err as Error).message.slice(0, 500),
+        ...classifyDatabaseError(err),
       });
       return { success: false, error: (err as Error).message };
     } finally {
@@ -194,7 +195,7 @@ export function registerMigrationHandlers(): void {
     } catch (err) {
       logger.main.error('[Adopt] failed', err);
       AnalyticsService.getInstance().sendEvent('migration_adopt_failed', {
-        message: (err as Error).message.slice(0, 500),
+        ...classifyDatabaseError(err),
       });
       return { success: false, error: (err as Error).message };
     } finally {

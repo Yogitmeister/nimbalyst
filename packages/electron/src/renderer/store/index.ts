@@ -105,6 +105,9 @@ export {
   sessionListChatAtom,
   showArchivedSessionsAtom,
   refreshSessionListAtom,
+  // Pin toggles published across surfaces (Agent mode header -> session sidebar)
+  sessionPinnedUpdateAtom,
+  publishSessionPinnedUpdateAtom,
   initSessionList,
   addSessionFullAtom,
   updateSessionFullAtom,
@@ -128,6 +131,7 @@ export {
   sessionDocumentContextAtom,
   sessionEffortLevelRawAtom,
   sessionThinkingModeRawAtom,
+  sessionCatalogControlValuesRawAtom,
   sessionLoadingAtom,
   sessionModeAtom,
   sessionModelAtom,

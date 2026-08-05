@@ -5,6 +5,10 @@ import {
   SWEEP_UNANSWERED_ERROR,
 } from '../PGLiteQueuedPromptsStore';
 
+/** Minimal local mirror of the store's unexported `PGliteLike` -- just enough
+ * to type a mocked `query` for the boot re-drive tests below. */
+type DbStub = { query: (sql: string, params?: any[]) => Promise<{ rows: any[] }> };
+
 const databases: PGlite[] = [];
 
 async function createDatabase(): Promise<PGlite> {
@@ -307,5 +311,43 @@ describe('PGLiteQueuedPromptsStore dispatch fencing', () => {
     await expect(store.deletePending('claimed', 'session-a')).resolves.toBe(false);
     await expect(store.replacePending({ id: 'claimed', sessionId: 'session-a', prompt: 'lost' })).resolves.toBeNull();
     await expect(store.get('claimed')).resolves.toMatchObject({ prompt: 'claimed', status: 'executing' });
+  });
+});
+
+describe('PGLiteQueuedPromptsStore boot re-drive helpers', () => {
+  it('listSessionIdsWithPending returns each session once, pending rows only', async () => {
+    const query = vi.fn(async (sql: string, params?: any[]) => {
+      expect(sql).toContain('DISTINCT session_id');
+      expect(sql).toContain("status = 'pending'");
+      expect(params).toBeUndefined();
+      return { rows: [{ session_id: 'session-a' }, { session_id: 'session-b' }] };
+    });
+    const db: DbStub = { query: query as any };
+
+    const store = createPGLiteQueuedPromptsStore(db);
+
+    expect(await store.listSessionIdsWithPending()).toEqual(['session-a', 'session-b']);
+  });
+
+  it('failAllPendingForSession fails only that session\'s pending rows', async () => {
+    const query = vi.fn(async (sql: string, params?: any[]) => {
+      expect(sql).toContain("SET status = 'failed'");
+      // Must not touch an executing row: that prompt is already in the
+      // conversation and failing it would contradict the boot sweep.
+      expect(sql).toContain("status = 'pending'");
+      expect(sql).toContain('session_id = $1');
+      expect(params).toEqual(['session-gone', 'Project folder is no longer available at /gone']);
+      return { rows: [{ id: 'p1' }, { id: 'p2' }] };
+    });
+    const db: DbStub = { query: query as any };
+
+    const store = createPGLiteQueuedPromptsStore(db);
+
+    expect(
+      await store.failAllPendingForSession(
+        'session-gone',
+        'Project folder is no longer available at /gone',
+      ),
+    ).toBe(2);
   });
 });

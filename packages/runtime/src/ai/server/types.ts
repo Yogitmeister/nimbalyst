@@ -89,6 +89,25 @@ export interface DocumentContext {
 
   /** Identifies the origin of this message when it comes from an automated source (e.g. 'wakeup_resume'). */
   promptOrigin?: string;
+
+  /** Durable authorship provenance for prompt search and audit surfaces. */
+  promptProvenance?: PromptProvenance;
+}
+
+export type PromptActor = 'human' | 'agent' | 'system';
+
+export type PromptProvenanceOrigin =
+  | 'composer'
+  | 'session-orchestration'
+  | 'child-session-update'
+  | 'mobile'
+  | 'automation';
+
+export interface PromptProvenance {
+  actor: PromptActor;
+  origin: PromptProvenanceOrigin;
+  originSessionId?: string;
+  queuedPromptId?: string;
 }
 
 export interface ChatAttachment {
@@ -443,6 +462,10 @@ export interface ProviderConfig {
   allowedTools?: string[];  // List of allowed tool names, ['*'] for all tools
   effortLevel?: EffortLevel;  // Effort level for Opus 4.6 adaptive reasoning (low/medium/high/max)
   thinkingMode?: ThinkingMode;  // Extended thinking mode for Claude Agent (enabled/disabled)
+  /** Catalog-owned, provider-neutral persisted controls validated at route resolution. */
+  catalogControlValues?: Readonly<Record<string, unknown>>;
+  /** Turn boundary used to enforce catalog control applicability. */
+  catalogControlContext?: import('./providers/claudeCode/providerCatalog').ProviderCatalogControlContext;
   customBackend?: string;  // Per-session Claude Agent backend selected by a synthetic model profile (DeepSeek)
   /**
    * Claude Code only: exact per-session backend profile. The profile is

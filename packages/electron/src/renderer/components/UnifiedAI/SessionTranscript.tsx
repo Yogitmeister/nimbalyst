@@ -18,6 +18,7 @@ import React, { useCallback, useRef, useImperativeHandle, forwardRef, useEffect,
 import { useAtom, useSetAtom, useAtomValue } from 'jotai';
 import { store, registerInteractiveWidgetHost, unregisterInteractiveWidgetHost } from '@nimbalyst/runtime/store';
 import type { SessionData, ChatAttachment, TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
+import type { ProviderCatalogControlValue } from '@nimbalyst/runtime/ai/server/providers/claudeCode/providerCatalog';
 import { AgentTranscriptPanel } from '@nimbalyst/runtime/ui/AgentTranscript/components/AgentTranscriptPanel';
 import { ClaudeCliTerminalStrip } from './ClaudeCliTerminalStrip';
 import { ClaudeCliNotInstalledNotice } from './ClaudeCliNotInstalledNotice';
@@ -44,6 +45,7 @@ import { recordClaudeActivity } from '../../store/listeners/claudeUsageListeners
 import { recordCodexActivity } from '../../store/listeners/codexUsageListeners';
 import { PendingReviewBanner } from '../AIChat/PendingReviewBanner';
 import { WakeupBanner } from '../AIChat/WakeupBanner';
+import { McpLockdownBanner } from '../AIChat/McpLockdownBanner';
 import type { AIMode } from './ModeTag';
 // Note: ExitPlanMode, AskUserQuestion, and ToolPermission use inline widgets via InteractiveWidgetHost (in runtime package)
 import { SlashCommandSuggestions } from './SlashCommandSuggestions';
@@ -56,6 +58,7 @@ import { serializeEditorContextItemsForIpc } from './editorContextSerialization'
 import { isClaudeCliTerminalSession } from './claudeCliInputRouting';
 import { expandSessionMentions } from './sessionMentions';
 import { diffTreeGroupByDirectoryAtom, setDiffTreeGroupByDirectoryAtom } from '../../store/atoms/projectState';
+import { openSettingsCommandAtom } from '../../store/atoms/settingsNavigation';
 import {
   sessionDraftInputAtom,
   sessionDraftHydratedAtom,
@@ -72,6 +75,7 @@ import {
   sessionDocumentContextAtom,
   sessionEffortLevelRawAtom,
   sessionThinkingModeRawAtom,
+  sessionCatalogControlValuesRawAtom,
   sessionLoadingAtom,
   sessionModeAtom,
   sessionModelAtom,
@@ -117,7 +121,7 @@ import {
 import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom } from '../../store/atoms/agentMode';
 import { usePostHog } from 'posthog-js/react';
 import { setAgentModeSettingsAtom, showPromptAdditionsAtom, hasExternalEditorAtom, externalEditorNameAtom, openInExternalEditorAtom, defaultAgentModelAtom, defaultEffortLevelAtom, defaultThinkingModeAtom, chatShowToolCallsAtom, developerModeAtom } from '../../store/atoms/appSettings';
-import { resolveCatalogReasoningValues, supportsEffortLevel, supportsThinkingToggle, parseEffortLevel, resolveThinkingMode, type EffortLevel, type ThinkingMode } from '../../utils/modelUtils';
+import { resolveCatalogControlValues, resolveCatalogReasoningValues, supportsEffortLevel, supportsThinkingToggle, parseEffortLevel, resolveThinkingMode, type EffortLevel, type ThinkingMode } from '../../utils/modelUtils';
 import { isDeepSeekClaudeAgentModel, normalizeDeepSeekEffort, normalizeDeepSeekThinkingMode } from '@nimbalyst/runtime/ai/server/deepSeekClaudeAgent';
 import { buildPlanImplementationPrompt, resolvePlanFilePath } from '../../utils/pathUtils';
 import { resolveTranscriptClickPath } from '../../utils/resolveTranscriptClickPath';
@@ -491,6 +495,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const sessionDocumentContext = useAtomValue(sessionDocumentContextAtom(sessionId));
   const rawEffortLevel = useAtomValue(sessionEffortLevelRawAtom(sessionId));
   const rawThinkingMode = useAtomValue(sessionThinkingModeRawAtom(sessionId));
+  const rawCatalogControlValues = useAtomValue(sessionCatalogControlValuesRawAtom(sessionId));
   const loadSessionData = useSetAtom(loadSessionDataAtom);
   const reloadSessionData = useSetAtom(reloadSessionDataAtom);
   const updateSessionStore = useSetAtom(updateSessionStoreAtom);
@@ -556,6 +561,12 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     metadataTeammates,
     currentTodos,
   ]);
+
+  const catalogControlValues = useMemo(() => {
+    return rawCatalogControlValues && typeof rawCatalogControlValues === 'object' && !Array.isArray(rawCatalogControlValues)
+      ? rawCatalogControlValues as Readonly<Record<string, unknown>>
+      : {};
+  }, [rawCatalogControlValues]);
 
   // Effort level: read from session metadata, fall back to global default
   const showEffortLevel = useMemo(() => supportsEffortLevel(currentModel), [currentModel]);
@@ -1606,12 +1617,12 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       // Claude Code, hard abort for other providers via the BaseAIProvider
       // default); (2) explicitly trigger queue processing. The natural
       // completion-handler path also triggers it, and the server's
-      // sessionsProcessingQueue guard de-dupes, so this is safe to call.
+      // queueProcessingLeases guard (hasActiveQueueLease) de-dupes, so this is safe to call.
       // We don't rely on the isLoading auto-effect because session:completed
       // may race or, in some edge cases, may not fire cleanly after abort.
       await window.electronAPI.invoke('ai:interruptCurrentTurn', sessionId);
       if (workspacePath) {
-        await window.electronAPI.invoke('ai:triggerQueueProcessing', sessionId, workspacePath);
+        await window.electronAPI.invoke('ai:triggerQueueProcessing', sessionId, workspacePath, 'send-now');
       }
     } catch (error) {
       console.error('[SessionTranscript] Failed to interrupt for send-now:', error);
@@ -1649,15 +1660,28 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
 
   const handleModelChange = useCallback(async (modelId: string, pickerModel?: PickerModel) => {
     if (isQueueMutationBlockedByModelReconciliation(modelReconciliationBlocked)) return false;
+    const nextCatalogControlValues = pickerModel?.catalog
+      ? resolveCatalogControlValues(pickerModel.catalog.controls, {
+          catalogControlValues,
+          effortLevel: rawEffortLevel,
+          thinkingMode: rawThinkingMode,
+        }, { discardUnknownPersistenceKeys: true }).values
+      : {};
     const mutation = {
       modelId,
       previousModel: currentModel,
       previousControls: {
         effortLevel: rawEffortLevel ?? null,
         thinkingMode: rawThinkingMode ?? null,
+        catalogControlValues,
       },
       catalogControls: pickerModel?.catalog
-        ? resolveCatalogReasoningValues(pickerModel.catalog.controls, { effortLevel, thinkingMode })
+        ? {
+            ...resolveCatalogReasoningValues(pickerModel.catalog.controls, {
+              catalogControlValues: nextCatalogControlValues,
+            }),
+            catalogControlValues: nextCatalogControlValues,
+          }
         : null,
     };
 
@@ -1674,7 +1698,48 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       }
       return false;
     }
-  }, [modelReconciliationBlocked, currentModel, sessionId, rawEffortLevel, rawThinkingMode, effortLevel, thinkingMode, createModelChangeHooks, requireModelReconciliation]);
+  }, [modelReconciliationBlocked, currentModel, sessionId, rawEffortLevel, rawThinkingMode, effortLevel, thinkingMode, catalogControlValues, createModelChangeHooks, requireModelReconciliation]);
+
+  const handleCatalogControlValueChange = useCallback(async (
+    persistenceKey: string,
+    value: ProviderCatalogControlValue,
+  ) => {
+    if (isQueueMutationBlockedByModelReconciliation(modelReconciliationBlocked)) return;
+    const nextCatalogControlValues = {
+      ...catalogControlValues,
+      [persistenceKey]: value,
+    };
+    const compatibilityMetadata = {
+      ...(persistenceKey === 'effort-level' ? { effortLevel: value } : {}),
+      ...(persistenceKey === 'thinking-mode' ? { thinkingMode: value } : {}),
+    };
+    try {
+      const result = await window.electronAPI.invoke('sessions:update-metadata', sessionId, {
+        metadata: {
+          catalogControlValues: nextCatalogControlValues,
+          ...compatibilityMetadata,
+        },
+      }) as { success?: boolean; error?: string } | undefined;
+      if (result?.success === false) {
+        throw new Error(result.error || 'Failed to update catalog control metadata.');
+      }
+      const currentSessionData = readSessionData(sessionId);
+      if (currentSessionData) {
+        updateSessionStore({
+          sessionId,
+          updates: {
+            metadata: {
+              ...(currentSessionData.metadata as Record<string, unknown> || {}),
+              catalogControlValues: nextCatalogControlValues,
+              ...compatibilityMetadata,
+            },
+          },
+        });
+      }
+    } catch (error) {
+      console.error('[SessionTranscript] Failed to update catalog control metadata:', error);
+    }
+  }, [catalogControlValues, modelReconciliationBlocked, sessionId, updateSessionStore]);
 
   const handleEffortLevelChange = useCallback(async (level: EffortLevel) => {
     if (isQueueMutationBlockedByModelReconciliation(modelReconciliationBlocked)) return;
@@ -2146,6 +2211,42 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         }
       },
 
+      getAttachmentStagingGitignoreStatus: async () => {
+        return window.electronAPI.invoke(
+          'attachment:workspace-staging-status',
+          workspacePath,
+        );
+      },
+      retryAttachmentStaging: async (prompt, blockedAttachments, addGitignore) => {
+        try {
+          const result = await window.electronAPI.invoke('attachment:retry-in-workspace', {
+            workspacePath,
+            sessionId,
+            attachments: blockedAttachments,
+            addGitignore,
+          }) as { success: boolean; attachments?: ChatAttachment[]; error?: string };
+          if (!result.success || !result.attachments) {
+            return { success: false, error: result.error ?? 'Failed to re-stage attachments' };
+          }
+
+          setDraftInput(prompt);
+          setDraftAttachments(result.attachments);
+          await Promise.resolve();
+          await handleSend();
+          return { success: true };
+        } catch (error) {
+          return { success: false, error: error instanceof Error ? error.message : String(error) };
+        }
+      },
+      openAttachmentSettings: () => {
+        store.set(openSettingsCommandAtom, {
+          category: 'agent-features',
+          scope: 'application',
+          anchor: 'attachment-staging-settings',
+          timestamp: Date.now(),
+        });
+      },
+
       // Common operations
       openFile: async (filePath: string) => {
         if (onFileClick) {
@@ -2186,6 +2287,9 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       gitFileDiff: (...args) => liveHostRef.current!.gitFileDiff!(...args),
       setDiffPeekSize: (...args) => liveHostRef.current!.setDiffPeekSize!(...args),
       superLoopBlockedFeedback: (...args) => liveHostRef.current!.superLoopBlockedFeedback(...args),
+      getAttachmentStagingGitignoreStatus: (...args) => liveHostRef.current!.getAttachmentStagingGitignoreStatus!(...args),
+      retryAttachmentStaging: (...args) => liveHostRef.current!.retryAttachmentStaging!(...args),
+      openAttachmentSettings: (...args) => liveHostRef.current!.openAttachmentSettings!(...args),
       openFile: (...args) => liveHostRef.current!.openFile(...args),
       trackEvent: (...args) => liveHostRef.current!.trackEvent(...args),
     };
@@ -2676,6 +2780,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       {/* Wakeup + pending review banners - only in chat mode, hidden when collapsed */}
       {mode === 'chat' && !collapseTranscript && (
         <>
+          <McpLockdownBanner provider={typeof provider === 'string' ? provider : undefined} />
           <WakeupBanner sessionId={sessionId} />
           <PendingReviewBanner workspacePath={workspacePath} sessionId={sessionId} />
         </>
@@ -2773,6 +2878,12 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         showEffortLevel={isClaudeCliTerminalSession(provider) && cliSessionCommitted ? false : showEffortLevel}
         thinkingMode={thinkingMode}
         onThinkingModeChange={handleThinkingModeChange}
+        catalogControlValues={catalogControlValues}
+        catalogLegacyControlValues={{
+          ...(rawEffortLevel != null ? { 'effort-level': rawEffortLevel } : {}),
+          ...(rawThinkingMode != null ? { 'thinking-mode': rawThinkingMode } : {}),
+        }}
+        onCatalogControlValueChange={handleCatalogControlValueChange}
         showThinkingToggle={isClaudeCliTerminalSession(provider) && cliSessionCommitted ? false : showThinkingToggle}
         tokenUsage={tokenUsage}
         provider={provider}

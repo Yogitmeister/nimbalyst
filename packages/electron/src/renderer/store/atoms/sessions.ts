@@ -971,6 +971,13 @@ export const sessionThinkingModeRawAtom = atomFamily((sessionId: string) =>
   })
 );
 
+export const sessionCatalogControlValuesRawAtom = atomFamily((sessionId: string) =>
+  atom((get) => {
+    const metadata = get(sessionStoreAtom(sessionId))?.metadata as Record<string, unknown> | undefined;
+    return metadata?.catalogControlValues ?? null;
+  })
+);
+
 // ============================================================
 // Hierarchical session support (workstreams)
 // These atoms enable parent-child session relationships for grouping
@@ -2684,4 +2691,27 @@ export const workstreamTitleAtom = atomFamily((workstreamId: string) =>
     const meta = registry.get(workstreamId);
     return meta?.title || 'Untitled';
   })
+);
+
+/**
+ * Latest session pin toggle, published by whichever surface performed it.
+ *
+ * The session sidebar keeps its rendered list in local React state, so a pin
+ * toggled from another surface (the Agent mode header) has no way to reach it.
+ * Request-atom shape: each publish bumps `version`; consumers use the
+ * skip-initial-mount idiom and patch their own copy.
+ */
+export interface SessionPinnedUpdate {
+  version: number;
+  payload: { sessionId: string; isPinned: boolean };
+}
+
+export const sessionPinnedUpdateAtom = atom<SessionPinnedUpdate | null>(null);
+
+export const publishSessionPinnedUpdateAtom = atom(
+  null,
+  (get, set, payload: { sessionId: string; isPinned: boolean }) => {
+    const previous = get(sessionPinnedUpdateAtom);
+    set(sessionPinnedUpdateAtom, { version: (previous?.version ?? 0) + 1, payload });
+  }
 );
