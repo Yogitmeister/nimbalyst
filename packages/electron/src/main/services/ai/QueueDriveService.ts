@@ -77,8 +77,12 @@ export interface QueueDriveDeps {
  * Safety net for a wake condition we failed to model. Per-session and armed
  * only while that session has a deferred row, so this is explicitly not a
  * global queue poller.
+ *
+ * Delays are short initially to handle transient conditions (e.g., model
+ * reconciliation metadata updates that haven't persisted yet) and extend
+ * for longer-term retry scenarios.
  */
-export const QUEUE_DRIVE_BACKOFF_MS = [2_000, 5_000, 15_000, 60_000] as const;
+export const QUEUE_DRIVE_BACKOFF_MS = [10, 50, 200, 1_000] as const;
 
 interface SessionDriveState {
   workspacePath: string;
