@@ -490,6 +490,7 @@ describe('MetaAgentService project-targeted session routing (NIM-408)', () => {
     expect(triggerQueuedPromptProcessingForSession).toHaveBeenCalledWith(
       'target-child',
       '/project-b_worktrees/safe-route',
+      'meta-agent',
     );
 
     await (service as any).respondToPrompt('caller', '/project-a', {
@@ -552,6 +553,7 @@ describe('MetaAgentService project-targeted session routing (NIM-408)', () => {
     expect(triggerQueuedPromptProcessingForSession).toHaveBeenCalledWith(
       'target-child',
       '/project-b_worktrees/safe-route',
+      'meta-agent',
     );
 
     await expect((service as any).sendPromptNowToSession(
