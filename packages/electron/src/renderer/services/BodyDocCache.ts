@@ -68,6 +68,7 @@ import {
   setCollabConnectionDiagnosticContext,
 } from '@nimbalyst/runtime/sync/collabConnectionDiagnostics';
 import { CollabLexicalProvider } from '@nimbalyst/runtime/collab-lexical';
+import { createProxiedWebSocket } from '../utils/proxiedWebSocket';
 import type {
   AwarenessState,
   DocumentSyncConfig,
@@ -378,6 +379,7 @@ export class BodyDocCache {
     // cache is the sole owner of the provider's lifecycle signals.
     const cacheConfig: DocumentSyncConfig = {
       ...config,
+      createWebSocket: config.createWebSocket ?? createProxiedWebSocket,
       onStatusChange: (status) => {
         entry.lastStatus = status;
         for (const l of entry.listeners) {
