@@ -2,6 +2,7 @@
  * PGLite implementation of SessionStore interface from runtime package
  */
 
+import { isDeepStrictEqual } from 'node:util';
 import { toMillis } from '../utils/timestampUtils';
 import { parseJsonObjectColumn } from '../utils/jsonColumn';
 import {
@@ -411,6 +412,10 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
         );
         if (transition.changed) merged.activity = transition.metadata.activity;
       }
+      // JSONB object key order is not meaningful, and JSON serialization drops
+      // undefined object properties. Compare the actual persisted JSON value so
+      // repeated token/context/task snapshots do not create another dead tuple.
+      const persistedMerged = JSON.parse(JSON.stringify(merged)) as Record<string, any>;
       const expected =
         rawMetadata === null || rawMetadata === undefined
           ? null
@@ -419,6 +424,19 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
             : JSON.stringify(rawMetadata);
       const expectedIndex = columnValues.length + 1;
       const mergedIndex = expectedIndex + 1;
+      if (isDeepStrictEqual(existingMetadata, persistedMerged)) {
+        if (columnUpdates.length === 0) return;
+        const updated = await db.query(
+          `UPDATE ai_sessions
+           SET ${columnUpdates.join(', ')}
+           WHERE id = $1
+             AND ((metadata IS NULL AND $${expectedIndex}::jsonb IS NULL) OR metadata = $${expectedIndex}::jsonb)
+           RETURNING metadata`,
+          [...columnValues, expected],
+        );
+        if (updated.rows.length > 0) return;
+        continue;
+      }
       const setClauses = [
         ...columnUpdates,
         `metadata = $${mergedIndex}::jsonb`,
@@ -429,7 +447,7 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
          WHERE id = $1
            AND ((metadata IS NULL AND $${expectedIndex}::jsonb IS NULL) OR metadata = $${expectedIndex}::jsonb)
          RETURNING metadata`,
-        [...columnValues, expected, JSON.stringify(merged)],
+        [...columnValues, expected, JSON.stringify(persistedMerged)],
       );
       if (updated.rows.length > 0) return;
     }

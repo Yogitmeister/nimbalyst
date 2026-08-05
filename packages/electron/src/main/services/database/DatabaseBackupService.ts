@@ -30,6 +30,20 @@ interface BackupMetadata {
   lastSuccessfulBackup: string | null;
 }
 
+export interface BackupPhysicalGrowthAssessment {
+  databaseSizeBytes: number;
+  aiSessionsRelationSizeBytes: number;
+  aiSessionsLiveBytes: number;
+  retainedBackupBytes: number;
+  projectedPeakBytes: number;
+  sessionPhysicalToLiveRatio: number;
+  maintenanceRecommended: boolean;
+  operatorGuidance: string | null;
+}
+
+const MIN_BLOATED_SESSION_RELATION_BYTES = 128 * 1024 * 1024;
+const SESSION_PHYSICAL_TO_LIVE_WARNING_RATIO = 10;
+
 export class DatabaseBackupService {
   private backupDir: string;
   private metadataPath: string;
@@ -159,6 +173,60 @@ export class DatabaseBackupService {
   }
 
   /**
+   * Read-only storage assessment used before a rolling backup copies the
+   * physical PGlite directory. Comparing the relation size with the live
+   * metadata payload distinguishes retained heap/TOAST history from genuine
+   * session data, while projectedPeakBytes makes the temporary fourth copy
+   * visible to operators.
+   */
+  async assessPhysicalGrowth(): Promise<BackupPhysicalGrowthAssessment> {
+    const result = await this.dbWorker.query<{
+      database_size_bytes: string | number;
+      ai_sessions_relation_size_bytes: string | number;
+      ai_sessions_live_bytes: string | number;
+    }>(`
+      SELECT
+        pg_database_size(current_database()) AS database_size_bytes,
+        pg_total_relation_size('ai_sessions') AS ai_sessions_relation_size_bytes,
+        COALESCE((SELECT SUM(pg_column_size(metadata)) FROM ai_sessions), 0) AS ai_sessions_live_bytes
+    `);
+    const row = result.rows[0];
+    const databaseSizeBytes = Number(row?.database_size_bytes) || 0;
+    const aiSessionsRelationSizeBytes = Number(row?.ai_sessions_relation_size_bytes) || 0;
+    const aiSessionsLiveBytes = Number(row?.ai_sessions_live_bytes) || 0;
+    const retainedBackups = [
+      this.metadata.currentBackup,
+      this.metadata.previousBackup,
+      this.metadata.oldestBackup,
+    ].filter((backup): backup is NonNullable<typeof backup> => backup !== null);
+    const retainedBackupBytes = retainedBackups.reduce(
+      (total, backup) => total + backup.size,
+      0,
+    );
+    const sessionPhysicalToLiveRatio = aiSessionsLiveBytes > 0
+      ? aiSessionsRelationSizeBytes / aiSessionsLiveBytes
+      : aiSessionsRelationSizeBytes > 0
+        ? Number.POSITIVE_INFINITY
+        : 0;
+    const maintenanceRecommended =
+      aiSessionsRelationSizeBytes >= MIN_BLOATED_SESSION_RELATION_BYTES
+      && sessionPhysicalToLiveRatio >= SESSION_PHYSICAL_TO_LIVE_WARNING_RATIO;
+
+    return {
+      databaseSizeBytes,
+      aiSessionsRelationSizeBytes,
+      aiSessionsLiveBytes,
+      retainedBackupBytes,
+      projectedPeakBytes: retainedBackupBytes + databaseSizeBytes,
+      sessionPhysicalToLiveRatio,
+      maintenanceRecommended,
+      operatorGuidance: maintenanceRecommended
+        ? 'Open Settings > Database and run the SQLite migration dry-run before the next backup.'
+        : null,
+    };
+  }
+
+  /**
    * Copy directory recursively
    */
   private async copyDirectory(src: string, dest: string): Promise<void> {
@@ -236,6 +304,17 @@ export class DatabaseBackupService {
       if (!fsSync.existsSync(this.dbPath)) {
         logger.main.warn('[Backup Service] Database path does not exist:', this.dbPath);
         return { success: false, error: 'Database path does not exist' };
+      }
+
+      try {
+        const growth = await this.assessPhysicalGrowth();
+        if (growth.maintenanceRecommended) {
+          logger.main.warn('[Backup Service] Physical session growth needs operator review', growth);
+        }
+      } catch (error) {
+        // Telemetry must not make a verified backup unavailable. The warning
+        // keeps a failed assessment visible while preserving recovery safety.
+        logger.main.warn('[Backup Service] Failed to assess physical growth:', error);
       }
 
       // Check disk space

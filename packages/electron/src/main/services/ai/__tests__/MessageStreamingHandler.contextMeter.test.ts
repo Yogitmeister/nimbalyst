@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ContextObservationV1 } from "@nimbalyst/runtime/ai/server/types";
 import {
+  applyMidTurnContextUsage,
   applyContextObservationToTokenUsage,
   contextMeterTransitionReason,
   expectedContextMeterIdentityForSession,
@@ -9,6 +10,7 @@ import {
   transitionContextMeterTokenUsage,
 } from "../MessageStreamingHandler";
 import { hydrateContextMeterStateV1 } from "@nimbalyst/runtime/ai/server";
+import { buildPersistedContextTokenUsage } from "../AIService";
 
 function observation(
   sequence: number,
@@ -46,6 +48,64 @@ const cumulative = {
 };
 
 describe("MessageStreamingHandler context-meter seam", () => {
+  it("excludes raw /context markdown from the durable token snapshot", () => {
+    const rawResponse = "provider-markdown-sentinel".repeat(16_384);
+    const next = buildPersistedContextTokenUsage(
+      {
+        ...cumulative,
+        costUSD: 1.25,
+        currentContext: {
+          tokens: 1,
+          contextWindow: 200_000,
+          rawResponse,
+        },
+      },
+      {
+        totalTokens: 32_000,
+        contextWindow: 200_000,
+        categories: [{ name: "System prompt", tokens: 8_000, percentage: 25 }],
+      },
+    );
+
+    expect(next).toMatchObject({
+      ...cumulative,
+      costUSD: 1.25,
+      contextWindow: 200_000,
+      currentContext: {
+        tokens: 32_000,
+        contextWindow: 200_000,
+        categories: [{ name: "System prompt", tokens: 8_000, percentage: 25 }],
+      },
+    });
+    expect(next.currentContext).not.toHaveProperty("rawResponse");
+    expect(JSON.stringify(next)).not.toContain("provider-markdown-sentinel");
+  });
+
+  it("keeps mid-turn context usage transient without durable sync metadata", () => {
+    const session = {
+      id: "session-1",
+      tokenUsage: { ...cumulative },
+    };
+    const send = vi.fn();
+    const next = applyMidTurnContextUsage({
+      session,
+      contextFillTokens: 32_000,
+      contextWindow: 200_000,
+      send,
+    });
+
+    expect(next).toMatchObject({
+      ...cumulative,
+      contextWindow: 200_000,
+      currentContext: { tokens: 32_000, contextWindow: 200_000 },
+    });
+    expect(session.tokenUsage).toBe(next);
+    expect(send).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      tokenUsage: next,
+    });
+  });
+
   it("projects only an accepted paired observation while preserving cumulative usage", () => {
     const next = applyContextObservationToTokenUsage(
       cumulative,
