@@ -15,10 +15,28 @@ import {
 } from '../modelConstants';
 import { isDeepSeekClaudeAgentModel } from './deepSeekClaudeAgent';
 import type { TranscriptViewMessage } from './transcript/TranscriptProjector';
+import type {
+  ContextMeterStateV1,
+  ContextObservationV1,
+  ContextInvalidationReason,
+  ContextMeterIdentityV1,
+} from '../contextMeter';
 export type { ToolDefinition } from '../tools';
 export { ModelIdentifier } from './ModelIdentifier';
 export type { ToolResult } from './protocols/ProtocolInterface';
 export type { TranscriptViewMessage } from './transcript/TranscriptProjector';
+export type {
+  ContextMeterStateV1,
+  ContextObservationV1,
+  ContextInvalidationReason,
+  ContextMeterIdentityV1,
+} from '../contextMeter';
+export {
+  createUnavailableContextMeterStateV1,
+  contextMeterIdentityEquals,
+  hydrateContextMeterStateV1,
+  reduceContextMeterStateV1,
+} from '../contextMeter';
 
 export interface DocumentContext {
   filePath?: string;
@@ -71,6 +89,25 @@ export interface DocumentContext {
 
   /** Identifies the origin of this message when it comes from an automated source (e.g. 'wakeup_resume'). */
   promptOrigin?: string;
+
+  /** Durable authorship provenance for prompt search and audit surfaces. */
+  promptProvenance?: PromptProvenance;
+}
+
+export type PromptActor = 'human' | 'agent' | 'system';
+
+export type PromptProvenanceOrigin =
+  | 'composer'
+  | 'session-orchestration'
+  | 'child-session-update'
+  | 'mobile'
+  | 'automation';
+
+export interface PromptProvenance {
+  actor: PromptActor;
+  origin: PromptProvenanceOrigin;
+  originSessionId?: string;
+  queuedPromptId?: string;
 }
 
 export interface ChatAttachment {
@@ -391,6 +428,8 @@ export interface SessionData {
       categories?: TokenUsageCategory[]; // Category breakdown from /context
       rawResponse?: string;   // Raw markdown from /context for display on session reload
     };
+    /** Sole versioned source for the context meter UI. */
+    contextMeterState?: ContextMeterStateV1;
   };
 
   // Additional metadata
@@ -414,6 +453,8 @@ export interface SessionData {
 
 export interface ProviderConfig {
   apiKey?: string;
+  /** Stable project scope for explicit per-workspace provider credentials. */
+  workspacePath?: string;
   model?: string;
   maxTokens?: number;
   temperature?: number;
@@ -421,6 +462,10 @@ export interface ProviderConfig {
   allowedTools?: string[];  // List of allowed tool names, ['*'] for all tools
   effortLevel?: EffortLevel;  // Effort level for Opus 4.6 adaptive reasoning (low/medium/high/max)
   thinkingMode?: ThinkingMode;  // Extended thinking mode for Claude Agent (enabled/disabled)
+  /** Catalog-owned, provider-neutral persisted controls validated at route resolution. */
+  catalogControlValues?: Readonly<Record<string, unknown>>;
+  /** Turn boundary used to enforce catalog control applicability. */
+  catalogControlContext?: import('./providers/claudeCode/providerCatalog').ProviderCatalogControlContext;
   customBackend?: string;  // Per-session Claude Agent backend selected by a synthetic model profile (DeepSeek)
   /**
    * Claude Code only: exact per-session backend profile. The profile is
@@ -523,6 +568,10 @@ export interface StreamChunk {
   contextFillTokens?: number;
   // Model context window for context fill calculations (when provider emits a per-turn snapshot).
   contextWindow?: number;
+  /** Provider observation to be validated by the host reducer. */
+  contextObservation?: ContextObservationV1;
+  /** Already-reduced state for extension providers that host the same reducer. */
+  contextMeterState?: ContextMeterStateV1;
   // Set to true when context was compacted this turn. Signals AIService to clear stale currentContext.
   contextCompacted?: boolean;
   /**

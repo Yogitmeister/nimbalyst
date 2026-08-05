@@ -7,9 +7,9 @@
  * re-entry on completion, and error recovery.
  *
  * It accesses several internal members of AIService (state Maps, helper methods)
- * through an internal view. Queue-dispatch ownership is deliberately kept on
- * AIService's typed public lease guard so this handler cannot drift back to the
- * removed broad processing set.
+ * via an `AIServiceInternal` cast — this keeps AIService's public API surface
+ * unchanged while letting the handler reach into the same shared state it had
+ * when it lived inline in `setupIpcHandlers()`.
  */
 
 import { BrowserWindow } from 'electron';
@@ -21,7 +21,15 @@ import {
   onAgentMessageBatch,
   buildMetaAgentSystemPrompt,
   buildDevAgentSystemPrompt,
+  createUnavailableContextMeterStateV1,
+  contextMeterIdentityEquals,
+  reduceContextMeterStateV1,
+  resolveClaudeCodeModelVariant,
   type AIProvider,
+  type ContextInvalidationReason,
+  type ContextMeterIdentityV1,
+  type ContextMeterStateV1,
+  type ContextObservationV1,
   type SessionManager,
 } from '@nimbalyst/runtime/ai/server';
 import {
@@ -36,13 +44,18 @@ import {
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { isBedrockToolSearchError } from '@nimbalyst/runtime/ai/server/utils/errorDetection';
 import { resolveEffortLevel, resolveThinkingMode } from '@nimbalyst/runtime/ai/server/effortLevels';
-import { applyDeepSeekClaudeAgentProfile, isDeepSeekClaudeAgentModel } from '@nimbalyst/runtime/ai/server/deepSeekClaudeAgent';
 import type { RawDocumentContext, DocumentContextService } from '@nimbalyst/runtime';
 import { AISessionsRepository, resolveClaudeCodeParentContextWindow } from '@nimbalyst/runtime';
+import {
+  buildMcpSessionStatusSnapshot,
+  type McpSessionStatusInput,
+} from '@nimbalyst/runtime/types/MCPServerConfig';
 import { toolRegistry } from './tools';
+import type { DriveReason } from './QueueDriveService';
 import { resolveExtensionAgentRef } from './providerResolution';
+import { createQueuedStreamTruthBinder } from './queuedPromptTruth';
+import { resolveClaudeCodeCatalogControlContext } from './ClaudeCodeTurnLifecycle';
 import { getAgentProviderRegistry } from '../../extensions/AgentProviderRegistry';
-import { prepareClaudeCodeProviderTurn } from './ClaudeCodeTurnLifecycle';
 
 /**
  * Resolve the human-readable model name (e.g. "Gemini 3.5 Flash (High)") for an
@@ -68,6 +81,7 @@ function resolveExtensionModelDisplayName(
 import { extractFilePath } from './tools/extractFilePath';
 import { SoundNotificationService } from '../SoundNotificationService';
 import { notificationService } from '../NotificationService';
+import { composeNotificationTitle } from '../../../shared/notificationTitle';
 import { TrayManager } from '../../tray/TrayManager';
 import { logger } from '../../utils/logger';
 import { windowStates, findWindowByWorkspace } from '../../window/WindowManager';
@@ -111,6 +125,7 @@ import {
 } from './aiServiceUtils';
 import { disableParentNotificationsAfterDirectTakeover } from './childSessionTakeover';
 import { installScopedProviderListener } from './providerListenerRegistry';
+import { shouldSettleUnterminatedTurn } from './sessionSettlePolicy';
 import type Store from 'electron-store';
 import type { AIService } from './AIService';
 import type { HooklessAgentFileWatcher } from './HooklessAgentFileWatcher';
@@ -123,9 +138,251 @@ import type { WorkspaceFileAttributionMode } from '../WorkspaceFileAttributionPo
  */
 export function hasPersistedPendingPrompt(metadata: unknown): boolean {
   return Boolean(
-    metadata
-    && typeof metadata === 'object'
-    && (metadata as Record<string, unknown>).hasPendingPrompt === true,
+    metadata &&
+      typeof metadata === "object" &&
+      (metadata as Record<string, unknown>).hasPendingPrompt === true
+  );
+}
+
+type SessionTokenUsage = NonNullable<SessionData["tokenUsage"]>;
+
+function baseTokenUsage(current: SessionData["tokenUsage"]): SessionTokenUsage {
+  return current ?? { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+}
+
+function projectContextMeterState(
+  current: SessionData["tokenUsage"],
+  contextMeterState: ContextMeterStateV1
+): SessionTokenUsage {
+  const usage = baseTokenUsage(current);
+  if (contextMeterState.confidence === "unavailable") {
+    return { ...usage, currentContext: undefined, contextMeterState };
+  }
+  return {
+    ...usage,
+    contextWindow: contextMeterState.effectiveWindowTokens,
+    currentContext: {
+      tokens: contextMeterState.fillTokens,
+      contextWindow: contextMeterState.effectiveWindowTokens,
+    },
+    contextMeterState,
+  };
+}
+
+export function applyContextObservationToTokenUsage(
+  current: SessionData["tokenUsage"],
+  observation: ContextObservationV1
+): SessionTokenUsage {
+  const prior =
+    current?.contextMeterState ??
+    createUnavailableContextMeterStateV1("no-observation");
+  const priorProvenance = prior.provenance;
+  let activeObservation = observation;
+  if (
+    priorProvenance &&
+    contextMeterIdentityEquals(
+      priorProvenance.identity,
+      observation.identity
+    ) &&
+    priorProvenance.order.processInstanceId !==
+      observation.order.processInstanceId &&
+    observation.order.lifecycleGeneration === 0
+  ) {
+    activeObservation = {
+      ...observation,
+      order: {
+        ...observation.order,
+        lifecycleGeneration: priorProvenance.order.lifecycleGeneration,
+      },
+    };
+  }
+  return projectContextMeterState(
+    current,
+    reduceContextMeterStateV1(prior, {
+      type: "observation",
+      observation: activeObservation,
+    })
+  );
+}
+
+export function transitionContextMeterTokenUsage(
+  current: SessionData["tokenUsage"],
+  identity: ContextMeterIdentityV1,
+  reason: ContextInvalidationReason
+): SessionTokenUsage {
+  const prior = current?.contextMeterState;
+  const provenance = prior?.provenance;
+  const lifecycleGeneration = (provenance?.order.lifecycleGeneration ?? -1) + 1;
+  return projectContextMeterState(
+    current,
+    reduceContextMeterStateV1(
+      prior ?? createUnavailableContextMeterStateV1("no-observation"),
+      {
+        type: "invalidate",
+        reason,
+        lifecycle: {
+          identity,
+          order: {
+            processInstanceId:
+              provenance?.order.processInstanceId ?? "host-lifecycle",
+            lifecycleGeneration,
+            sequence: 1,
+            observedAtMs: Date.now(),
+          },
+        },
+      }
+    )
+  );
+}
+
+export function expectedContextMeterIdentityForSession(
+  session: Pick<
+    SessionData,
+    | "id"
+    | "provider"
+    | "model"
+    | "providerConfig"
+    | "providerSessionId"
+    | "metadata"
+  >,
+  _persistedIdentity?: ContextMeterIdentityV1
+): ContextMeterIdentityV1 {
+  const snapshot = session.metadata?.providerRuntimeRouteSnapshotV1 as any;
+  const durableMain =
+    snapshot?.schemaVersion === 1 &&
+    snapshot?.main?.plan &&
+    typeof snapshot.main.plan === "object"
+      ? snapshot.main.plan
+      : undefined;
+  const routeModel = durableMain?.model;
+  const routeInterface = durableMain?.selectedInterface;
+  const persistedModelId =
+    (typeof routeModel?.persistedId === "string" && routeModel.persistedId) ||
+    session.model ||
+    session.providerConfig?.model ||
+    `${session.provider}:unknown`;
+  const fallbackModelPart = persistedModelId.includes(":")
+    ? persistedModelId.slice(persistedModelId.indexOf(":") + 1)
+    : persistedModelId;
+  const activeProviderModelId =
+    typeof routeModel?.providerModelId === "string"
+      ? routeModel.providerModelId
+      : session.provider === "claude-code"
+      ? resolveClaudeCodeModelVariant(fallbackModelPart, fallbackModelPart)
+      : fallbackModelPart;
+  const activeInterfaceId =
+    typeof routeInterface?.id === "string"
+      ? routeInterface.id
+      : session.provider === "claude-code"
+      ? "claude-agent-sdk-native"
+      : undefined;
+  return {
+    nimbalystSessionId: session.id,
+    providerId:
+      (typeof durableMain?.provider === "string" && durableMain.provider) ||
+      session.provider,
+    persistedModelId,
+    ...(activeProviderModelId
+      ? { providerModelId: activeProviderModelId }
+      : {}),
+    ...(typeof routeModel?.catalogEntryId === "string"
+      ? { catalogEntryId: routeModel.catalogEntryId }
+      : {}),
+    ...(activeInterfaceId ? { interfaceId: activeInterfaceId } : {}),
+    upstreamThreadId: session.providerSessionId || session.id,
+    producerRole: "lead",
+  };
+}
+
+export function contextMeterTransitionReason(
+  current: ContextMeterIdentityV1,
+  live: ContextMeterIdentityV1
+): ContextInvalidationReason | undefined {
+  if (current.persistedModelId !== live.persistedModelId)
+    return "model-changed";
+  if (
+    current.providerId !== live.providerId ||
+    current.providerModelId !== live.providerModelId ||
+    current.catalogEntryId !== live.catalogEntryId
+  )
+    return "route-changed";
+  if (current.interfaceId !== live.interfaceId) return "interface-changed";
+  if (current.upstreamThreadId !== live.upstreamThreadId) return "thread-reset";
+  return undefined;
+}
+
+export function invalidateContextMeterTokenUsage(
+  current: SessionData["tokenUsage"],
+  reason: ContextInvalidationReason
+): SessionTokenUsage {
+  const prior = current?.contextMeterState;
+  const provenance = prior?.provenance;
+  if (!provenance) {
+    return projectContextMeterState(
+      current,
+      createUnavailableContextMeterStateV1(reason)
+    );
+  }
+  return projectContextMeterState(
+    current,
+    reduceContextMeterStateV1(prior, {
+      type: "invalidate",
+      reason,
+      lifecycle: {
+        identity: provenance.identity,
+        order: {
+          ...provenance.order,
+          lifecycleGeneration: provenance.order.lifecycleGeneration + 1,
+          sequence: 1,
+          observedAtMs: Date.now(),
+        },
+      },
+    })
+  );
+}
+
+export function settleContextMeterTurn(
+  current: SessionData["tokenUsage"],
+  hadFreshObservation: boolean,
+  outcome: "completed" | "cancelled" | "error" = "completed"
+): SessionTokenUsage {
+  const prior = current?.contextMeterState;
+  const provenance = prior?.provenance;
+  if (!prior || !provenance) {
+    return projectContextMeterState(
+      current,
+      createUnavailableContextMeterStateV1("turn-missing-observation")
+    );
+  }
+  return projectContextMeterState(
+    current,
+    reduceContextMeterStateV1(
+      prior,
+      outcome === "completed"
+        ? {
+            type: "turn-completed",
+            hadFreshObservation,
+            lifecycle: {
+              identity: provenance.identity,
+              order: {
+                ...provenance.order,
+                sequence: provenance.order.sequence + 1,
+                observedAtMs: Date.now(),
+              },
+            },
+          }
+        : {
+            type: outcome === "cancelled" ? "turn-cancelled" : "turn-error",
+            lifecycle: {
+              identity: provenance.identity,
+              order: {
+                ...provenance.order,
+                sequence: provenance.order.sequence + 1,
+                observedAtMs: Date.now(),
+              },
+            },
+          }
+    )
   );
 }
 
@@ -142,7 +399,11 @@ export async function runTerminalPromptTransition(params: {
   if (!hasPendingPrompt && !params.hasActiveLease && !params.hasOtherDeferral) {
     dispatched = await params.tryDispatch();
   }
-  const deferred = hasPendingPrompt || params.hasActiveLease || Boolean(params.hasOtherDeferral) || dispatched;
+  const deferred =
+    hasPendingPrompt ||
+    params.hasActiveLease ||
+    Boolean(params.hasOtherDeferral) ||
+    dispatched;
   if (!deferred) await params.endSession();
   if (!params.hasActiveLease) params.sync?.(hasPendingPrompt);
   return { deferred, hasPendingPrompt };
@@ -152,14 +413,21 @@ function resolveWorkspaceFileAttributionMode(
   providerName: string,
   provider: AIProvider | null | undefined,
 ): WorkspaceFileAttributionMode {
-  if (providerName !== 'openai-codex') return 'fuzzy';
+  if (providerName !== "openai-codex") return "fuzzy";
 
-  const codexProvider = provider as (AIProvider & {
-    getTransport?: () => 'sdk' | 'app-server';
-  }) | null | undefined;
+  const codexProvider = provider as
+    | (AIProvider & {
+        getTransport?: () => "sdk" | "app-server";
+      })
+    | null
+    | undefined;
   const activeTransport = codexProvider?.getTransport?.();
-  const configuredTransport = getAppSetting<{ transport?: 'sdk' | 'app-server' }>('openaiCodex')?.transport;
-  return (activeTransport ?? configuredTransport) === 'sdk' ? 'fuzzy' : 'disabled';
+  const configuredTransport = getAppSetting<{
+    transport?: "sdk" | "app-server";
+  }>("openaiCodex")?.transport;
+  return (activeTransport ?? configuredTransport) === "sdk"
+    ? "fuzzy"
+    : "disabled";
 }
 
 export type SendMessageHandler = (
@@ -168,12 +436,20 @@ export type SendMessageHandler = (
   documentContext?: DocumentContext,
   sessionId?: string,
   workspacePath?: string,
-) => Promise<{ content: string }>;
+) => Promise<{
+  content: string;
+  queuedPromptTerminal?: {
+    lifecycle: 'completed' | 'failed';
+    terminalAt: number;
+    eventSequence: number;
+  };
+}>;
 
 /**
- * Structural view of the AIService members this handler needs. Queue dispatch
- * ownership is intentionally excluded: it is accessed through AIService's
- * typed `hasActiveQueueLease` method rather than this structural view.
+ * Structural view of the AIService members this handler needs. Keeping it
+ * declared here (rather than reaching into the AIService class via `private`
+ * access) means AIService's class declaration stays untouched — we just cast
+ * the injected service reference to this shape internally.
  */
 interface AIServiceInternal {
   // Shared state
@@ -182,6 +458,7 @@ interface AIServiceInternal {
   sendMessageHandler: SendMessageHandler | null;
   processingQueuedPromptIds: Set<string>;
   matchDebounceTimers: Map<string, ReturnType<typeof setTimeout>>;
+  hasActiveQueueLease(sessionId: string): boolean;
   documentContextService: DocumentContextService;
   hooklessWatcher: HooklessAgentFileWatcher;
 
@@ -201,6 +478,7 @@ interface AIServiceInternal {
     targetWindow: Electron.BrowserWindow | null,
     source: string,
   ): Promise<boolean>;
+  requestQueueDrive(sessionId: string, workspacePath: string, reason: DriveReason): void;
   runAutoContextCommand(
     session: SessionData,
     workspacePath: string,
@@ -273,7 +551,6 @@ async function getWorkspacePathForSession(sessionId: string): Promise<string | n
 }
 
 export class MessageStreamingHandler {
-  private readonly aiService: AIService;
   private readonly svc: AIServiceInternal;
   private readonly unsubscribeBatchListener: () => void;
   // Per-provider map of event -> currently-installed listener. Used by
@@ -286,7 +563,6 @@ export class MessageStreamingHandler {
   >();
 
   constructor(service: AIService) {
-    this.aiService = service;
     this.svc = service as unknown as AIServiceInternal;
 
     // The shared AgentMessageWriteQueue (in BaseAIProvider) coalesces streaming
@@ -329,15 +605,6 @@ export class MessageStreamingHandler {
   }
 
   /**
-   * Queue ownership is a generation lease, not a session-wide boolean. Keep
-   * this indirection typed against AIService so a future field rename fails
-   * typechecking instead of becoming an undefined `.has()` at runtime.
-   */
-  private hasActiveQueueLease(sessionId: string): boolean {
-    return this.aiService.hasActiveQueueLease(sessionId);
-  }
-
-  /**
    * Replace the previously-installed listener for this (provider, event) pair
    * without touching listeners owned by other modules. handle() registers its
    * subscriptions on every ai:sendMessage call against the same cached
@@ -362,6 +629,26 @@ export class MessageStreamingHandler {
   ) => {
     // Check for queued prompt deduplication - prevents duplicate execution from multiple renderer panels
     const queuedPromptId = (documentContext as any)?.queuedPromptId as string | undefined;
+    const queuedPromptTruth = (documentContext as any)?.queuedPromptTruth as Record<string, unknown> | undefined;
+    let queuedTerminalEmitted = false;
+    let queuedPromptTerminal: { lifecycle: 'completed' | 'failed'; terminalAt: number; eventSequence: number } | undefined;
+    const queueTruthMetadata = createQueuedStreamTruthBinder(queuedPromptTruth);
+    const queueStreamMetadata = (lifecycle: 'streaming' | 'completed' | 'failed') => {
+      const truth = queueTruthMetadata(lifecycle);
+      if (lifecycle !== 'streaming' && truth) {
+        queuedTerminalEmitted = true;
+        queuedPromptTerminal = {
+          lifecycle,
+          terminalAt: truth.terminalAt as number,
+          eventSequence: truth.eventSequence as number,
+        };
+      }
+      return truth ? { queuedPromptTruth: truth } : {};
+    };
+    const queueMessageMetadata = (lifecycle: 'streaming' | 'completed' | 'failed') => {
+      const truth = queueTruthMetadata(lifecycle);
+      return truth ? { metadata: { queuedPromptTruth: truth } } : {};
+    };
     if (queuedPromptId) {
       if (this.svc.processingQueuedPromptIds.has(queuedPromptId)) {
         logger.main.info(`[AIService] SKIPPING duplicate queued prompt: ${queuedPromptId}`);
@@ -369,7 +656,8 @@ export class MessageStreamingHandler {
       }
 
       // Mark prompt ID as processing
-      // Note: session lock is already set in claimQueuedPrompt handler, no need to check here
+      // Note: session lock is already set via the queue dispatcher's claim/lease
+      // path (queueProcessingLeases), no need to check here
       this.svc.processingQueuedPromptIds.add(queuedPromptId);
       logger.main.info(`[AIService] Processing queued prompt: ${queuedPromptId}, session: ${sessionId}, total prompts in progress: ${this.svc.processingQueuedPromptIds.size}`);
     }
@@ -482,6 +770,7 @@ export class MessageStreamingHandler {
       timestamp: Date.now(),
       attachments: attachments && attachments.length > 0 ? attachments : undefined,
       mode: documentContext?.mode,
+      ...queueMessageMetadata('streaming'),
     };
     // logger.main.info(`[AIService] Adding user message to session ${session.id}: "${message.substring(0, 50)}..." (queuedPromptId: ${queuedPromptId || 'none'}, mode: ${documentContext?.mode})`);
     await this.svc.sessionManager.addMessage(userMessage, session.id);
@@ -614,15 +903,19 @@ export class MessageStreamingHandler {
       }
 
       const reinitEffortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
+      const reinitCatalogControlValues = (session.metadata as any)?.catalogControlValues;
       const reinitConfig: any = {
-        apiKey: isProviderClaudeCode && isDeepSeekClaudeAgentModel(session.model || session.providerConfig?.model)
-          ? this.svc.getApiKeyForProvider('deepseek', workspacePath)
-          : apiKey,
+        apiKey,
         maxTokens: (session.providerConfig as any)?.maxTokens,
         temperature: (session.providerConfig as any)?.temperature,
         // Effort level: explicit session value, else the app-wide default the
         // selector displays (Opus 4.6 adaptive reasoning).
         ...(reinitEffortLevel && { effortLevel: reinitEffortLevel }),
+        ...(reinitCatalogControlValues
+          && typeof reinitCatalogControlValues === 'object'
+          && !Array.isArray(reinitCatalogControlValues)
+          ? { catalogControlValues: reinitCatalogControlValues }
+          : {}),
         ...(isProviderClaudeCode ? {
           thinkingMode: resolveThinkingMode((session.metadata as any)?.thinkingMode, getDefaultThinkingMode()),
         } : {}),
@@ -676,8 +969,6 @@ export class MessageStreamingHandler {
         }
       }
 
-      if (isProviderClaudeCode) Object.assign(reinitConfig, applyDeepSeekClaudeAgentProfile(reinitConfig));
-
       if (isProviderClaudeCode) {
         const safeConfig = { ...reinitConfig, apiKey: reinitConfig.apiKey ? '***' : undefined };
       }
@@ -701,7 +992,8 @@ export class MessageStreamingHandler {
         const errorMessage: Message = {
           role: 'assistant',
           content: `I encountered an error connecting to ${session.provider}:\n\n${initError.message || String(initError)}`,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          ...queueMessageMetadata('failed'),
         };
 
         await this.svc.sessionManager.addMessage(errorMessage, session.id);
@@ -711,17 +1003,15 @@ export class MessageStreamingHandler {
           this.svc.processingQueuedPromptIds.delete(queuedPromptId);
         }
 
-        // Return empty response instead of throwing - the error message is now in the conversation
+        // Direct submissions preserve the existing recoverable error result.
+        // A queued turn must reject so its exact claim settles failed.
+        if (queuedPromptId) throw initError;
         return { content: '' };
       }
 
       // CRITICAL: Restore provider session data from database
       // This is essential for session resumption (e.g., Claude Code sessions)
-      if (
-        session.provider !== 'claude-code'
-        && session.providerSessionId
-        && provider.setProviderSessionData
-      ) {
+      if (session.providerSessionId && provider.setProviderSessionData) {
         provider.setProviderSessionData(session.id, {
           providerSessionId: session.providerSessionId,
           // Backward-compatible keys for existing providers
@@ -740,11 +1030,7 @@ export class MessageStreamingHandler {
     // on first creation, but the provider can outlive its in-memory session ID mapping
     // across Nimbalyst restarts (process restart -> empty map). Running this on every
     // message guarantees `options.resume` is populated.
-    if (
-      session.provider !== 'claude-code'
-      && session.providerSessionId
-      && (provider as any).setProviderSessionData
-    ) {
+    if (session.providerSessionId && (provider as any).setProviderSessionData) {
       (provider as any).setProviderSessionData(session.id, {
         providerSessionId: session.providerSessionId,
         claudeSessionId: session.providerSessionId,
@@ -850,6 +1136,36 @@ export class MessageStreamingHandler {
     // Replace this handler's previous 'message:logged' subscription only,
     // so other modules subscribing to the same provider event stay wired.
     this.installListener(provider, 'message:logged', onMessageLogged);
+
+    // Per-session MCP health transitions (NIM-2272 / GH #1089). The provider's
+    // 30s poll runs *between* turns as well as during them — mcpQuery outlives
+    // leadQuery specifically so it can — so this listener has to survive turn
+    // boundaries. installScopedProviderListener replaces only its own prior
+    // subscription, so re-running handle() on the next turn rewires without a
+    // gap. Payload is built by the same function the pull handler uses, so a
+    // pushed snapshot and a pulled one are byte-identical.
+    const onMcpServerStatusChanged = (data: {
+      sessionId?: string;
+      servers?: unknown[];
+      lastCheckedAt?: number | null;
+      configuredNames?: string[] | null;
+      withheldNames?: string[] | null;
+    }) => {
+      const mcpSessionId = data?.sessionId || session.id;
+      safeSend(event, 'ai:mcp-status:changed', {
+        ...buildMcpSessionStatusSnapshot({
+          sessionId: mcpSessionId,
+          supported: true,
+          active: true,
+          statuses: (data?.servers || []) as McpSessionStatusInput[],
+          configuredNames: data?.configuredNames ?? null,
+          withheldNames: data?.withheldNames ?? null,
+          lastCheckedAt: data?.lastCheckedAt ?? null,
+        }),
+        workspacePath: effectiveWorkspacePath,
+      });
+    };
+    this.installListener(provider, 'mcpServerStatus:changed', onMcpServerStatusChanged);
 
     // Forward any provider-side title updates to all renderers so the session
     // list updates in real time.
@@ -1172,7 +1488,7 @@ export class MessageStreamingHandler {
         return;
       }
       // A queued/continuation turn may already be taking over; let it own the end.
-      if (this.hasActiveQueueLease(data.sessionId)) return;
+      if (this.svc.hasActiveQueueLease(data.sessionId)) return;
 
       logger.main.info(`[AIService] Sub-agent drain settled for session ${data.sessionId}, ending deferred session`);
       await stateManager.endSession(data.sessionId);
@@ -1248,6 +1564,8 @@ export class MessageStreamingHandler {
       let hasStreamingContent = false;  // Track if we used streamContent tool
       let hadError = false;  // Track if an error occurred during the stream
       let providerError: string | undefined;
+      let sawCompleteChunk = false;  // A terminal 'complete' chunk arrived
+      let settledOnErrorChunk = false;  // The error branch already ended the session
       let firstChunkTime: number | undefined;
       let chunkCount = 0;
       let textChunks = 0;
@@ -1275,14 +1593,10 @@ export class MessageStreamingHandler {
       const logPrefix = isClaudeCode ? '[CLAUDE-CODE-SERVICE]' : '[AIService]';
 
       if (isClaudeCode) {
-        // Refresh, qualify, initialize, and restore as one fail-closed
-        // lifecycle. This exact seam runs for first turns, cached second turns,
-        // and provider instances rebuilt after process restart.
-        await prepareClaudeCodeProviderTurn(
-          provider,
-          session,
-          () => this.svc.buildClaudeCodeRuntimeConfig(session, effectiveWorkspacePath),
-        );
+        // Refresh provider config every turn so auth/key changes in settings apply immediately.
+        const refreshedConfig = await this.svc.buildClaudeCodeRuntimeConfig(session, effectiveWorkspacePath);
+        refreshedConfig.catalogControlContext = resolveClaudeCodeCatalogControlContext(provider, session);
+        await provider.initialize(refreshedConfig);
 
         //   messageLength: message.length,
         //   hasContext: !!documentContext,
@@ -1396,6 +1710,15 @@ export class MessageStreamingHandler {
         // The transcript parser uses this to render wakeup resumes as a system marker
         // instead of a user-lane message.
         promptOrigin: documentContext?.promptOrigin,
+
+        // Queued orchestration paths provide their own provenance. A direct
+        // ai:sendMessage call is a human composer submission. Older queued
+        // rows intentionally remain unclassified rather than being guessed.
+        promptProvenance: documentContext?.promptProvenance ?? (
+          queuedPromptId
+            ? undefined
+            : { actor: 'human', origin: 'composer' }
+        ),
       };
 
       // Update MCP document state for Claude Code provider so it knows which tools to show
@@ -1596,7 +1919,8 @@ export class MessageStreamingHandler {
             safeSend(event, 'ai:streamResponse', {
               sessionId: session.id,
               partial: fullResponse,  // Send the full accumulated text
-              isComplete: false
+              isComplete: false,
+              ...queueStreamMetadata('streaming'),
             });
             break;
 
@@ -2040,7 +2364,8 @@ export class MessageStreamingHandler {
                       arguments: chunk.toolCall.arguments as Record<string, unknown> | undefined,
                       result: chunk.toolCall.result as string | ToolResult | undefined
                     },
-                    ...(toolResult !== undefined ? { errorMessage: toolResult?.error, isError: toolResult?.success === false } : {})
+                    ...(toolResult !== undefined ? { errorMessage: toolResult?.error, isError: toolResult?.success === false } : {}),
+                    ...queueMessageMetadata('streaming'),
                   };
                   await this.svc.sessionManager.addMessage(toolMessage, session.id);
                 }
@@ -2076,7 +2401,8 @@ export class MessageStreamingHandler {
                     partial: '',
                     isComplete: false,
                     edits: [edit],
-                    toolCalls: [chunk.toolCall]  // Also send as toolCall so it displays in chat
+                    toolCalls: [chunk.toolCall],  // Also send as toolCall so it displays in chat
+                    ...queueStreamMetadata('streaming'),
                   });
                 } else if (chunk.toolCall.name === 'streamContent') {
                   // Mark that we used streamContent AND track the tool call
@@ -2088,7 +2414,8 @@ export class MessageStreamingHandler {
                     sessionId: session.id,
                     partial: '',
                     isComplete: false,
-                    toolCalls: [chunk.toolCall]
+                    toolCalls: [chunk.toolCall],
+                    ...queueStreamMetadata('streaming'),
                   });
                 } else {
                   // For other tools, just send the tool call
@@ -2096,7 +2423,8 @@ export class MessageStreamingHandler {
                     sessionId: session.id,
                     partial: '',
                     isComplete: false,
-                    toolCalls: [chunk.toolCall]
+                    toolCalls: [chunk.toolCall],
+                    ...queueStreamMetadata('streaming'),
                   });
                 }
               }
@@ -2120,7 +2448,8 @@ export class MessageStreamingHandler {
                   result: chunk.toolError.result as string | ToolResult | undefined
                 },
                 isError: true,
-                errorMessage: chunk.toolError.error
+                errorMessage: chunk.toolError.error,
+                ...queueMessageMetadata('streaming'),
               };
               await this.svc.sessionManager.addMessage(errorMessage, session.id);
 
@@ -2128,7 +2457,8 @@ export class MessageStreamingHandler {
                 sessionId: session.id,
                 partial: '',
                 isComplete: false,
-                toolError: chunk.toolError
+                toolError: chunk.toolError,
+                ...queueStreamMetadata('streaming'),
               });
             }
             break;
@@ -2247,12 +2577,13 @@ export class MessageStreamingHandler {
             if (
               isExtensionAgentSession
               && session?.id
-              && !this.hasActiveQueueLease(session.id)
+              && !this.svc.hasActiveQueueLease(session.id)
             ) {
               try {
                 await stateManager.updateActivity({ sessionId: session.id, status: 'error' });
                 await stateManager.endSession(session.id);
                 await this.svc.hooklessWatcher.stopForSession(session.id);
+                settledOnErrorChunk = true;
               } catch (settleErr) {
                 logger.main.error('[AIService] Failed to settle extension-agent error chunk:', settleErr);
               }
@@ -2262,6 +2593,7 @@ export class MessageStreamingHandler {
           case 'complete':
             // if (isClaudeCode) {
             // }
+            sawCompleteChunk = true;
             perfLog.totalTime = Date.now() - startTime;
             perfLog.streamTime = Date.now() - streamStartTime;
             perfLog.chunkCount = chunkCount;
@@ -2527,7 +2859,8 @@ export class MessageStreamingHandler {
                 ...(edits.length > 0 && { edits }),  // Include edits if any
                 // CRITICAL: Don't include tokenUsage from chunk.usage for claude-code provider
                 // Token usage for claude-code comes ONLY from /context command below
-                ...(tokenUsage && session.provider !== 'claude-code' && { tokenUsage })
+                ...(tokenUsage && session.provider !== 'claude-code' && { tokenUsage }),
+                ...queueMessageMetadata(providerError ? 'failed' : 'completed'),
               };
               await this.svc.sessionManager.addMessage(assistantMessage, session.id);
             } else if (edits.length > 0) {
@@ -2539,7 +2872,8 @@ export class MessageStreamingHandler {
                 edits,
                 // CRITICAL: Don't include tokenUsage from chunk.usage for claude-code provider
                 // Token usage for claude-code comes ONLY from /context command below
-                ...(tokenUsage && session.provider !== 'claude-code' && { tokenUsage })
+                ...(tokenUsage && session.provider !== 'claude-code' && { tokenUsage }),
+                ...queueMessageMetadata(providerError ? 'failed' : 'completed'),
               };
               await this.svc.sessionManager.addMessage(assistantMessage, session.id);
             } else if (hasStreamingContent) {
@@ -2557,7 +2891,8 @@ export class MessageStreamingHandler {
                 },
                 // CRITICAL: Don't include tokenUsage from chunk.usage for claude-code provider
                 // Token usage for claude-code comes ONLY from /context command below
-                ...(tokenUsage && session.provider !== 'claude-code' && { tokenUsage })
+                ...(tokenUsage && session.provider !== 'claude-code' && { tokenUsage }),
+                ...queueMessageMetadata(providerError ? 'failed' : 'completed'),
               };
               await this.svc.sessionManager.addMessage(assistantMessage, session.id);
             } else if (toolCalls.length > 0) {
@@ -2568,7 +2903,8 @@ export class MessageStreamingHandler {
                 timestamp: Date.now(),
                 // CRITICAL: Don't include tokenUsage from chunk.usage for claude-code provider
                 // Token usage for claude-code comes ONLY from /context command below
-                ...(tokenUsage && session.provider !== 'claude-code' && { tokenUsage })
+                ...(tokenUsage && session.provider !== 'claude-code' && { tokenUsage }),
+                ...queueMessageMetadata(providerError ? 'failed' : 'completed'),
               };
               await this.svc.sessionManager.addMessage(assistantMessage, session.id);
             }
@@ -2625,7 +2961,8 @@ export class MessageStreamingHandler {
               lastTextSection: lastTextSection.trim() || prevTextSection,
               isComplete: true,
               error: providerError,
-              autoContextPending: session.provider === 'claude-code'
+              autoContextPending: session.provider === 'claude-code',
+              ...queueStreamMetadata(providerError ? 'failed' : 'completed'),
             });
 
             // Mark session as complete so UI shows agent is ready.
@@ -2642,21 +2979,26 @@ export class MessageStreamingHandler {
             const willResume = session.provider === 'claude-code'
               && typeof (provider as any).willResumeAfterCompletion === 'function'
               && (provider as any).willResumeAfterCompletion();
-            const persistedSession = await AISessionsRepository.get(session.id);
-            const hasPendingStructuredPrompt = hasPersistedPendingPrompt(persistedSession?.metadata);
-            const queuedChainAlreadyActive = this.hasActiveQueueLease(session.id);
-            const terminalTransition = await runTerminalPromptTransition({
-              metadata: persistedSession?.metadata,
-              hasActiveLease: queuedChainAlreadyActive,
-              hasOtherDeferral: hasTeammates || willResume,
-              tryDispatch: () => this.svc.tryDispatchNextQueuedPrompt(session.id, workspacePath, BrowserWindow.fromWebContents(event.sender), 'completion-handler queue'),
-              endSession: () => stateManager.endSession(session.id),
-            });
-            const queuedContinuationScheduled = terminalTransition.deferred && !hasPendingStructuredPrompt && !hasTeammates && !willResume && !queuedChainAlreadyActive;
-            if (terminalTransition.deferred) {
-              const reason = hasPendingStructuredPrompt
-                ? 'structured prompt pending'
-                : hasTeammates
+            const queuedChainAlreadyActive = this.svc.hasActiveQueueLease(session.id);
+            let queuedContinuationScheduled = false;
+            if (!hasTeammates && !willResume && !queuedChainAlreadyActive) {
+              queuedContinuationScheduled = await this.svc.tryDispatchNextQueuedPrompt(
+                session.id,
+                workspacePath,
+                BrowserWindow.fromWebContents(event.sender),
+                'completion-handler queue',
+              );
+              if (!queuedContinuationScheduled) {
+                // The direct dispatch declined (sender window gone, row claimed
+                // elsewhere, ...). Hand the session to the queue driver so any
+                // remaining rows retry instead of stranding until the user
+                // presses Escape or restarts (#962). It defers on session-busy
+                // and wakes on the endSession below.
+                this.svc.requestQueueDrive(session.id, workspacePath, 'fifo-continuation');
+              }
+            }
+            if (hasTeammates || willResume || queuedChainAlreadyActive || queuedContinuationScheduled) {
+              const reason = hasTeammates
                 ? 'teammates still active'
                 : willResume
                 ? 'lead resuming'
@@ -2665,6 +3007,7 @@ export class MessageStreamingHandler {
                 : 'queued continuation scheduled';
               // logger.main.info(`[AIService] Deferring endSession for ${session.id} - ${reason}`);
             } else {
+              await stateManager.endSession(session.id);
               // Stop file watcher after a brief delay to let pending
               // watcher events drain through WorkspaceFileEditAttributionService.
               // The manager cancels the scheduled stop if a new turn starts
@@ -2696,10 +3039,11 @@ export class MessageStreamingHandler {
               // });
 
               await notificationService.showNotification({
-                title: `${sessionLabel} -- Response Ready`,
+                title: composeNotificationTitle(sessionLabel, 'Response Ready'),
                 body: notificationBody,
                 sessionId: session.id,
                 workspacePath: workspacePath,
+                sourceLabel: sessionLabel,
                 provider: session.provider
               });
 
@@ -2802,6 +3146,31 @@ export class MessageStreamingHandler {
         }
       }
 
+      // A built-in provider can yield an in-band 'error' chunk and then return
+      // normally instead of throwing (the Codex app-server transport catches
+      // RPC failures this way). That reaches neither the 'complete' branch nor
+      // the outer catch, so nothing ended the session and it stayed 'running'
+      // forever -- Cancel then no-ops, because the turn is already gone, while
+      // the renderer's processing reconcile keeps re-asserting the spinner.
+      if (session?.id && shouldSettleUnterminatedTurn({
+        sawComplete: sawCompleteChunk,
+        providerError,
+        alreadySettled: settledOnErrorChunk,
+        queuedChainActive: this.svc.hasActiveQueueLease(session.id),
+      })) {
+        logger.main.warn(
+          `[AIService] Provider stream for ${session.id} ended on an error chunk without completing -- settling session`
+        );
+        try {
+          await stateManager.updateActivity({ sessionId: session.id, status: 'error' });
+          await stateManager.endSession(session.id);
+          await this.svc.hooklessWatcher.stopForSession(session.id);
+          codexEditWindowRegistry.clearSession(session.id);
+        } catch (settleErr) {
+          logger.main.error('[AIService] Failed to settle unterminated provider error:', settleErr);
+        }
+      }
+
       // Flush any Bash commands that only emitted one observable tool event
       // so they still get pending-review tags and tool-call-linked diffs.
       for (const [commandItemId, command] of pendingBashCommands.entries()) {
@@ -2825,12 +3194,10 @@ export class MessageStreamingHandler {
       }
 
       // Clear executing and pending prompt flags for mobile sync
-      if (syncProvider && !this.hasActiveQueueLease(session.id)) {
-        const terminalSession = await AISessionsRepository.get(session.id);
-        const retainsPendingPrompt = hasPersistedPendingPrompt(terminalSession?.metadata);
+      if (syncProvider && !this.svc.hasActiveQueueLease(session.id)) {
         syncProvider.pushChange(session.id, {
           type: 'metadata_updated',
-          metadata: { isExecuting: false, hasPendingPrompt: retainsPendingPrompt, updatedAt: Date.now() },
+          metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },
         });
       }
 
@@ -2840,7 +3207,7 @@ export class MessageStreamingHandler {
         // logger.main.info(`[AIService] Cleared prompt tracking for ${queuedPromptId}`);
       }
 
-      return { content: fullResponse };
+      return { content: fullResponse, queuedPromptTerminal };
     } catch (error) {
       const errorTime = Date.now() - startTime;
       const isClaudeCode = session?.provider === 'claude-code';
@@ -2894,25 +3261,18 @@ export class MessageStreamingHandler {
         const willResumeOnError = session.provider === 'claude-code'
           && typeof (provider as any).willResumeAfterCompletion === 'function'
           && (provider as any).willResumeAfterCompletion();
-        const persistedErrorSession = await AISessionsRepository.get(session.id);
-        const hasPendingStructuredPromptOnError = hasPersistedPendingPrompt(persistedErrorSession?.metadata);
-        const queuedChainAlreadyActiveOnError = this.hasActiveQueueLease(session.id);
-        const errorTransition = await runTerminalPromptTransition({
-          metadata: persistedErrorSession?.metadata,
-          hasActiveLease: queuedChainAlreadyActiveOnError,
-          hasOtherDeferral: hasTeammatesOnError || willResumeOnError,
-          tryDispatch: () => this.svc.tryDispatchNextQueuedPrompt(session.id, workspacePath, BrowserWindow.fromWebContents(event.sender), 'error-handler queue'),
-          endSession: async () => {
-            await stateManager.endSession(session.id);
-            await this.svc.hooklessWatcher.stopForSession(session.id);
-            codexEditWindowRegistry.clearSession(session.id);
-          },
-        });
-        const queuedContinuationScheduledOnError = errorTransition.deferred && !hasPendingStructuredPromptOnError && !hasTeammatesOnError && !willResumeOnError && !queuedChainAlreadyActiveOnError;
-        if (errorTransition.deferred) {
-          const reason = hasPendingStructuredPromptOnError
-            ? 'structured prompt pending'
-            : hasTeammatesOnError
+        const queuedChainAlreadyActiveOnError = this.svc.hasActiveQueueLease(session.id);
+        let queuedContinuationScheduledOnError = false;
+        if (!hasTeammatesOnError && !willResumeOnError && !queuedChainAlreadyActiveOnError) {
+          queuedContinuationScheduledOnError = await this.svc.tryDispatchNextQueuedPrompt(
+            session.id,
+            workspacePath,
+            BrowserWindow.fromWebContents(event.sender),
+            'error-handler queue',
+          );
+        }
+        if (hasTeammatesOnError || willResumeOnError || queuedChainAlreadyActiveOnError || queuedContinuationScheduledOnError) {
+          const reason = hasTeammatesOnError
             ? 'teammates still active'
             : willResumeOnError
             ? 'lead resuming'
@@ -2920,13 +3280,18 @@ export class MessageStreamingHandler {
             ? 'queued continuation already active'
             : 'queued continuation scheduled';
           logger.main.info(`[AIService] Deferring endSession for ${session.id} on error - ${reason}`);
+        } else {
+          await stateManager.endSession(session.id);
+          // Stop file watcher - session ended on error
+          await this.svc.hooklessWatcher.stopForSession(session.id);
+          codexEditWindowRegistry.clearSession(session.id);
         }
 
         // Clear executing and pending prompt flags for mobile sync on error
-        if (syncProvider && !this.hasActiveQueueLease(session.id)) {
+        if (syncProvider && !this.svc.hasActiveQueueLease(session.id)) {
           syncProvider.pushChange(session.id, {
             type: 'metadata_updated',
-            metadata: { isExecuting: false, hasPendingPrompt: hasPendingStructuredPromptOnError, updatedAt: Date.now() },
+            metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },
           });
 
           // Request mobile push notification for agent error (only when truly away)
@@ -2953,6 +3318,28 @@ export class MessageStreamingHandler {
           sessionId: session?.id,
           message: error instanceof Error ? error.message : 'Unknown error occurred'
         });
+
+        // The queue driver settles this exact thrown path as failed. Emit one
+        // terminal boundary with the same durable association so a renderer
+        // never upgrades an earlier bound fragment into a completed response.
+        if (queuedPromptTruth && session?.id && !queuedTerminalEmitted) {
+          const errorContent = error instanceof Error ? error.message : 'Unknown error occurred';
+          await this.svc.sessionManager.addMessage({
+            role: 'assistant',
+            content: errorContent,
+            timestamp: Date.now(),
+            isError: true,
+            errorMessage: errorContent,
+            ...queueMessageMetadata('failed'),
+          }, session.id);
+          safeSend(event, 'ai:streamResponse', {
+            sessionId: session.id,
+            content: '',
+            isComplete: true,
+            error: errorContent,
+            ...queueStreamMetadata('failed'),
+          });
+        }
       }
 
       // Clean up queued prompt tracking on error
@@ -2961,6 +3348,11 @@ export class MessageStreamingHandler {
         logger.main.info(`[AIService] Cleared prompt tracking for ${queuedPromptId} (error path)`);
       }
 
+      if (queuedPromptTerminal) {
+        const terminalError = error instanceof Error ? error : new Error(String(error));
+        (terminalError as Error & { queuedPromptTerminal?: typeof queuedPromptTerminal }).queuedPromptTerminal = queuedPromptTerminal;
+        throw terminalError;
+      }
       throw error;
     }
   };

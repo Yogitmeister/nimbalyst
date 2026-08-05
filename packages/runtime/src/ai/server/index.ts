@@ -6,6 +6,11 @@ export * from './SessionManager';
 export * from './providers/ClaudeProvider';
 export * from './providers/ClaudeCodeProvider';
 export * from './providers/claudeCode/customBackends';
+export * from './providers/claudeCode/providerCatalog';
+export * from './providers/claudeCode/providerCatalogDefaults';
+export * from './providers/claudeCode/providerCatalogLoader';
+export * from './providers/claudeCode/runtimeRouteResolver';
+export * from './providers/claudeCode/providerRuntimeRoutePersistence';
 export * from './providers/OpenAIProvider';
 export * from './providers/OpenAICodexProvider';
 export * from './providers/OpenAICodexACPProvider';
@@ -25,6 +30,8 @@ export {
 export type { SharedMcpServerConfig, PerProviderMcpDeps } from './services/mcpServerConfig';
 export * from './services/mcpTopology';
 export * from './services/mcpTokenBudget';
+export * from './attachments/attachmentDenyMatcher';
+export * from './attachments/stagedAttachmentRegistry';
 
 // Meta-agent persona builder. Re-exported here (rather than from the root
 // barrel which would collide with `buildSystemPrompt`) so the electron-main

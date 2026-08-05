@@ -22,6 +22,8 @@
  * full document content — the CLI reads the document itself (Read for file
  * paths, the readCollabDoc MCP tool for collab:// URIs).
  */
+import type { PromptProvenance } from '@nimbalyst/runtime/ai/server/types';
+
 export interface ClaudeCliDocumentContext {
   filePath?: string | null;
   fileType?: string | null;
@@ -31,6 +33,7 @@ export interface ClaudeCliDocumentContext {
    * tolerate both (mirrors DocumentContextService.normalizeTextSelection).
    */
   textSelection?: { text?: string | null } | string | null;
+  promptProvenance?: PromptProvenance;
 }
 
 /** Extract the selection text from either supported textSelection shape. */
@@ -53,8 +56,8 @@ export interface ComposeClaudeCliInput {
 /** Selections longer than this are truncated in the PTY line (the CLI can re-read the file). */
 const MAX_SELECTION_CHARS = 2000;
 
-/** Flatten to one logical line: the composer never sends real newlines through the PTY. */
-function flattenToSingleLine(text: string): string {
+/** Context is framing, so flatten only it; never transform the logical prompt. */
+function flattenContextToSingleLine(text: string): string {
   return text.replace(/\r\n|\r|\n/g, '\\n');
 }
 
@@ -86,7 +89,7 @@ export function composeClaudeCliContextPreamble(
   }
 
   if (rawSelection) {
-    let selection = flattenToSingleLine(rawSelection);
+    let selection = flattenContextToSingleLine(rawSelection);
     if (selection.length > MAX_SELECTION_CHARS) {
       selection = `${selection.slice(0, MAX_SELECTION_CHARS)} …(selection truncated)`;
     }
@@ -102,7 +105,7 @@ export function composeClaudeCliContextPreamble(
 /**
  * Build the single-line PTY submission: `<prompt> <context block> <path1> <path2> …`.
  *
- * - No attachments/context → just the trimmed prompt.
+ * - No attachments/context → exactly the submitted prompt.
  * - Document context (NIM-818) → compact context block after the prompt.
  * - Attachments → space-separated absolute paths at the end.
  * - Attachments without a usable `filepath` are skipped.
@@ -110,20 +113,20 @@ export function composeClaudeCliContextPreamble(
  *   context alone is not a submission.
  */
 export function composeClaudeCliPtySubmission(input: ComposeClaudeCliInput): string {
-  // Flatten the typed prompt for the same reason the selection is flattened: a
-  // real newline is Enter to the CLI's readline, so a multi-line prompt submits
-  // at the first line break and the rest is lost.
-  const trimmed = flattenToSingleLine((input.prompt ?? '').trim());
+  // Bracketed paste framing in the caller preserves real newlines. Do not trim,
+  // flatten, normalize, or otherwise change the user's logical payload here.
+  const prompt = input.prompt ?? '';
 
   const paths = (input.attachments ?? [])
     .map((a) => (a && typeof a.filepath === 'string' ? a.filepath.trim() : ''))
     .filter((p) => p.length > 0);
 
-  if (!trimmed && paths.length === 0) {
+  if (!prompt.trim() && paths.length === 0) {
     return '';
   }
 
   const preamble = composeClaudeCliContextPreamble(input.documentContext);
 
-  return [trimmed, preamble, ...paths].filter((part) => part.length > 0).join(' ');
+  if (!preamble && paths.length === 0) return prompt;
+  return [prompt, preamble, ...paths].filter((part) => part.length > 0).join(' ');
 }

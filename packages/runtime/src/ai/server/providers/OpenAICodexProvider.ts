@@ -83,6 +83,14 @@ interface PendingAskUserQuestionEntry {
   sessionId: string;
 }
 
+/**
+ * Codex plugin id (`<plugin>@<marketplace>`) for the ChatGPT desktop app's
+ * bundled browser plugin. It lives in the shared `~/.codex/config.toml`, so
+ * Nimbalyst's codex sessions inherit it; see `buildCodexConfigOverrides` for why
+ * we turn it off.
+ */
+const SHADOWING_CODEX_BROWSER_PLUGIN_ID = 'browser@openai-bundled';
+
 const PERSISTED_APP_SERVER_NOTIFICATION_METHODS = new Set([
   'item/started',
   'item/completed',
@@ -90,6 +98,25 @@ const PERSISTED_APP_SERVER_NOTIFICATION_METHODS = new Set([
   'turn/failed',
   'error',
 ]);
+
+/** Preserve the protocol's paired context observation without reinterpreting usage. */
+export function projectCodexCompleteEvent(event: ProtocolEvent): StreamChunk {
+  return {
+    type: 'complete',
+    content: event.content,
+    isComplete: true,
+    usage: event.usage,
+    ...(event.contextFillTokens !== undefined
+      ? { contextFillTokens: event.contextFillTokens }
+      : {}),
+    ...(event.contextWindow !== undefined
+      ? { contextWindow: event.contextWindow }
+      : {}),
+    ...(event.contextObservation
+      ? { contextObservation: event.contextObservation }
+      : {}),
+  };
+}
 
 export class OpenAICodexProvider extends BaseAgentProvider {
   static readonly DEFAULT_MODEL = DEFAULT_MODELS['openai-codex'];
@@ -470,8 +497,20 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     ['codex-mini-latest', 'gpt-5.4-mini'],
   ]);
 
+  // NIM-428: bare flavor-tier shorthand (no `gpt-5.6-` prefix) normalizes to
+  // the matching currently-supported model rather than falling through to the
+  // unsupported-alias rejection below.
+  private static readonly SHORTHAND_MODEL_ALIASES = new Map<string, string>([
+    ['sol', 'gpt-5.6-sol'],
+    ['terra', 'gpt-5.6-terra'],
+    ['luna', 'gpt-5.6-luna'],
+  ]);
+
   /**
-   * Normalize a single model ID, mapping legacy aliases to the canonical form.
+   * Normalize a single model ID, mapping legacy/shorthand aliases to the
+   * canonical form. Throws for a model ID that is neither a known alias nor
+   * an already-supported model (NIM-393) -- callers must not dispatch a
+   * child session on an unrecognized model string.
    */
   static normalizeModelSelection(modelId: string): string {
     const normalized = modelId.trim().toLowerCase();
@@ -483,16 +522,27 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     const rawModelId = parsed && parsed.provider === 'openai-codex'
       ? parsed.model
       : modelId.replace(/^openai-codex:/, '');
-    const replacement = OpenAICodexProvider.MODEL_REPLACEMENTS.get(rawModelId.toLowerCase());
+    const rawModelIdLower = rawModelId.toLowerCase();
+
+    const replacement =
+      OpenAICodexProvider.MODEL_REPLACEMENTS.get(rawModelIdLower) ||
+      OpenAICodexProvider.SHORTHAND_MODEL_ALIASES.get(rawModelIdLower);
     if (replacement) {
       return ModelIdentifier.create('openai-codex', replacement).combined;
     }
 
-    return modelId;
+    if (OpenAICodexProvider.FALLBACK_MODELS_SET.has(rawModelIdLower)) {
+      return ModelIdentifier.create('openai-codex', rawModelIdLower).combined;
+    }
+
+    throw new Error(`Unsupported Codex model alias: "${modelId}"`);
   }
 
   /**
    * Normalize an array of model IDs, deduplicating after normalization.
+   * Entries that fail normalization (NIM-393) are dropped rather than
+   * failing the whole batch -- this is a list-cleanup helper, not a
+   * single-dispatch gate.
    */
   static normalizeModelSelections(models: string[] | undefined): string[] | undefined {
     if (!Array.isArray(models)) {
@@ -500,7 +550,12 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     }
     const result: string[] = [];
     for (const modelId of models) {
-      const mapped = OpenAICodexProvider.normalizeModelSelection(modelId);
+      let mapped: string;
+      try {
+        mapped = OpenAICodexProvider.normalizeModelSelection(modelId);
+      } catch {
+        continue;
+      }
       if (!result.includes(mapped)) {
         result.push(mapped);
       }
@@ -702,7 +757,14 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   }
 
   private static toRawModelId(modelId: string): string | null {
-    const normalizedSelection = OpenAICodexProvider.normalizeModelSelection(modelId);
+    let normalizedSelection: string;
+    try {
+      normalizedSelection = OpenAICodexProvider.normalizeModelSelection(modelId);
+    } catch {
+      // Model/API discovery lists many models we don't support (e.g. non-Codex
+      // tiers); callers already filter unrecognized ids via FALLBACK_MODELS_SET.
+      return null;
+    }
     const parsed = ModelIdentifier.tryParse(normalizedSelection);
     const rawModelId = parsed && parsed.provider === 'openai-codex'
       ? parsed.model
@@ -953,7 +1015,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     });
 
     if (sessionId) {
-      const metadataToLog: Record<string, unknown> = {};
+      const metadataToLog: Record<string, unknown> = this.withPromptProvenanceMetadata(documentContext);
       if (attachments && attachments.length > 0) {
         metadataToLog.attachments = attachments;
       }
@@ -1318,14 +1380,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
               break;
 
             case 'complete':
-              yield {
-                type: 'complete',
-                content: item.event.content,
-                isComplete: true,
-                usage: item.event.usage,
-                ...(item.event.contextFillTokens !== undefined ? { contextFillTokens: item.event.contextFillTokens } : {}),
-                ...(item.event.contextWindow !== undefined ? { contextWindow: item.event.contextWindow } : {}),
-              };
+              yield projectCodexCompleteEvent(item.event);
               break;
 
             case 'error':
@@ -1876,7 +1931,11 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     // The openai.models.list() API does not include all Codex-available models
     // (e.g., gpt-5.4 works via the SDK but isn't listed in the API).
     // The SDK itself will fail with a proper error if the model doesn't exist.
-    return OpenAICodexProvider.MODEL_REPLACEMENTS.get(normalized) || resolved;
+    return (
+      OpenAICodexProvider.MODEL_REPLACEMENTS.get(normalized) ||
+      OpenAICodexProvider.SHORTHAND_MODEL_ALIASES.get(normalized) ||
+      resolved
+    );
   }
 
   private buildCodexPrompt(options: {
@@ -1977,6 +2036,26 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       // Codex SDK documents this config flag as the switch for surfacing
       // raw agent reasoning in streamed events.
       show_raw_agent_reasoning: true,
+
+      // Codex reads the shared `~/.codex/config.toml`, which the ChatGPT desktop
+      // app writes. Its bundled `browser` plugin injects a "control-in-app-browser"
+      // skill that steers the model at ChatGPT.app's in-app browser via the
+      // `node_repl` `js` tool. That browser only exists inside ChatGPT.app, so in
+      // Nimbalyst the model dead-ends on "No browser is available" -- and never
+      // reaches for our own `mcp__nimbalyst_browser` tools, which are deferred.
+      // Disabling the plugin per-session leaves the user's ChatGPT.app config
+      // untouched.
+      //
+      // The key needs different shapes per transport: app-server takes the
+      // override map as nested JSON and looks the plugin id up verbatim, while
+      // the legacy SDK flattens it into `--config a.b.c=value` dotted TOML paths
+      // (`serializeConfigOverrides`) without quoting -- and `@` is not legal in a
+      // TOML bare key, so the SDK path has to carry its own quotes.
+      plugins: {
+        [this.transport === 'sdk'
+          ? `"${SHADOWING_CODEX_BROWSER_PLUGIN_ID}"`
+          : SHADOWING_CODEX_BROWSER_PLUGIN_ID]: { enabled: false },
+      },
     };
 
     if (Object.keys(codexMcpServers).length > 0) {

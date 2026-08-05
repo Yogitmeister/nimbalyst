@@ -73,6 +73,34 @@ describe('OpenAICodexProvider', () => {
     });
   });
 
+  describe('shadowing ChatGPT.app browser plugin', () => {
+    const protocol = {
+      platform: 'test',
+      createSession: vi.fn(),
+      resumeSession: vi.fn(),
+      forkSession: vi.fn(),
+      sendMessage: vi.fn(),
+      abortSession: vi.fn(),
+      cleanupSession: vi.fn(),
+    } as any;
+
+    it('disables browser@openai-bundled on app-server with the id verbatim', () => {
+      const provider = new OpenAICodexProvider({}, { transport: 'app-server', protocol });
+
+      expect((provider as any).buildCodexConfigOverrides({}).plugins).toEqual({
+        'browser@openai-bundled': { enabled: false },
+      });
+    });
+
+    it('quotes the plugin id for the SDK transport so the flattened TOML path is legal', () => {
+      const provider = new OpenAICodexProvider({}, { transport: 'sdk', protocol });
+
+      expect((provider as any).buildCodexConfigOverrides({}).plugins).toEqual({
+        '"browser@openai-bundled"': { enabled: false },
+      });
+    });
+  });
+
   describe('AskUserQuestion completion persistence', () => {
     function providerWithPendingQuestion(questionId: string, sessionId: string) {
       const provider = new OpenAICodexProvider({ apiKey: 'test-key' });
@@ -258,6 +286,38 @@ describe('OpenAICodexProvider', () => {
     expect(OpenAICodexProvider.normalizeModelSelection(legacyModelId)).toBe(
       `openai-codex:${canonicalModelId}`
     );
+  });
+
+  it.each([
+    ['sol', 'gpt-5.6-sol'],
+    ['terra', 'gpt-5.6-terra'],
+    ['luna', 'gpt-5.6-luna'],
+    ['openai-codex:sol', 'gpt-5.6-sol'],
+  ])('normalizes shorthand alias %s to %s (NIM-428)', (shorthand, canonicalModelId) => {
+    expect(OpenAICodexProvider.normalizeModelSelection(shorthand)).toBe(
+      `openai-codex:${canonicalModelId}`
+    );
+  });
+
+  it('passes through an already-supported model unchanged (normalized form)', () => {
+    expect(OpenAICodexProvider.normalizeModelSelection('gpt-5.4-mini')).toBe(
+      'openai-codex:gpt-5.4-mini'
+    );
+    expect(OpenAICodexProvider.normalizeModelSelection('openai-codex:gpt-5.6-sol')).toBe(
+      'openai-codex:gpt-5.6-sol'
+    );
+  });
+
+  it('rejects an unsupported Codex model alias instead of passing it through (NIM-393)', () => {
+    expect(() => OpenAICodexProvider.normalizeModelSelection('gpt-9000-nonexistent')).toThrow(
+      /Unsupported Codex model alias/
+    );
+  });
+
+  it('normalizeModelSelections drops unsupported entries instead of throwing', () => {
+    expect(
+      OpenAICodexProvider.normalizeModelSelections(['gpt-5.4-mini', 'gpt-9000-nonexistent', 'sol'])
+    ).toEqual(['openai-codex:gpt-5.4-mini', 'openai-codex:gpt-5.6-sol']);
   });
 
   it('uses SDK-provided model discovery when available', async () => {

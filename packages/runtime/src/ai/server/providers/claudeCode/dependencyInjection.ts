@@ -6,6 +6,8 @@
  * creating a direct dependency on Electron code.
  */
 
+import type { ProviderCatalogResolution } from "./providerCatalog";
+
 // ---- Type Definitions ----
 
 export type McpConfigLoader = (workspacePath?: string) => Promise<Record<string, any>>;
@@ -14,6 +16,11 @@ export type ClaudeCodeSettingsLoader = () => Promise<{ projectCommandsEnabled: b
 export type ClaudeSettingsEnvLoader = () => Promise<Record<string, string>>;
 export type ShellEnvironmentLoader = () => Record<string, string> | null;
 export type AdditionalDirectoriesLoader = (workspacePath: string) => string[];
+export type AttachmentStagingLoader = (workspacePath: string) => {
+  root: string;
+  mode: 'temp' | 'workspace' | 'custom';
+};
+export type AttachmentDenyRulesLoader = (workspacePath: string) => Promise<string[]>;
 export type PatternSaver = (workspacePath: string, pattern: string) => Promise<void>;
 export type PatternChecker = (workspacePath: string, pattern: string) => Promise<boolean>;
 export type ImageCompressor = (
@@ -22,6 +29,11 @@ export type ImageCompressor = (
   options?: { targetSizeBytes?: number }
 ) => Promise<{ buffer: Buffer; mimeType: string; wasCompressed: boolean }>;
 export type ExtensionFileTypesLoader = () => Set<string>;
+export type ProviderCredentialResolver = (
+  credentialRef: string,
+  context?: Readonly<{ workspacePath?: string }>
+) => string | undefined;
+export type ProviderCatalogResolutionLoader = () => ProviderCatalogResolution;
 
 // ---- Dependency Store ----
 
@@ -52,6 +64,13 @@ export const ClaudeCodeDeps = {
   // Returns merged user + workspace MCP servers
   mcpConfigLoader: null as McpConfigLoader | null,
 
+  // Names `mcpConfigLoader` deliberately withheld from its last result because
+  // they failed the OAuth check. Read straight after that loader resolves, so it
+  // reports the same pass. Kept off `mcpConfigLoader`'s return value because that
+  // value IS the server map handed to the SDK -- a withheld server must not be in
+  // it. See GH #1057: without this the drop is invisible to every surface.
+  mcpWithheldNamesLoader: null as ((workspacePath?: string) => string[]) | null,
+
   // Returns plugin paths from enabled extensions with Claude plugins
   // Accepts optional workspace path to include project-scoped CLI plugins
   extensionPluginsLoader: null as ExtensionPluginsLoader | null,
@@ -76,6 +95,11 @@ export const ClaudeCodeDeps = {
   // (e.g., SDK docs when working on an extension project)
   additionalDirectoriesLoader: null as AdditionalDirectoriesLoader | null,
 
+  // Resolves the host-owned attachment staging directory and effective Claude
+  // deny rules without making the runtime package depend on Electron storage.
+  attachmentStagingLoader: null as AttachmentStagingLoader | null,
+  attachmentDenyRulesLoader: null as AttachmentDenyRulesLoader | null,
+
   // ---- Security / Permissions ----
 
   // Writes tool patterns to .claude/settings.local.json when user approves with "Always"
@@ -92,6 +116,16 @@ export const ClaudeCodeDeps = {
   // Returns file extensions that have custom editors registered via extensions
   // Used in planning mode to allow editing extension-registered file types (e.g., .mockup.html)
   extensionFileTypesLoader: null as ExtensionFileTypesLoader | null,
+
+  // Resolves an already-reviewed named provider credential at the final
+  // per-spawn boundary. Catalogs, plans, receipts, and logs receive only the
+  // reference and presence bit, never the returned value.
+  providerCredentialResolver: null as ProviderCredentialResolver | null,
+
+  // Testable/process-reload boundary for the code-owned catalog snapshot.
+  // Production uses the module resolution when no loader is injected.
+  providerCatalogResolutionLoader:
+    null as ProviderCatalogResolutionLoader | null,
 
   // ---- Plan Tracking ----
 
@@ -115,6 +149,10 @@ export const ClaudeCodeDeps = {
 
   setMCPConfigLoader(loader: McpConfigLoader | null): void {
     this.mcpConfigLoader = loader;
+  },
+
+  setMcpWithheldNamesLoader(loader: ((workspacePath?: string) => string[]) | null): void {
+    this.mcpWithheldNamesLoader = loader;
   },
 
   setExtensionPluginsLoader(loader: ExtensionPluginsLoader | null): void {
@@ -141,6 +179,14 @@ export const ClaudeCodeDeps = {
     this.additionalDirectoriesLoader = loader;
   },
 
+  setAttachmentStagingLoader(loader: AttachmentStagingLoader | null): void {
+    this.attachmentStagingLoader = loader;
+  },
+
+  setAttachmentDenyRulesLoader(loader: AttachmentDenyRulesLoader | null): void {
+    this.attachmentDenyRulesLoader = loader;
+  },
+
   setClaudeSettingsPatternSaver(saver: PatternSaver | null): void {
     this.claudeSettingsPatternSaver = saver;
   },
@@ -155,6 +201,18 @@ export const ClaudeCodeDeps = {
 
   setExtensionFileTypesLoader(loader: ExtensionFileTypesLoader | null): void {
     this.extensionFileTypesLoader = loader;
+  },
+
+  setProviderCredentialResolver(
+    resolver: ProviderCredentialResolver | null
+  ): void {
+    this.providerCredentialResolver = resolver;
+  },
+
+  setProviderCatalogResolutionLoader(
+    loader: ProviderCatalogResolutionLoader | null
+  ): void {
+    this.providerCatalogResolutionLoader = loader;
   },
 
   setPlanTrackingEnabled(enabled: boolean): void {

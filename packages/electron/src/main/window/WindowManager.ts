@@ -27,6 +27,7 @@ import { ExtensionLogService } from '../services/ExtensionLogService';
 import { getMcpConfigService } from '../mcpConfigServiceRef';
 import { addNimAssetRoot } from '../protocols/nimAssetProtocol';
 import { addNimPreviewWorkspaceRoot } from '../protocols/nimPreviewProtocol';
+import { scheduleAttachmentStagingCleanup } from '../services/attachments/attachmentStagingCleanup';
 import { windows, windowStates, anyWindowReferencesWorkspace, resolveDocumentServicePath, getWindowIdForWindow } from './windowState';
 import { shouldSaveSessionOnWindowClose } from './sessionSaveOnClose';
 import {
@@ -147,6 +148,12 @@ app.on('before-quit', () => {
   isQuitting = true;
 });
 
+/** True once `before-quit` has fired. Callers that create windows lazily
+ *  (e.g. auto-opening a project to deliver a queued prompt) must check this. */
+export function isAppQuitting(): boolean {
+  return isQuitting;
+}
+
 // Get focused window or create new one
 export function getFocusedOrNewWindow(): BrowserWindow {
     const focusedWindow = BrowserWindow.getFocusedWindow();
@@ -176,17 +183,7 @@ export function createWindow(
     try {
         // console.log('[MAIN] Creating window at', new Date().toISOString());
 
-        // Set up icon path - icon.png is at the package root in both dev and packaged builds
-        // (included in electron-builder's `files` array, so it's inside the ASAR at the root)
-        let iconPath: string | undefined = join(app.getAppPath(), 'icon.png');
-
-        // Check if icon exists
-        if (!existsSync(iconPath)) {
-            console.log('[MAIN] Icon not found at:', iconPath);
-            iconPath = undefined;
-        } else {
-            // console.log('[MAIN] Using icon at:', iconPath);
-        }
+        const iconPath = resolveWindowIconPath();
 
         // Calculate window position with cascading effect
         let x: number | undefined;
@@ -299,6 +296,7 @@ export function createWindow(
         if (isWorkspaceMode && workspacePath) {
             addNimAssetRoot(workspacePath);
             addNimPreviewWorkspaceRoot(workspacePath);
+            scheduleAttachmentStagingCleanup(workspacePath);
         }
         if (isWorkspaceMode && workspacePath) {
             if (!documentServices.has(workspacePath)) {
@@ -739,6 +737,26 @@ export function createWindow(
         console.error('Error creating window:', error);
         throw error;
     }
+}
+
+function resolveWindowIconPath(): string | undefined {
+    const candidates = [
+        // Windows taskbar/window chrome needs the packaged ICO. In unpacked
+        // builds this lives next to app.asar under resources.
+        ...(process.platform === 'win32' ? [join(process.resourcesPath, 'icon.ico')] : []),
+        // Packaged ASAR currently carries nimbalyst-logo.png, not icon.png.
+        join(app.getAppPath(), 'nimbalyst-logo.png'),
+        join(app.getAppPath(), 'icon.png'),
+    ];
+
+    for (const candidate of candidates) {
+        if (candidate && existsSync(candidate)) {
+            return candidate;
+        }
+    }
+
+    console.log('[MAIN] Window icon not found in candidates:', candidates);
+    return undefined;
 }
 
 // Find window by file path

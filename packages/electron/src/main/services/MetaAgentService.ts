@@ -9,7 +9,7 @@ import {
   type ClaudeCodeBackend,
 } from '@nimbalyst/runtime/ai/server';
 import { preflightOllamaClaudeCodeBackend } from './ai/OllamaClaudeCodePreflight';
-import type { AIProviderType } from '@nimbalyst/runtime/ai/server/types';
+import type { AIProviderType, PromptProvenance } from '@nimbalyst/runtime/ai/server/types';
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
 import type { EffortLevel, ThinkingMode } from '@nimbalyst/runtime/ai/server/effortLevels';
 import {
@@ -43,6 +43,7 @@ import {
   type PriorityControlPrompt,
   type PriorityTargetState,
 } from './PriorityPromptDeliveryService';
+import { composeNotificationTitle } from '../../shared/notificationTitle';
 
 type SessionStatusValue = 'idle' | 'running' | 'waiting_for_input' | 'error' | 'interrupted';
 type PromptType = 'permission_request' | 'ask_user_question_request' | 'exit_plan_mode_request';
@@ -93,7 +94,7 @@ interface CreateChildSessionArgs {
   toolScope?: SessionLaunchToolScope;
   effortLevel?: EffortLevel;
   thinkingMode?: ThinkingMode;
-  /** Explicit Ollama Claude-Agent backend profile id (see customBackends.ts). */
+  /** Explicit reviewed Claude-Agent catalog backend/profile id. */
   claudeCodeBackend?: string;
 }
 
@@ -101,7 +102,8 @@ interface CreateChildSessionArgs {
  * Public MCP response projection of a resolved backend -- deliberately more
  * stable/abstracted than the internal registry shape (ClaudeCodeBackend) so a
  * future non-LiteLLM transport doesn't have to change the public shape. Drops
- * internal-only fields (upstreamBaseUrl, authToken) and renames the
+ * internal-only route/credential fields (upstreamBaseUrl, baseUrl, authToken)
+ * and renames the
  * Claude-facing alias to downstreamAlias, which reads clearer from the
  * caller's point of view than the internal "claudeModelAlias".
  */
@@ -109,11 +111,10 @@ interface PublicClaudeCodeBackend {
   id: string;
   persistedModel: string;
   transportProfile: 'litellm';
-  provider: 'ollama';
+  provider: ClaudeCodeBackend['provider'];
   model: string;
   upstreamModel: string;
   downstreamAlias: string;
-  baseUrl: string;
 }
 
 function toPublicClaudeCodeBackend(backend: ClaudeCodeBackend): PublicClaudeCodeBackend {
@@ -125,7 +126,6 @@ function toPublicClaudeCodeBackend(backend: ClaudeCodeBackend): PublicClaudeCode
     model: backend.model,
     upstreamModel: backend.upstreamModel,
     downstreamAlias: backend.claudeModelAlias,
-    baseUrl: backend.baseUrl,
   };
 }
 
@@ -169,8 +169,8 @@ interface ResolvedChildModel {
   normalizedModel: string;
   providerSource: SessionLaunchValueSource;
   modelSource: SessionLaunchValueSource;
-  /** Present only for a claude-code child routed through a non-Anthropic
-   *  (currently Ollama) backend. Absent means an ordinary Anthropic session. */
+  /** Present only for a claude-code child routed through a reviewed
+   *  non-Anthropic catalog backend. Absent means an ordinary Anthropic session. */
   claudeCodeBackend?: ClaudeCodeBackend;
 }
 
@@ -267,9 +267,9 @@ async function resolveChildSessionModelAndProvider(
     finalModelSource = 'requested';
   }
 
-  // Only consult backend resolution when there is an actual Ollama signal
-  // (an explicit backend id, or a canonical model that already carries the
-  // ollama-* identity). The overwhelming majority of child sessions are
+  // Only consult backend resolution when there is an explicit catalog profile
+  // or a canonical model that already carries the legacy ollama-* identity.
+  // The overwhelming majority of child sessions are
   // ordinary Anthropic/openai-codex/extension-agent spawns with neither, and
   // skipping the call for them keeps this path a no-op dependency for those
   // sessions -- matching every other call site in this file, which resolves
@@ -331,7 +331,7 @@ interface SpawnSessionArgs {
   toolScope?: SessionLaunchToolScope;
   effortLevel?: EffortLevel;
   thinkingMode?: ThinkingMode;
-  /** Explicit Ollama Claude-Agent backend profile id (see customBackends.ts). */
+  /** Explicit reviewed Claude-Agent catalog backend/profile id. */
   claudeCodeBackend?: string;
   /**
    * Records explicit inheritance intent in launch provenance. The current
@@ -400,7 +400,11 @@ export class MetaAgentService {
     );
   }
 
-  private async persistSyntheticInputMessage(sessionId: string, prompt: string): Promise<void> {
+  private async persistSyntheticInputMessage(
+    sessionId: string,
+    prompt: string,
+    promptProvenance?: PromptProvenance,
+  ): Promise<void> {
     await AgentMessagesRepository.create({
       sessionId,
       source: 'nimbalyst-meta-agent',
@@ -408,6 +412,7 @@ export class MetaAgentService {
       content: prompt,
       createdAt: new Date(),
       searchable: true,
+      metadata: promptProvenance ? { promptProvenance } : undefined,
     });
   }
 
@@ -449,6 +454,8 @@ export class MetaAgentService {
           this.sendPromptNowToSession(metaSessionId, workspaceId, args),
         notifyUser: (callerSessionId, workspaceId, args) =>
           this.notifyUserJson(callerSessionId, workspaceId, args),
+        compactSession: (callerSessionId, workspaceId, args) =>
+          this.compactSessionJson(callerSessionId, workspaceId, args),
         respondToPrompt: (metaSessionId, workspaceId, args) =>
           this.respondToPrompt(metaSessionId, workspaceId, args),
         listSpawnedSessions: (metaSessionId, workspaceId) =>
@@ -888,10 +895,15 @@ export class MetaAgentService {
     const shouldBypassExecution = this.shouldBypassChildAgentExecutionForTests();
 
     if (initialPrompt) {
+      const promptProvenance: PromptProvenance = {
+        actor: 'agent',
+        origin: 'session-orchestration',
+        originSessionId: metaSessionId,
+      };
       if (shouldBypassExecution) {
-        await this.persistSyntheticInputMessage(sessionId, initialPrompt);
+        await this.persistSyntheticInputMessage(sessionId, initialPrompt, promptProvenance);
       } else {
-        await this.aiService.queuePromptForSession(sessionId, initialPrompt);
+        await this.aiService.queuePromptForSession(sessionId, initialPrompt, undefined, { promptProvenance });
       }
     }
 
@@ -921,7 +933,7 @@ export class MetaAgentService {
     }
 
     if (initialPrompt && !shouldBypassExecution) {
-      await this.aiService.triggerQueuedPromptProcessingForSession(sessionId, worktreePath || workspaceId);
+      await this.aiService.triggerQueuedPromptProcessingForSession(sessionId, worktreePath || workspaceId, 'meta-agent');
     }
 
     return {
@@ -1243,6 +1255,19 @@ export class MetaAgentService {
       includeCompleted: options.includeCompleted === true,
       prompts: prompts.map((prompt) => ({
         id: prompt.id,
+        clientSubmissionId: prompt.clientSubmissionId ?? prompt.id,
+        sourceSessionId: prompt.sourceSessionId ?? prompt.sessionId,
+        sourceRoomId: prompt.sourceRoomId ?? prompt.sessionId,
+        submissionSequence: prompt.submissionSequence ?? null,
+        producer: prompt.producer ?? null,
+        payloadReceipt: prompt.payloadReceipt ?? null,
+        claimTrigger: prompt.claimTrigger ?? null,
+        claimTriggeredAt: prompt.claimTriggeredAt ?? null,
+        turnId: prompt.turnId ?? null,
+        providerInputMessageId: prompt.providerInputMessageId ?? null,
+        providerOutputMessageId: prompt.providerOutputMessageId ?? null,
+        terminalStatus: prompt.terminalStatus ?? null,
+        terminalAt: prompt.terminalAt ?? null,
         status: prompt.status,
         createdAt: prompt.createdAt,
         claimedAt: prompt.claimedAt ?? null,
@@ -1251,7 +1276,6 @@ export class MetaAgentService {
         deliveryClass: prompt.deliveryClass,
         priorityRank: prompt.priorityRank,
         deliveryReady: prompt.deliveryReady,
-        producer: prompt.producer ?? null,
         idempotencyKey: prompt.idempotencyKey ?? null,
         controlOperation: prompt.controlOperation ?? null,
         interruptTargetGeneration: prompt.interruptTargetGeneration ?? null,
@@ -1284,6 +1308,11 @@ export class MetaAgentService {
     );
 
     const normalizedPrompt = prompt.trim();
+    const promptProvenance: PromptProvenance = {
+      actor: 'agent',
+      origin: 'session-orchestration',
+      originSessionId: callerSessionId,
+    };
     const shouldBypassExecution = this.shouldBypassChildAgentExecutionForTests();
     const statusRow = await this.getSessionStatusRow(sessionId, session.workspacePath);
     const statusBeforeQueue = (statusRow?.status || 'idle') as SessionStatusValue;
@@ -1300,14 +1329,20 @@ export class MetaAgentService {
       }, null, 2);
     }
 
-    const queued = await this.aiService.queuePromptForSession(sessionId, normalizedPrompt);
+    const queued = await this.aiService.queuePromptForSession(
+      sessionId,
+      normalizedPrompt,
+      undefined,
+      { promptProvenance },
+    );
     const status = (statusRow?.status || 'idle') as SessionStatusValue;
     const processingTriggered = status === 'idle' || status === 'interrupted' || status === 'error';
 
     if (processingTriggered) {
       await this.aiService.triggerQueuedPromptProcessingForSession(
         sessionId,
-        session.worktreePath || session.workspacePath
+        session.worktreePath || session.workspacePath,
+        'meta-agent'
       );
     }
 
@@ -1346,11 +1381,14 @@ export class MetaAgentService {
     }
 
     const boundedBody = body.length > 1000 ? `${body.slice(0, 997)}...` : body;
+    const rawSourceLabel = session.title || session.provider || `Session ${targetSessionId.slice(0, 8)}`;
+    const sourceLabel = rawSourceLabel.trim().slice(0, 60) || `Session ${targetSessionId.slice(0, 8)}`;
     const result = await this.showNotificationWithResult({
-      title: title.length > 120 ? `${title.slice(0, 117)}...` : title,
+      title: composeNotificationTitle(sourceLabel, title),
       body: boundedBody,
       sessionId: targetSessionId,
       workspacePath: session.workspacePath,
+      sourceLabel,
       provider: 'agent',
       bypassFocusCheck: args.bypassFocusCheck === true,
       silent: args.silent === true,
@@ -1365,6 +1403,56 @@ export class MetaAgentService {
       bypassFocusCheck: args.bypassFocusCheck === true,
       result,
     }, null, 2);
+  }
+
+  /**
+   * Compact a session's conversation directly -- the reliable counterpart to
+   * sending a literal "/compact" prompt through the queue. Defaults to the
+   * calling session (self-compaction) when sessionId is omitted, matching
+   * notifyUserJson's self-targeting convention. Reports whether compaction
+   * actually ran via the structured `contextCompacted` flag threaded through
+   * from the provider's own stream chunk (MessageStreamingHandler's
+   * `chunk.contextCompacted`, the same signal a normal turn uses to clear
+   * stale context-fill metadata) -- never inferred from a text/substring
+   * match on the response, which can false-positive on ordinary chat text
+   * that happens to mention compaction, or false-negative on a differently
+   * worded provider message.
+   */
+  private async compactSessionJson(
+    callerSessionId: string,
+    workspaceId: string,
+    args: { sessionId?: string; focus?: string }
+  ): Promise<string> {
+    if (!this.aiService) {
+      throw new Error('AI service not initialized');
+    }
+
+    const targetSessionId = args.sessionId?.trim() || callerSessionId;
+    const session = await AISessionsRepository.get(targetSessionId);
+    if (!session || session.workspacePath !== workspaceId) {
+      throw new Error(`Session ${targetSessionId} not found`);
+    }
+
+    const focus = args.focus?.trim();
+    const prompt = focus ? `/compact focus on ${focus}` : '/compact';
+
+    try {
+      const result = await this.aiService.sendMessageDirect(targetSessionId, workspaceId, prompt);
+      const compacted = result.contextCompacted === true;
+      return JSON.stringify({
+        sessionId: targetSessionId,
+        prompt,
+        compacted,
+        response: result.content.slice(0, 500),
+      }, null, 2);
+    } catch (error) {
+      return JSON.stringify({
+        sessionId: targetSessionId,
+        prompt,
+        compacted: false,
+        error: error instanceof Error ? error.message : String(error),
+      }, null, 2);
+    }
   }
 
   private async respondToPrompt(callerSessionId: string, workspaceId: string, args: {
@@ -1523,7 +1611,18 @@ export class MetaAgentService {
       }
 
       const notification = this.buildNotificationMessage(eventType, result);
-      await this.aiService.queuePromptForSession(session.createdBySessionId, notification);
+      await this.aiService.queuePromptForSession(
+        session.createdBySessionId,
+        notification,
+        undefined,
+        {
+          promptProvenance: {
+            actor: 'agent',
+            origin: 'child-session-update',
+            originSessionId: session.id,
+          },
+        },
+      );
 
       // Do not auto-re-drive the parent when THIS child settle was an error.
       // The [Child Session Update] notification above is still queued for
@@ -1532,7 +1631,7 @@ export class MetaAgentService {
       // child settles instantly into 'error' every cycle). Native children
       // settle 'session:completed', so this gate is a no-op for them.
       if (eventType !== 'session:error' && (metaStatus === 'idle' || metaStatus === 'interrupted' || metaStatus === 'error')) {
-        await this.aiService.triggerQueuedPromptProcessingForSession(metaSession.id, metaSession.workspacePath);
+        await this.aiService.triggerQueuedPromptProcessingForSession(metaSession.id, metaSession.workspacePath, 'meta-agent');
       }
     } catch (error) {
       console.error(`[MetaAgentService] handleChildSessionEvent failed for session ${sessionId} (${eventType}):`, error);
@@ -1551,7 +1650,14 @@ export class MetaAgentService {
     ];
 
     if (result.originalPrompt) {
-      lines.push(`Original task: ${result.originalPrompt}`);
+      // Cap the echo -- a long parent task prompt must not blow up the
+      // notification unbounded. Matches extractLastAgentResponse's preview
+      // cap (500 chars + ellipsis) used for the sibling "Last response" line.
+      const ORIGINAL_PROMPT_PREVIEW_LENGTH = 500;
+      const promptPreview = result.originalPrompt.length > ORIGINAL_PROMPT_PREVIEW_LENGTH
+        ? `${result.originalPrompt.slice(0, ORIGINAL_PROMPT_PREVIEW_LENGTH)}...`
+        : result.originalPrompt;
+      lines.push(`Original task: ${promptPreview}`);
     }
     if (result.recentMessages.length > 0) {
       lines.push('Recent messages:');
