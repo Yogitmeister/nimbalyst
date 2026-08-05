@@ -1877,8 +1877,12 @@ export class MetaAgentService {
         await queueStore.recordPriorityInterruptReceipt(input) as unknown as PriorityControlPrompt,
       interruptCurrentTurn: (targetSessionId, expectedState) =>
         this.aiService!.interruptCurrentTurnForSession(targetSessionId, expectedState),
+      // Explicit 'meta-agent' reason: this wrapper backs send_prompt_now's priority
+      // delivery path. Omitting it silently fell through to triggerQueuedPromptProcessingForSession's
+      // default DriveReason ('renderer-trigger'), mislabeling every meta-agent-driven
+      // priority prompt as a renderer-originated one in drive telemetry/diagnostics.
       triggerProcessing: (targetSessionId, targetWorkspaceId) =>
-        this.aiService!.triggerQueuedPromptProcessingForSession(targetSessionId, targetWorkspaceId),
+        this.aiService!.triggerQueuedPromptProcessingForSession(targetSessionId, targetWorkspaceId, 'meta-agent'),
       getControlPrompt: async (promptId) =>
         await queueStore.get(promptId) as unknown as PriorityControlPrompt | null,
     });
