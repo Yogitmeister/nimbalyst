@@ -44,9 +44,12 @@ test('derives future headless domains from package exports and excludes UI entri
     './trackers-ui': { default: './src/trackers-ui/index.ts' },
   }, '/repo/packages/collab-client');
 
+  // path.resolve is platform-native (backslashes on Windows); assert against its own
+  // output rather than a hardcoded POSIX literal so this passes on any dev platform,
+  // not just the POSIX CI runner it was originally written against.
   assert.deepEqual(entries, {
-    core: '/repo/packages/collab-client/src/core/index.ts',
-    docs: '/repo/packages/collab-client/src/docs/index.ts',
-    trackers: '/repo/packages/collab-client/src/trackers/index.ts',
+    core: path.resolve('/repo/packages/collab-client', './src/core/index.ts'),
+    docs: path.resolve('/repo/packages/collab-client', './src/docs/index.ts'),
+    trackers: path.resolve('/repo/packages/collab-client', './src/trackers/index.ts'),
   });
 });

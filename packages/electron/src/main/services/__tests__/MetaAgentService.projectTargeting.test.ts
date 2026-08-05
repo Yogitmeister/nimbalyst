@@ -174,6 +174,15 @@ const targetChild = {
 
 describe('MetaAgentService project-targeted session routing (NIM-408)', () => {
   beforeEach(() => {
+    // MetaAgentService.getInstance() is a bare singleton with no reset hook, so
+    // internal state from an earlier test in this file (e.g. real, non-mocked
+    // getPriorityTargetState generation/lease tracking for a reused sessionId
+    // like 'target-child') otherwise leaks into this test and changes which
+    // branch PriorityPromptDeliveryService.deliver() takes -- reproduced 2026-08-05:
+    // "routes send_prompt_now..." only fails when run after earlier tests in this
+    // file touch the same sessionId, passes in isolation. Test-file-local reset,
+    // not a production API change.
+    (MetaAgentService as any).instance = null;
     vi.restoreAllMocks();
     hasLiveWindowForWorkspaceMock.mockReset();
     createWorktreeMock.mockReset();
@@ -490,6 +499,7 @@ describe('MetaAgentService project-targeted session routing (NIM-408)', () => {
     expect(triggerQueuedPromptProcessingForSession).toHaveBeenCalledWith(
       'target-child',
       '/project-b_worktrees/safe-route',
+      'meta-agent',
     );
 
     await (service as any).respondToPrompt('caller', '/project-a', {
@@ -552,6 +562,7 @@ describe('MetaAgentService project-targeted session routing (NIM-408)', () => {
     expect(triggerQueuedPromptProcessingForSession).toHaveBeenCalledWith(
       'target-child',
       '/project-b_worktrees/safe-route',
+      'meta-agent',
     );
 
     await expect((service as any).sendPromptNowToSession(

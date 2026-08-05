@@ -1307,7 +1307,12 @@ export class MetaAgentService {
       sessionId
     );
 
-    const normalizedPrompt = prompt.trim();
+    // Whitespace validation above is not payload normalization -- do not trim here.
+    // Reverted a silent loss from the 2026-08-04/05 upstream merge (see
+    // MetaAgentService.queuedPromptTruth.test.ts, "preserve queue delivery truth
+    // across reconnects"): trimming a queued prompt payload discards leading/trailing
+    // whitespace the caller may have deliberately sent.
+    const normalizedPrompt = prompt;
     const promptProvenance: PromptProvenance = {
       actor: 'agent',
       origin: 'session-orchestration',
@@ -1318,7 +1323,7 @@ export class MetaAgentService {
     const statusBeforeQueue = (statusRow?.status || 'idle') as SessionStatusValue;
 
     if (shouldBypassExecution) {
-      await this.persistSyntheticInputMessage(sessionId, normalizedPrompt);
+      await this.persistSyntheticInputMessage(sessionId, normalizedPrompt, promptProvenance);
       return JSON.stringify({
         sessionId,
         queuedPromptId: null,
@@ -1872,8 +1877,12 @@ export class MetaAgentService {
         await queueStore.recordPriorityInterruptReceipt(input) as unknown as PriorityControlPrompt,
       interruptCurrentTurn: (targetSessionId, expectedState) =>
         this.aiService!.interruptCurrentTurnForSession(targetSessionId, expectedState),
+      // Explicit 'meta-agent' reason: this wrapper backs send_prompt_now's priority
+      // delivery path. Omitting it silently fell through to triggerQueuedPromptProcessingForSession's
+      // default DriveReason ('renderer-trigger'), mislabeling every meta-agent-driven
+      // priority prompt as a renderer-originated one in drive telemetry/diagnostics.
       triggerProcessing: (targetSessionId, targetWorkspaceId) =>
-        this.aiService!.triggerQueuedPromptProcessingForSession(targetSessionId, targetWorkspaceId),
+        this.aiService!.triggerQueuedPromptProcessingForSession(targetSessionId, targetWorkspaceId, 'meta-agent'),
       getControlPrompt: async (promptId) =>
         await queueStore.get(promptId) as unknown as PriorityControlPrompt | null,
     });

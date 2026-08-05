@@ -143,7 +143,10 @@ function configCarriesProxy(argument, initializers, seen = new Set()) {
 export function findUnproxiedSyncSockets(files = listSourceFiles(rendererRoot)) {
   const violations = [];
   for (const file of files) {
-    const relative = path.relative(rendererRoot, file);
+    // path.relative is platform-native (backslashes on Windows); ALLOWLIST entries are
+    // written POSIX-style, so normalize before comparing or the allowlist silently never
+    // matches on Windows and a legitimately-exempted file gets flagged as a violation.
+    const relative = path.relative(rendererRoot, file).split(path.sep).join('/');
     if (ALLOWLIST.some((entry) => entry.file === relative)) continue;
     const text = readFileSync(file, 'utf8');
     const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
