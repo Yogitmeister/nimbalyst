@@ -36,17 +36,18 @@ test('current core and docs entry graphs satisfy the boundary', () => {
 });
 
 test('derives future headless domains from package exports and excludes UI entries', () => {
+  const packageRoot = '/repo/packages/collab-client';
   const entries = deriveCollabClientHeadlessEntryPoints({
     './core': { default: './src/core/index.ts' },
     './docs': { default: './src/docs/index.ts' },
     './docs-ui': { default: './src/docs-ui/index.ts' },
     './trackers': { default: './src/trackers/index.ts' },
     './trackers-ui': { default: './src/trackers-ui/index.ts' },
-  }, '/repo/packages/collab-client');
+  }, packageRoot);
 
   assert.deepEqual(entries, {
-    core: '/repo/packages/collab-client/src/core/index.ts',
-    docs: '/repo/packages/collab-client/src/docs/index.ts',
-    trackers: '/repo/packages/collab-client/src/trackers/index.ts',
+    core: path.resolve(packageRoot, './src/core/index.ts'),
+    docs: path.resolve(packageRoot, './src/docs/index.ts'),
+    trackers: path.resolve(packageRoot, './src/trackers/index.ts'),
   });
 });
