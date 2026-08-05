@@ -19,6 +19,7 @@ import {
   applyProviderRuntimeLaunchPlanEnv,
   omitEnvironmentKeysCaseInsensitive,
   resolveClaudeCodeBackendForConfig,
+  scrubAmbientProviderRouteEnv,
 } from './customBackends';
 import {
   ProviderRuntimeRouteError,
@@ -578,6 +579,15 @@ export async function buildSdkOptions(
   };
 
   if (!mainRoutePlan && config.customBackend === DEEPSEEK_CLAUDE_BACKEND_ID) {
+    // Scrub ambient OAuth/provider-route keys before pinning the DeepSeek route.
+    // Without this, the user's real CLAUDE_CODE_OAUTH_TOKEN / refresh token /
+    // CLAUDE_BRIDGE_OAUTH_TOKEN (legitimate for Anthropic sessions, so not
+    // bootstrap-stripped) survive into the spawn and the SDK attempts OAuth
+    // against api.deepseek.com/anthropic -- a host that serves no OAuth endpoint
+    // -- producing the red("not logged in") -> green(auto-relogin) -> red loop.
+    // DeepSeek-specific keys are re-pinned below after the scrub. Mirrors the
+    // scrub-then-set order applyClaudeCodeBackendEnv uses for catalog routes.
+    scrubAmbientProviderRouteEnv(env);
     delete env.ANTHROPIC_API_KEY;
     env.ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
     // Key comes from .env only, never from settings JSON (Yogev, 2026-07-30) --

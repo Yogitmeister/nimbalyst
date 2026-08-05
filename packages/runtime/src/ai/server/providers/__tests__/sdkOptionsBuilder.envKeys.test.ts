@@ -31,7 +31,20 @@ vi.mock('../../../../electron/claudeCodeEnvironment', () => ({
   resolveNativeBinaryPath: () => undefined,
 }));
 
+// The DeepSeek-direct (claude-code:deepseek) path reads its API key from the
+// dev .env via readDeepSeekApiKeyFromEnvFile(). Stub it to a deterministic fake
+// so the Mechanism A scrub test never reads a real DEEPSEEK_API_KEY from disk.
+// All other exports (profile, constants, normalizers) stay real.
+vi.mock('../../deepSeekClaudeAgent', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../deepSeekClaudeAgent')>();
+  return { ...actual, readDeepSeekApiKeyFromEnvFile: () => 'sk-deepseek-test-key' };
+});
+
 import { buildSdkOptions } from '../claudeCode/sdkOptionsBuilder';
+import {
+  applyDeepSeekClaudeAgentProfile,
+  DEEPSEEK_CLAUDE_AGENT_MODEL_ID,
+} from '../../deepSeekClaudeAgent';
 import {
   OLLAMA_GLM_5_2_CLOUD_BACKEND_ID,
   PROVIDER_CATALOG_RESOLUTION,
@@ -422,5 +435,86 @@ describe('buildSdkOptions env-key hardening', () => {
     );
 
     expect(options.env.ENABLE_TOOL_SEARCH).toBe('false');
+  });
+
+  // The DeepSeek-direct route (model id `claude-code:deepseek`, the legacy
+  // picker identity still emitted by mobile) takes Mechanism A in buildSdkOptions:
+  // it sets ANTHROPIC_BASE_URL to api.deepseek.com/anthropic and the DeepSeek API
+  // key, but -- unlike the catalog/Ollama routes -- historically did NOT call
+  // scrubAmbientProviderRouteEnv. The user's real OAuth tokens (legitimate for
+  // Anthropic sessions, so not bootstrap-stripped) then rode into the DeepSeek
+  // spawn, the SDK attempted OAuth against a host that serves no OAuth endpoint,
+  // and the session looped red ("not logged in") -> green (auto-relogin against
+  // Anthropic) -> red. These tests pin the ambient-OAuth scrub for that route.
+  describe('DeepSeek-direct route (claude-code:deepseek) — ambient OAuth scrub', () => {
+    const oauthKeys = [
+      'CLAUDE_CODE_OAUTH_TOKEN',
+      'CLAUDE_CODE_OAUTH_REFRESH_TOKEN',
+      'CLAUDE_BRIDGE_OAUTH_TOKEN',
+      'ANTHROPIC_AUTH_TOKEN',
+    ] as const;
+    let savedOauth: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      savedOauth = {};
+      for (const key of oauthKeys) savedOauth[key] = process.env[key];
+      // Simulate a host that is logged in to Claude Code: OAuth tokens are
+      // present in process.env and are NOT in the bootstrap API-key strip list.
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'ambient-oauth-token';
+      process.env.CLAUDE_CODE_OAUTH_REFRESH_TOKEN = 'ambient-refresh';
+      process.env.CLAUDE_BRIDGE_OAUTH_TOKEN = 'ambient-bridge';
+      process.env.ANTHROPIC_AUTH_TOKEN = 'ambient-anthropic-token';
+    });
+
+    afterEach(() => {
+      for (const key of oauthKeys) {
+        if (savedOauth[key] === undefined) delete process.env[key];
+        else process.env[key] = savedOauth[key];
+      }
+    });
+
+    it('strips ambient OAuth tokens from the DeepSeek-direct spawn env (auth-drop fix)', async () => {
+      // applyDeepSeekClaudeAgentProfile is what ClaudeCodeProvider runs before
+      // buildSdkOptions; it maps the picker model to customBackend=deepseek-v4.
+      const config = applyDeepSeekClaudeAgentProfile({
+        model: DEEPSEEK_CLAUDE_AGENT_MODEL_ID,
+        effortLevel: 'high',
+        thinkingMode: 'enabled',
+      });
+
+      const { options } = await buildSdkOptions(
+        makeDeps({ config }),
+        makeParams(),
+      );
+
+      // The route is the DeepSeek Anthropic-format endpoint.
+      expect(options.env.ANTHROPIC_BASE_URL).toBe('https://api.deepseek.com/anthropic');
+      // The DeepSeek API key (stubbed) wins over any ambient auth token.
+      expect(options.env.ANTHROPIC_AUTH_TOKEN).toBe('sk-deepseek-test-key');
+      // Ambient OAuth tokens that cause the red->green->red auth-drop loop must
+      // be absent so the SDK does not attempt OAuth against the DeepSeek base URL.
+      expect(options.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+      expect(options.env.CLAUDE_CODE_OAUTH_REFRESH_TOKEN).toBeUndefined();
+      expect(options.env.CLAUDE_BRIDGE_OAUTH_TOKEN).toBeUndefined();
+    });
+
+    it('still forwards the resolved DeepSeek effort and thinking selection', async () => {
+      const config = applyDeepSeekClaudeAgentProfile({
+        model: DEEPSEEK_CLAUDE_AGENT_MODEL_ID,
+        effortLevel: 'max',
+        thinkingMode: 'disabled',
+      });
+
+      const { options } = await buildSdkOptions(
+        makeDeps({ config }),
+        makeParams(),
+      );
+
+      expect(options.env.ANTHROPIC_BASE_URL).toBe('https://api.deepseek.com/anthropic');
+      expect(options.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('max');
+      expect(options.thinking).toEqual({ type: 'disabled' });
+      // Scrub must not regress the effort control.
+      expect(options.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    });
   });
 });
