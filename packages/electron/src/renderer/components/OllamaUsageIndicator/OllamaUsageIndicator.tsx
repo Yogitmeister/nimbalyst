@@ -8,7 +8,7 @@
  * account-usage API responds. See ollamaUsageAtoms.ts for the exact split.
  */
 
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useMemo } from 'react';
 import { useAtomValue } from 'jotai';
 import {
   ollamaUsageAtom,
@@ -52,6 +52,22 @@ export const OllamaUsageIndicator: React.FC<OllamaUsageIndicatorProps> = ({ clas
   const utilization = hasLoadError ? 0 : usage?.weekly?.utilization ?? 0;
   const strokeDashoffset = RING_CIRCUMFERENCE * (1 - utilization / 100);
   const limitsAvailable = !hasLoadError && (usage?.limitsAvailable ?? false);
+
+  // Calculate elapsed percentage for the stripe (when both start and end are available)
+  const elapsedPercent = useMemo(() => {
+    const window_ = usage?.weekly;
+    if (!window_ || !window_.windowStart || !window_.windowEnd) return null;
+    try {
+      const start = new Date(window_.windowStart).getTime();
+      const end = new Date(window_.windowEnd).getTime();
+      const now = Date.now();
+      if (end <= start) return null;
+      const elapsed = Math.max(0, Math.min(1, (now - start) / (end - start)));
+      return Math.round(elapsed * 100);
+    } catch {
+      return null;
+    }
+  }, [usage?.weekly]);
 
   const colorClasses: Record<string, string> = {
     green: 'stroke-green-500',

@@ -6,7 +6,7 @@
  * info. Mirrors GeminiUsagePopover.tsx's structure.
  */
 
-import React, { useEffect, RefObject } from 'react';
+import React, { useEffect, RefObject, useMemo } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime';
 import {
@@ -43,6 +43,21 @@ const UsageSection: React.FC<UsageSectionProps> = ({ title, window, color }) => 
     .sort((a, b) => b.requestCount - a.requestCount)
     .slice(0, 3);
 
+  // Calculate elapsed percentage for the stripe (when both start and end are available)
+  const elapsedPercent = useMemo(() => {
+    if (!window.windowStart || !window.windowEnd) return null;
+    try {
+      const start = new Date(window.windowStart).getTime();
+      const end = new Date(window.windowEnd).getTime();
+      const now = Date.now();
+      if (end <= start) return null;
+      const elapsed = Math.max(0, Math.min(1, (now - start) / (end - start)));
+      return Math.round(elapsed * 100);
+    } catch {
+      return null;
+    }
+  }, [window.windowStart, window.windowEnd]);
+
   return (
     <div className="mb-4 last:mb-0">
       <div className="flex justify-between items-baseline mb-1">
@@ -57,6 +72,15 @@ const UsageSection: React.FC<UsageSectionProps> = ({ title, window, color }) => 
           style={{ width: `${Math.min(window.utilization, 100)}%` }}
         />
       </div>
+      {elapsedPercent !== null && (
+        <div className="relative h-0.5 bg-nim-tertiary rounded-full overflow-hidden mb-1.5">
+          <div
+            className="h-full rounded-full bg-nim-muted"
+            style={{ width: `${elapsedPercent}%` }}
+          />
+          <div className="absolute left-0 top-0 h-full w-1 bg-nim-muted opacity-50" />
+        </div>
+      )}
       {window.resetsAt ? (
         <div className="flex items-center gap-1 text-[11px] text-nim-muted">
           <MaterialSymbol icon="schedule" size={12} className="opacity-70" />
