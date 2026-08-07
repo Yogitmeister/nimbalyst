@@ -50,6 +50,8 @@
 import { BrowserWindow } from 'electron';
 import { logger } from '../utils/logger';
 import { getShellEnvironment } from './CLIManager';
+import { getOllamaCookie } from './OllamaCookieService';
+import { fetchOllamaResetTimes, OllamaResetTimeResult } from './OllamaResetTimeScraper';
 
 type OllamaEnv = Record<string, string | undefined>;
 
@@ -156,6 +158,12 @@ class OllamaUsageServiceImpl {
   private lastActivityTime = 0;
   private isPolling = false;
   private isSleeping = true;
+  // Track locally-persisted window starts for session/weekly (scraper only gives ends).
+  private sessionWindowStart: string | null = null;
+  private weeklyWindowStart: string | null = null;
+  // Track scraper results and errors
+  private lastScraperResult: OllamaResetTimeResult | null = null;
+  private lastScraperTime = 0;
 
   /**
    * Initialize the service. Does not start polling until activity is
@@ -240,6 +248,12 @@ class OllamaUsageServiceImpl {
       this.fetchAccountUsage(),
       this.fetchProxyHealth(),
     ]);
+
+    // Enrich session/weekly windows with reset times from scraper (lazy trigger).
+    // This happens after account usage fetch so we know which windows are present.
+    const session = accountUsage.session;
+    const weekly = accountUsage.weekly;
+    await this.enrichWithResetTimes(session, weekly);
 
     const usageData: OllamaUsageData = {
       ...accountUsage,
@@ -363,6 +377,65 @@ class OllamaUsageServiceImpl {
       });
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Fetch reset times from scraper if:
+   * - Cookie is available
+   * - resetsAt is missing or already past
+   *
+   * Per the scraper's design, never guess a time -- degrade to null if the
+   * scrape fails or times out. On cookie-expired, surface that state so the
+   * UI can prompt for a fresh cookie.
+   */
+  private async enrichWithResetTimes(session: OllamaUsageWindow | undefined, weekly: OllamaUsageWindow | undefined): Promise<void> {
+    const cookie = getOllamaCookie();
+    if (!cookie) {
+      logger.main.debug('[OllamaUsageService] No Ollama session cookie stored; reset times unavailable.');
+      return;
+    }
+
+    // Only call scraper if at least one window needs a reset time.
+    const sessionNeedsTime = session && (!session.resetsAt || new Date(session.resetsAt) <= new Date());
+    const weeklyNeedsTime = weekly && (!weekly.resetsAt || new Date(weekly.resetsAt) <= new Date());
+
+    if (!sessionNeedsTime && !weeklyNeedsTime) {
+      return; // Both windows already have valid reset times.
+    }
+
+    try {
+      const result = await fetchOllamaResetTimes(cookie);
+      this.lastScraperResult = result;
+      this.lastScraperTime = Date.now();
+
+      if (result.status === 'ok') {
+        // Populate session reset time and persist window start on first seen.
+        if (session && result.session) {
+          session.resetsAt = result.session;
+          if (!this.sessionWindowStart) {
+            this.sessionWindowStart = new Date().toISOString();
+          }
+          session.windowStart = this.sessionWindowStart;
+          session.windowEnd = result.session;
+        }
+        // Populate weekly reset time and persist window start on first seen.
+        if (weekly && result.weekly) {
+          weekly.resetsAt = result.weekly;
+          if (!this.weeklyWindowStart) {
+            this.weeklyWindowStart = new Date().toISOString();
+          }
+          weekly.windowStart = this.weeklyWindowStart;
+          weekly.windowEnd = result.weekly;
+        }
+      } else if (result.status === 'cookie-expired') {
+        // Let the UI know the cookie needs refreshing.
+        logger.main.warn('[OllamaUsageService] Ollama session cookie expired (redirect detected)');
+      } else if (result.status === 'error') {
+        logger.main.warn(`[OllamaUsageService] Failed to fetch reset times: ${result.error}`);
+      }
+    } catch (error) {
+      logger.main.error('[OllamaUsageService] Unexpected error fetching reset times:', error);
     }
   }
 }
