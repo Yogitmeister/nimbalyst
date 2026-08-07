@@ -222,6 +222,19 @@ export async function publishQueuedPromptSnapshotForSession(
   });
 }
 
+// Narrow structural type for settleQueueLeaseAfterAction's provider param
+// (NIM-591). AIProvider itself doesn't declare these members (not every
+// provider type implements them), so a cast is unavoidable at some point --
+// this keeps it narrow and typo/rename-safe instead of a bare `unknown` +
+// `as any`, which silently compiles even if these members are ever renamed
+// (NIM-591 panel finding, Sonnet 5). Optional members mean any AIProvider
+// value is structurally assignable here without an explicit cast at the
+// call site.
+interface TurnAwareProvider {
+  waitForCurrentTurnSettled?: (timeoutMs?: number) => Promise<'settled' | 'timeout'>;
+  isLeadBusy?: () => boolean;
+}
+
 export class AIService {
   private sessionManager: SessionManager;
   private settingsStore: Store<Record<string, unknown>> | null = null;
@@ -432,6 +445,50 @@ export class AIService {
       await stateManager.interruptSession(sessionId);
     } catch (error) {
       logger.main.error(`[AIService] Failed to clear session state on cancel for ${sessionId}:`, error);
+    }
+  }
+
+  /**
+   * Clear a session's queueProcessingLeases entry only once it's actually
+   * safe to: bounded wait for the turn's own teardown (BaseAgentProvider's
+   * turnSettled, via waitForCurrentTurnSettled), fail CLOSED on timeout --
+   * leave the lease set rather than risk a duplicate dispatch racing a turn
+   * that hasn't actually stopped -- then a final isLeadBusy() recheck in
+   * case a newer turn has since started while we were waiting. Used by
+   * ai:cancelRequest and interruptCurrentTurnForSession's plain-caller path
+   * (NOT the expectedState/priority path -- that keeps its own unchanged,
+   * immediate clear; see sweepPriorityQueue there). Both previously deleted
+   * the lease eagerly, before the actual abort()/interruptCurrentTurn()
+   * call, which is the race this closes (NIM-591/NIM-615 pressure-test:
+   * fail-open on timeout was independently rejected by all 3 reviewers --
+   * see _pending/nim591_design_v2.md §2.4).
+   */
+  private async settleQueueLeaseAfterAction(
+    sessionId: string,
+    provider: TurnAwareProvider | null | undefined,
+    logContext: string,
+  ): Promise<void> {
+    // Identity-checked: capture which lease we're watching BEFORE the wait,
+    // and only delete if it's still the SAME lease afterward. A newer
+    // caller may have legitimately claimed a fresh lease for this sessionId
+    // while we were waiting -- isLeadBusy() is a real but imperfect proxy
+    // for "is there a newer owner" (it doesn't go true until leadQuery is
+    // assigned, well after a new turn's own lease/controller setup), so the
+    // identity check is load-bearing, not redundant with it. Same pattern
+    // as ClaudeCodeProvider's `this.abortController === myAbortController`
+    // and queuedPromptDispatcher.ts's `processingLeases.get(id) === lease`
+    // (NIM-591 panel finding -- confirmed against both sibling patterns).
+    const myLease = this.queueProcessingLeases.get(sessionId);
+    if (provider?.waitForCurrentTurnSettled) {
+      const result = await provider.waitForCurrentTurnSettled(3000);
+      if (result === 'timeout') {
+        logger.main.error(`[AIService] ${logContext}: turn for session ${sessionId} did not settle within timeout -- leaving lease set, needs manual recovery if genuinely wedged`);
+        return;
+      }
+    }
+    const stillBusy = provider?.isLeadBusy?.() ?? false;
+    if (!stillBusy && this.queueProcessingLeases.get(sessionId) === myLease) {
+      this.queueProcessingLeases.delete(sessionId);
     }
   }
 
@@ -686,8 +743,7 @@ export class AIService {
       return { success: false, error: 'No active provider for session', nativeEntered: false };
     }
 
-    const sweepInterruptedQueue = async () => {
-      this.queueProcessingLeases.delete(sessionId);
+    const sweepQueueDb = async () => {
       try {
         const { getQueuedPromptsStore } = await import('../RepositoryManager');
         const queueStore = getQueuedPromptsStore();
@@ -702,12 +758,31 @@ export class AIService {
       }
     };
 
-    // Preserve the manual IPC behavior. Priority callers pass an expected
-    // lifecycle token; for them, avoid mutating queue state until after the
-    // fenced provider interrupt has actually been entered.
-    if (!expectedState) {
-      await sweepInterruptedQueue();
-    }
+    // Priority callers (expectedState set): UNCHANGED from pre-NIM-591 --
+    // immediate lease clear + DB sweep, no bounded wait. Their own
+    // DB-generation fencing (the stale-lifecycle check below) already
+    // protects this path. NIM-591 panel finding (GLM-5.2 + DeepSeek Pro +
+    // DeepSeek Flash, independently): an earlier draft of this fix
+    // accidentally routed this path through the new bounded-wait/
+    // fail-closed machinery too, adding up to 3s latency and fail-closed-
+    // wedge risk to MetaAgentService's live-steering -- kept out of scope.
+    const sweepPriorityQueue = async () => {
+      this.queueProcessingLeases.delete(sessionId);
+      await sweepQueueDb();
+    };
+
+    // Plain (renderer ai:interruptCurrentTurn, expectedState undefined)
+    // caller: bounded wait for the turn's own teardown, fail-closed on
+    // timeout, isLeadBusy() + lease-identity gated
+    // (settleQueueLeaseAfterAction). Fired WITHOUT awaiting so the IPC
+    // response is not blocked for up to 3s on every interrupt -- design v2
+    // 3.3 specified fire-and-forget (NIM-591 panel finding, GLM-5.2 +
+    // DeepSeek Flash).
+    const settlePlainQueue = () => {
+      void this.settleQueueLeaseAfterAction(sessionId, provider as TurnAwareProvider, 'interruptCurrentTurn')
+        .then(() => sweepQueueDb())
+        .catch(err => logger.main.error('[AIService] interruptCurrentTurn: settlePlainQueue failed:', err));
+    };
 
     const current = await readLifecycle();
     if (
@@ -720,7 +795,9 @@ export class AIService {
     try {
       const result = await provider.interruptCurrentTurn();
       if (expectedState) {
-        await sweepInterruptedQueue();
+        await sweepPriorityQueue();
+      } else {
+        settlePlainQueue();
       }
       logger.main.info(`[AIService] Interrupted current turn for session ${sessionId} (method=${result.method})`);
 
@@ -740,7 +817,9 @@ export class AIService {
       return { success: true, method: result.method, nativeEntered: true, forcedIdle };
     } catch (error) {
       if (expectedState) {
-        await sweepInterruptedQueue();
+        await sweepPriorityQueue();
+      } else {
+        settlePlainQueue();
       }
       return {
         success: false,
@@ -3637,31 +3716,41 @@ export class AIService {
           reason: 'user_cancel'
         });
 
-        // Defensive cleanup: if the in-flight turn was processing a queued
-        // prompt, drop the in-memory guard and unwedge any DB row stuck in
-        // 'executing'. sweepExecutingForSession is delivery-aware -- a
-        // prompt whose user message already landed in ai_agent_messages is
-        // marked completed instead of rolled back, so the queue trigger
-        // that follows the abort doesn't immediately re-claim and re-send
-        // the same input (NIM-615).
-        this.queueProcessingLeases.delete(sessionId);
-        try {
-          const { getQueuedPromptsStore } = await import('../RepositoryManager');
-          const queueStore = getQueuedPromptsStore();
-          const { completed, failed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
-          if (completed > 0 || failed > 0 || rolledBack > 0) {
-            logger.main.info(
-              `[AIService] cancelRequest: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`
-            );
-            await this.publishQueueStateToSync(sessionId);
-          }
-        } catch (sweepErr) {
-          logger.main.error('[AIService] cancelRequest: sweepExecutingForSession failed:', sweepErr);
-        }
-
         provider.abort();
         // console.log(`[AIService] Cancelled request for session ${sessionId}`);
         this.analytics.sendEvent('cancel_ai_request', {provider: providerType})
+
+        // Defensive cleanup: if the in-flight turn was processing a queued
+        // prompt, unwedge any DB row stuck in 'executing'. sweepExecutingForSession
+        // is delivery-aware -- a prompt whose user message already landed in
+        // ai_agent_messages is marked completed instead of rolled back, so the
+        // queue trigger that follows the abort doesn't immediately re-claim and
+        // re-send the same input (NIM-615). The in-memory lease clear moved to
+        // AFTER abort() and is bounded-wait + isLeadBusy-gated
+        // (settleQueueLeaseAfterAction) -- was previously eager/before abort(),
+        // racing the actual teardown and reopening the window a third trigger
+        // could exploit to dispatch a second, genuinely concurrent turn
+        // (NIM-591). Fired without awaiting so the IPC response isn't blocked
+        // for up to 3s on every cancel -- design v2 3.3 specified
+        // fire-and-forget (NIM-591 panel finding, GLM-5.2 + DeepSeek Flash).
+        void this.settleQueueLeaseAfterAction(sessionId, provider as TurnAwareProvider, 'cancelRequest')
+          .then(async () => {
+            try {
+              const { getQueuedPromptsStore } = await import('../RepositoryManager');
+              const queueStore = getQueuedPromptsStore();
+              const { completed, failed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
+              if (completed > 0 || failed > 0 || rolledBack > 0) {
+                logger.main.info(
+                  `[AIService] cancelRequest: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`
+                );
+                await this.publishQueueStateToSync(sessionId);
+              }
+            } catch (sweepErr) {
+              logger.main.error('[AIService] cancelRequest: sweepExecutingForSession failed:', sweepErr);
+            }
+          })
+          .catch(err => logger.main.error('[AIService] cancelRequest: settleQueueLeaseAfterAction failed:', err));
+
         await this.forceSessionIdleOnCancel(sessionId);
         return { success: true };
       }
@@ -3680,12 +3769,15 @@ export class AIService {
     // BaseAIProvider default. Returns { method } so the renderer can
     // distinguish the two paths.
     //
-    // Defensive cleanup runs before the interrupt: clear the in-memory
-    // queueProcessingLeases guard and unwedge any PGLite rows stuck in
-    // 'executing' via sweepExecutingForSession (delivery-aware -- already
-    // delivered prompts are marked completed, not rolled back, so the
-    // follow-up ai:triggerQueueProcessing doesn't re-send the same input
-    // -- NIM-615).
+    // Defensive cleanup runs AFTER the interrupt for this (plain, no
+    // expectedState) caller: clear the in-memory queueProcessingLeases
+    // guard (bounded-wait + fail-closed, settleQueueLeaseAfterAction) and
+    // unwedge any PGLite rows stuck in 'executing' via
+    // sweepExecutingForSession (delivery-aware -- already delivered prompts
+    // are marked completed, not rolled back, so the follow-up
+    // ai:triggerQueueProcessing doesn't re-send the same input -- NIM-615).
+    // Was eager/before the interrupt prior to NIM-591 -- see
+    // interruptCurrentTurnForSession's settlePlainQueue/sweepPriorityQueue.
     safeHandle('ai:interruptCurrentTurn', async (_event, sessionId: string) =>
       this.interruptCurrentTurnForSession(sessionId)
     );

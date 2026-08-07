@@ -60,6 +60,15 @@ export abstract class BaseAgentProvider extends BaseAIProvider {
   // Abort management
   protected abortController: AbortController | null = null;
 
+  // Resolves once the turn active WHEN THIS WAS READ has finished running its
+  // own cleanup (finally block) -- or immediately if none was active. Default
+  // Promise.resolve() means any subclass that never populates this per-turn
+  // sees an always-"already settled" answer (zero behavior change unless a
+  // subclass actively participates). Populated by ClaudeCodeProvider's
+  // sendMessage() turn lifecycle; consumed externally via
+  // waitForCurrentTurnSettled() (NIM-591/NIM-615).
+  protected turnSettled: Promise<void> = Promise.resolve();
+
   // Session management
   protected readonly sessions: ProviderSessionManager;
 
@@ -92,6 +101,35 @@ export abstract class BaseAgentProvider extends BaseAIProvider {
       this.abortController = null;
     }
     this.permissions.rejectAllPendingPermissions();
+  }
+
+  /**
+   * Resolves once the turn that was active WHEN THIS WAS CALLED has finished
+   * running its own cleanup -- or immediately if none was active. Does NOT
+   * itself trigger any abort; callers call abort()/interruptCurrentTurn()
+   * first. Bounded by timeoutMs so a caller can never hang indefinitely on a
+   * turn whose cleanup is itself stuck (NIM-591/NIM-615).
+   */
+  async waitForCurrentTurnSettled(timeoutMs = 3000): Promise<'settled' | 'timeout'> {
+    const settled = this.turnSettled; // capture NOW -- a newer turn reassigning
+                                       // this.turnSettled afterward must not
+                                       // change what THIS call is waiting for
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<'timeout'>(resolve => {
+      timer = setTimeout(() => resolve('timeout'), timeoutMs);
+    });
+    // Clear the timer regardless of which branch wins -- an uncleared
+    // setTimeout otherwise leaks for the full timeoutMs on every call, even
+    // when the turn was already idle and settled immediately (NIM-591 panel
+    // finding, DeepSeek Flash).
+    try {
+      return await Promise.race([
+        settled.then(() => 'settled' as const).catch(() => 'settled' as const),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

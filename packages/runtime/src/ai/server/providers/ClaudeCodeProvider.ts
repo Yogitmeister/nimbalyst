@@ -419,7 +419,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         const teammateHooks = this.createTeammateToolHooksService(cwd, sessionId, undefined, true);
         return teammateHooks.createPostToolUseHook();
       },
-      getAbortSignal: () => this.abortController?.signal,
+      getAbortSignal: () => this.getCurrentAbortSignal(),
       interruptWithMessage: (message) => this.interruptWithMessage(message),
       createCanUseToolHandler: (sessionId, workspacePath, permissionsPath, teammateName) =>
         this.createCanUseToolHandler(sessionId, workspacePath, permissionsPath, teammateName),
@@ -477,6 +477,20 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
 
   getProviderName(): string {
     return 'claude-code';
+  }
+
+  /**
+   * Current active turn's abort signal, if any -- evaluated at CALL time, not
+   * captured. Deliberately reads the shared field: existing callers (none
+   * today; wired into TeammateManager's constructor-time dependency object
+   * but currently uninvoked anywhere) want "whatever is current right now."
+   * Routed through a named method (rather than an inline arrow reading the
+   * field directly) so the current-vs-turn-scoped tradeoff has one
+   * documented, discoverable choke point for whoever wires up the first real
+   * consumer (NIM-591 pressure-test finding).
+   */
+  protected getCurrentAbortSignal(): AbortSignal | undefined {
+    return this.abortController?.signal;
   }
 
   /**
@@ -910,13 +924,30 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       sessionId,
     });
 
-    // Abort any existing request before starting a new one
+    // Abort any existing request before starting a new one -- a re-entrant
+    // call always supersedes and takes over "the current turn" for this
+    // provider instance (unchanged behavior from before this fix). Capture
+    // a LOCAL reference to the controller THIS turn creates; every
+    // subsequent read inside this generator body uses that local capture,
+    // never `this.abortController` again, so a LATER re-entrant call
+    // repointing the shared field can never silently redirect what THIS
+    // turn thinks it's checking or aborting (NIM-591).
+    //
+    // NOTE: this does NOT wait for the previous turn's teardown to
+    // complete before proceeding (deliberately conservative -- matches
+    // pre-fix behavior for latency). A stronger variant that adds
+    // `await this.turnSettled;` here (bounded by the existing stall
+    // watchdog below, not a new timeout) would close a residual rapid-
+    // sequential-reentrancy gap identified in pressure-test but changes
+    // latency behavior on rapid re-entrancy -- pending a scope decision,
+    // NOT implemented in this pass. Do not add it without being told to.
     if (this.abortController) {
       this.abortController.abort();
     }
-
-    // Create abort controller for this request
-    this.abortController = new AbortController();
+    let resolveTurnSettled = () => {};
+    this.turnSettled = new Promise<void>(resolve => { resolveTurnSettled = resolve; });
+    const myAbortController = new AbortController();
+    this.abortController = myAbortController;
 
     // For worktree sessions, use the parent project path for permission lookups
     // This is passed via documentContext.permissionsPath from AIService
@@ -1042,7 +1073,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
           teammateManager: this.teammateManager,
           sessions: this.sessions,
           config: this.config,
-          abortController: this.abortController!,
+          abortController: myAbortController,
           mainRouteSnapshot,
           subagentRouteSnapshot,
           mainRouteCredential: routeCredentials?.main,
@@ -1313,7 +1344,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         });
         while (true) {
           // Check for abort signal before each iteration
-          if (this.abortController?.signal.aborted) {
+          if (myAbortController.signal.aborted) {
             console.log('[CLAUDE-CODE] Abort signal detected in streaming loop, breaking out');
             this.drainExitCause = 'aborted';
             break;
@@ -1355,7 +1386,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
             void nextPromise.catch(() => {});
             const stalledAfterMs = Date.now() - queryStartTime;
             console.error(`[CLAUDE-CODE] STREAM_STALL_DETECTED: no chunk for ${streamStallMs}ms pre-result (chunkCount=${chunkCount}, turnElapsed=${stalledAfterMs}ms). Aborting wedged query.`);
-            try { this.abortController?.abort(); } catch { /* best effort */ }
+            try { myAbortController.abort(); } catch { /* best effort */ }
             // Throw so the existing catch path logs the error, yields it to the
             // UI, and emits the terminal `complete` -- unwinding the stuck spinner.
             throw new Error(
@@ -2013,7 +2044,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         // Consume output from the new turn (same chunk processing)
         try {
           for await (const rawChunk of (this.leadQuery as AsyncIterable<any>)) {
-            if (this.abortController?.signal.aborted) {
+            if (myAbortController.signal.aborted) {
               console.log('[CLAUDE-CODE] Abort signal detected during teammate message processing');
               break;
             }
@@ -2294,7 +2325,15 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       const queryForDrainCleanup = this.leadQuery;
       this.leadQuery = null;
       ClaudeCodeProvider.streamingInstances.delete(this);
-      this.abortController = null;
+      // Identity-checked: only clear OUR OWN entry. A newer re-entrant call
+      // may have already repointed `this.abortController` to ITS OWN
+      // controller by the time this turn's finally block runs; blindly
+      // nulling would clobber a live, in-progress turn's controller out from
+      // under it (NIM-591). Same identity-safe-.finally() pattern as the
+      // sibling NIM-590 ProviderFactory fix.
+      if (this.abortController === myAbortController) {
+        this.abortController = null;
+      }
       this.wasInterrupted = false;
       this.interruptResolve = null;
       // End the persistent prompt stream so the SDK's streamInput generator
@@ -2329,6 +2368,18 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       this.finishStreamClosedTurnState();
 
       this.transportDied = false;
+
+      // Resolve LAST, after all other finally-block teardown above --
+      // "settled" must mean the turn's cleanup has actually completed
+      // (including promptController.end(), which signals the SDK to close
+      // stdin, and background-drain finalization), not just that the
+      // abortController field was cleared. An earlier draft resolved this
+      // right after the abortController clear, before that teardown ran --
+      // a caller awaiting waitForCurrentTurnSettled() could see "settled"
+      // while the SDK subprocess hadn't actually been signaled to tear down
+      // yet (NIM-591 panel finding, DeepSeek Flash, verified against this
+      // exact ordering).
+      resolveTurnSettled();
     }
   }
 
