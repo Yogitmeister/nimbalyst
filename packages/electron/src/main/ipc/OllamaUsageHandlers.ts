@@ -52,7 +52,7 @@ export function registerOllamaUsageHandlers(): void {
     };
   });
 
-  safeHandle('ollama:set-cookie', async (cookie: string): Promise<void> => {
+  safeHandle('ollama:set-cookie', async (_event, cookie: string): Promise<void> => {
     if (!cookie || typeof cookie !== 'string') {
       throw new Error('Cookie must be a non-empty string');
     }

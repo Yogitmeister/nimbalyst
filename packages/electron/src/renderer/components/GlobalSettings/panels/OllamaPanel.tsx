@@ -1,6 +1,4 @@
 import React, { useState } from 'react';
-import { SettingsToggle } from '../SettingsToggle';
-import { useRendererAPI } from '../../../hooks/useRendererAPI';
 
 /**
  * OllamaPanel - Settings for Ollama Cloud integration.
@@ -16,7 +14,6 @@ import { useRendererAPI } from '../../../hooks/useRendererAPI';
  */
 
 export function OllamaPanel() {
-  const rendererAPI = useRendererAPI();
   const [cookie, setCookie] = useState('');
   const [hasCookie, setHasCookie] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -25,11 +22,11 @@ export function OllamaPanel() {
 
   React.useEffect(() => {
     // Load existing cookie status on mount
-    rendererAPI.ipcRenderer.invoke('ollama:get-cookie-status').then((status: { hasCookie: boolean }) => {
+    window.electronAPI.invoke('ollama:get-cookie-status').then((status: { hasCookie: boolean }) => {
       setHasCookie(status.hasCookie);
       setIsLoading(false);
     });
-  }, [rendererAPI]);
+  }, []);
 
   const handleSaveCookie = async () => {
     if (!cookie.trim()) {
@@ -39,7 +36,7 @@ export function OllamaPanel() {
 
     setIsSaving(true);
     try {
-      await rendererAPI.ipcRenderer.invoke('ollama:set-cookie', cookie);
+      await window.electronAPI.invoke('ollama:set-cookie', cookie);
       setHasCookie(true);
       setCookie('');
       setMessage({ type: 'success', text: 'Cookie saved securely' });
@@ -54,7 +51,7 @@ export function OllamaPanel() {
 
   const handleClearCookie = async () => {
     try {
-      await rendererAPI.ipcRenderer.invoke('ollama:clear-cookie');
+      await window.electronAPI.invoke('ollama:clear-cookie');
       setHasCookie(false);
       setMessage({ type: 'success', text: 'Cookie cleared' });
       setTimeout(() => setMessage(null), 3000);
