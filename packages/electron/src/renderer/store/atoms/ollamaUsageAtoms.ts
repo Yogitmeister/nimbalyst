@@ -25,6 +25,8 @@ export interface OllamaUsageModelBreakdown {
 export interface OllamaUsageWindow {
   utilization: number; // 0-100 percentage
   resetsAt: string | null;
+  windowStart: string | null;
+  windowEnd: string | null;
   models: OllamaUsageModelBreakdown[];
 }
 

@@ -60,7 +60,9 @@ export interface OllamaUsageModelBreakdown {
 
 export interface OllamaUsageWindow {
   utilization: number; // 0-100 percentage
-  resetsAt: string | null; // not present in the API payload today
+  resetsAt: string | null; // filled from scraper (session/weekly) or costPeriod.ending_at (cost-period)
+  windowStart: string | null; // window start time (from costPeriod.starting_at or scraper)
+  windowEnd: string | null; // window end time (from costPeriod.ending_at or scraper)
   models: OllamaUsageModelBreakdown[];
 }
 
@@ -140,6 +142,8 @@ function parseWindow(raw: RawOllamaUsageWindow | undefined): OllamaUsageWindow |
   return {
     utilization: Math.round(raw.usage * 1000) / 10, // 0-1 fraction -> 0-100%, 1 decimal
     resetsAt: null,
+    windowStart: null,
+    windowEnd: null,
     models,
   };
 }
