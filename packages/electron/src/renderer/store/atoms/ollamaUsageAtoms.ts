@@ -47,6 +47,8 @@ export interface OllamaUsageData {
   planTiers: OllamaUsagePlanTier[];
   lastUpdated: number;
   error?: string;
+  /** True when the stored session cookie was rejected on the last scrape -- prompt for a fresh one. */
+  cookieExpired?: boolean;
 }
 
 export const ollamaUsageAtom = atom<OllamaUsageData | null>(null);
