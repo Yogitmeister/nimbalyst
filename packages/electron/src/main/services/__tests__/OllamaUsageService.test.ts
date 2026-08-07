@@ -31,6 +31,10 @@ describe('OllamaUsageService', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     delete process.env.OLLAMA_API_KEY;
+    // ollamaUsageService is a module-level singleton -- clear its cache and
+    // persisted session/weekly window state so tests can't leak into each
+    // other (see resetForTests's doc comment).
+    ollamaUsageService.resetForTests();
   });
 
   afterEach(() => {
@@ -267,13 +271,53 @@ describe('OllamaUsageService', () => {
       });
       const data1 = await ollamaUsageService.refresh();
       expect(data1.session?.resetsAt).toBe('2099-08-07T11:30:00Z');
+      expect(data1.session?.windowStart).toEqual(expect.any(String));
 
-      // Second call: resetsAt is still valid, scraper should not be called again
+      // Second call: resetsAt is still valid, scraper should not be called again,
+      // and windowStart should be unchanged (same window, not a fresh "first seen").
       const callCount = vi.mocked(Scraper.fetchOllamaResetTimes).mock.calls.length;
       const data2 = await ollamaUsageService.refresh();
 
       expect(vi.mocked(Scraper.fetchOllamaResetTimes).mock.calls.length).toBe(callCount);
       expect(data2.session?.resetsAt).toBe('2099-08-07T11:30:00Z');
+      expect(data2.session?.windowStart).toBe(data1.session?.windowStart);
+    });
+
+    it('resets windowStart to "now" when the scraper reports a new resetsAt (previous window ended)', async () => {
+      process.env.OLLAMA_API_KEY = 'test-key';
+      mockFetch({
+        usage: async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            activity: { cost: '0', period: { type: 'last_4_weeks', starting_at: '2026-07-06T00:00:00Z', ending_at: '2026-07-30T06:03:03Z' } },
+            limits: { session: { usage: 0, models: [] }, weekly: { usage: 0.05, models: [] } },
+          }),
+        }),
+      });
+
+      vi.mocked(CookieService.getOllamaCookie).mockReturnValue('test-cookie');
+
+      // First window, already past -- forces a scrape on the very next refresh too.
+      vi.mocked(Scraper.fetchOllamaResetTimes).mockResolvedValueOnce({
+        status: 'ok',
+        session: '2020-01-01T00:00:00Z',
+        weekly: null,
+      });
+      const data1 = await ollamaUsageService.refresh();
+      const firstWindowStart = data1.session?.windowStart;
+      expect(data1.session?.resetsAt).toBe('2020-01-01T00:00:00Z');
+
+      // Second scrape reports a different (new) window.
+      vi.mocked(Scraper.fetchOllamaResetTimes).mockResolvedValueOnce({
+        status: 'ok',
+        session: '2099-01-01T00:00:00Z',
+        weekly: null,
+      });
+      const data2 = await ollamaUsageService.refresh();
+
+      expect(data2.session?.resetsAt).toBe('2099-01-01T00:00:00Z');
+      expect(data2.session?.windowStart).not.toBe(firstWindowStart);
     });
 
     it('handles scraper errors gracefully (degrade to null, not throw)', async () => {
@@ -300,9 +344,10 @@ describe('OllamaUsageService', () => {
       expect(data.limitsAvailable).toBe(true);
       expect(data.session?.resetsAt).toBeNull();
       expect(data.weekly?.resetsAt).toBeNull();
+      expect(data.cookieExpired).toBe(false);
     });
 
-    it('surfaces cookie-expired status when scraper detects redirect', async () => {
+    it('surfaces cookie-expired distinctly from a generic scrape error, so the UI can prompt for a fresh cookie', async () => {
       process.env.OLLAMA_API_KEY = 'test-key';
       vi.mocked(CookieService.getOllamaCookie).mockReturnValue('expired-cookie');
       vi.mocked(Scraper.fetchOllamaResetTimes).mockResolvedValue({
@@ -325,6 +370,25 @@ describe('OllamaUsageService', () => {
       expect(data.limitsAvailable).toBe(true);
       expect(data.session?.resetsAt).toBeNull();
       expect(data.weekly?.resetsAt).toBeNull();
+      expect(data.cookieExpired).toBe(true);
+    });
+
+    it('reports cookieExpired=false when no cookie is stored at all (nothing to expire)', async () => {
+      process.env.OLLAMA_API_KEY = 'test-key';
+      mockFetch({
+        usage: async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            activity: { cost: '0', period: { type: 'last_4_weeks', starting_at: '2026-07-06T00:00:00Z', ending_at: '2026-07-30T06:03:03Z' } },
+            limits: { session: { usage: 0, models: [] }, weekly: { usage: 0.05, models: [] } },
+          }),
+        }),
+      });
+
+      const data = await ollamaUsageService.refresh();
+
+      expect(data.cookieExpired).toBe(false);
     });
   });
 });
