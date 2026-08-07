@@ -31,6 +31,57 @@ interface UsageSectionProps {
   color: 'green' | 'yellow' | 'red' | 'muted';
 }
 
+/** Percentage of [start, end] elapsed so far, clamped 0-100, or null if either bound is missing/invalid. */
+function useElapsedPercent(start: string | null | undefined, end: string | null | undefined): number | null {
+  return useMemo(() => {
+    if (!start || !end) return null;
+    try {
+      const startMs = new Date(start).getTime();
+      const endMs = new Date(end).getTime();
+      const now = Date.now();
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return null;
+      const elapsed = Math.max(0, Math.min(1, (now - startMs) / (endMs - startMs)));
+      return Math.round(elapsed * 100);
+    } catch {
+      return null;
+    }
+  }, [start, end]);
+}
+
+interface CostPeriodSectionProps {
+  costPeriod: { type: string; startingAt: string; endingAt: string };
+  costUSD?: number;
+}
+
+/**
+ * Cost-period stripe + countdown -- always available from the account-usage
+ * API's `activity.period`, no cookie needed. Gets this gauge to the same
+ * elapsed-stripe/countdown parity as Claude/Codex's windows, immediately.
+ */
+const CostPeriodSection: React.FC<CostPeriodSectionProps> = ({ costPeriod, costUSD }) => {
+  const elapsedPercent = useElapsedPercent(costPeriod.startingAt, costPeriod.endingAt);
+
+  return (
+    <div className="mb-4 last:mb-0">
+      <div className="flex justify-between items-baseline mb-1">
+        <div className="text-[13px] font-semibold text-nim">Cost Period</div>
+        {costUSD !== undefined && (
+          <div className="text-[16px] font-semibold text-nim-muted">${costUSD.toFixed(5)}</div>
+        )}
+      </div>
+      {elapsedPercent !== null && (
+        <div className="relative h-1.5 bg-nim-tertiary rounded-full overflow-hidden mb-1.5">
+          <div className="h-full rounded-full bg-nim-muted" style={{ width: `${elapsedPercent}%` }} />
+        </div>
+      )}
+      <div className="flex items-center gap-1 text-[11px] text-nim-muted">
+        <MaterialSymbol icon="schedule" size={12} className="opacity-70" />
+        <span>Resets in {formatResetTime(costPeriod.endingAt)}</span>
+      </div>
+    </div>
+  );
+};
+
 const UsageSection: React.FC<UsageSectionProps> = ({ title, window, color }) => {
   const colorClasses: Record<string, { text: string; bar: string }> = {
     green: { text: 'text-green-500', bar: 'bg-green-500' },
@@ -44,19 +95,7 @@ const UsageSection: React.FC<UsageSectionProps> = ({ title, window, color }) => 
     .slice(0, 3);
 
   // Calculate elapsed percentage for the stripe (when both start and end are available)
-  const elapsedPercent = useMemo(() => {
-    if (!window.windowStart || !window.windowEnd) return null;
-    try {
-      const start = new Date(window.windowStart).getTime();
-      const end = new Date(window.windowEnd).getTime();
-      const now = Date.now();
-      if (end <= start) return null;
-      const elapsed = Math.max(0, Math.min(1, (now - start) / (end - start)));
-      return Math.round(elapsed * 100);
-    } catch {
-      return null;
-    }
-  }, [window.windowStart, window.windowEnd]);
+  const elapsedPercent = useElapsedPercent(window.windowStart, window.windowEnd);
 
   return (
     <div className="mb-4 last:mb-0">
@@ -170,17 +209,29 @@ export const OllamaUsagePopover: React.FC<OllamaUsagePopoverProps> = ({
             <div className="text-[13px] text-nim-error">{usage.error}</div>
           ) : (
             <>
+              {usage.cookieExpired && (
+                <div className="mb-3 text-[11px] text-nim-error bg-red-500/10 rounded-md px-2.5 py-2">
+                  Ollama session cookie expired. Copy a fresh <code className="font-mono">wos-session</code> value
+                  from ollama.com/settings and paste it in Settings &rarr; Ollama Cloud to restore session/weekly
+                  reset countdowns.
+                </div>
+              )}
               {usage.session && (
                 <UsageSection title="Session" window={usage.session} color={sessionColor as 'green' | 'yellow' | 'red' | 'muted'} />
               )}
               {usage.weekly && (
                 <UsageSection title="Weekly" window={usage.weekly} color={weeklyColor as 'green' | 'yellow' | 'red' | 'muted'} />
               )}
-              {usage.costUSD !== undefined && (
+              {usage.costPeriod ? (
+                <CostPeriodSection costPeriod={usage.costPeriod} costUSD={usage.costUSD} />
+              ) : usage.costUSD !== undefined ? (
+                // costPeriod fields weren't in the API response this time (unconfirmed shape --
+                // see OllamaUsageService.ts doc) -- fall back to a plain cost line rather than
+                // hiding the cost entirely.
                 <div className="text-[11px] text-nim-muted mt-1">
                   Metered cost this period: ${usage.costUSD.toFixed(5)}
                 </div>
-              )}
+              ) : null}
             </>
           )}
           <div className="mt-3 pt-3 border-t border-nim text-[11px] text-nim-muted">
