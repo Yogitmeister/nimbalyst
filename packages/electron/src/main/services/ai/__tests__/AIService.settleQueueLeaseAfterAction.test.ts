@@ -1,11 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// Mirrors AIService.interactivePromptSettlement.test.ts's mock set -- AIService.ts
-// pulls in a large module graph at import time; these are the pieces that
-// actually need stubbing for the module to import cleanly under vitest. None
-// of them are touched by settleQueueLeaseAfterAction itself (it only reads
-// `this.queueProcessingLeases` and the passed-in `provider`), but the whole
-// file still has to import successfully to reach the class at all.
 const { query, getSession, clearPending } = vi.hoisted(() => ({
   query: vi.fn(),
   getSession: vi.fn(),
@@ -26,32 +20,13 @@ vi.mock('../../../utils/logger', () => ({
 
 import { AIService } from '../AIService';
 import { logger } from '../../../utils/logger';
+import { ProviderFactory } from '@nimbalyst/runtime/ai/server';
 
-/**
- * NIM-591/NIM-615 -- settleQueueLeaseAfterAction replaced an eager,
- * pre-action `queueProcessingLeases.delete(sessionId)` in both
- * ai:cancelRequest and interruptCurrentTurnForSession's plain-caller path
- * with a bounded wait + fail-closed-on-timeout + isLeadBusy() recheck. See
- * _pending/nim591_design_v2.md §2.4/2.5 (the pressure-test finding that all
- * 3 reviewers independently rejected fail-open on timeout) and the addendum
- * (the real target is `queueProcessingLeases: Map<string, symbol>`, not the
- * v1/v2 draft's assumed `Set<string>`).
- *
- * `settleQueueLeaseAfterAction` is a private instance method with no
- * standalone exported logic to import, so these tests call the REAL method
- * on a minimally-seeded AIService instance -- constructed via
- * `Object.create(AIService.prototype)` (matching
- * AIService.interactivePromptSettlement.test.ts's established pattern for
- * this exact situation) rather than paying the full constructor's cost
- * (SessionManager, MessageStreamingHandler, mobile sync, etc., none of which
- * this method touches). This is not a reimplementation: `instance` is a real
- * `AIService` (its prototype chain and every other method are the genuine
- * class), just with only the one field this method reads pre-seeded.
- */
+type TerminationResult = 'terminated' | 'timeout';
 
-function service(leaseSessionId: string): AIService {
+function service(sessionId: string): AIService {
   const instance = Object.create(AIService.prototype) as any;
-  instance.queueProcessingLeases = new Map<string, symbol>([[leaseSessionId, Symbol('lease')]]);
+  instance.queueProcessingLeases = new Map<string, symbol>([[sessionId, Symbol('dispatch')]]);
   return instance;
 }
 
@@ -59,126 +34,318 @@ function callSettle(
   instance: AIService,
   sessionId: string,
   provider: unknown,
-  logContext = 'test-context',
-): Promise<void> {
-  // settleQueueLeaseAfterAction is `private` at the TypeScript layer only --
-  // at runtime it's an ordinary method, and this is the real one.
-  return (instance as any).settleQueueLeaseAfterAction(sessionId, provider, logContext);
+  sweepQueueDb: () => Promise<boolean> = vi.fn(async () => true),
+): Promise<'released' | 'retained'> {
+  return (instance as any).settleQueueLeaseAfterAction(
+    sessionId,
+    provider,
+    'test-context',
+    sweepQueueDb,
+  );
 }
 
-function leaseIsSet(instance: AIService, sessionId: string): boolean {
-  return (instance as any).queueProcessingLeases.has(sessionId);
+function leases(instance: AIService): Map<string, symbol> {
+  return (instance as any).queueProcessingLeases;
 }
+
+function exactHandle(
+  results: TerminationResult[],
+  id = 'turn-A',
+): {
+  id: string;
+  waitForTermination: ReturnType<typeof vi.fn>;
+  hardClose: ReturnType<typeof vi.fn>;
+  acquireSettlementHold: ReturnType<typeof vi.fn>;
+  releaseSettlementHold: ReturnType<typeof vi.fn>;
+} {
+  const releaseSettlementHold = vi.fn();
+  return {
+    id,
+    waitForTermination: vi.fn(async () => results.shift() ?? 'terminated'),
+    hardClose: vi.fn(),
+    acquireSettlementHold: vi.fn(() => ({ release: releaseSettlementHold })),
+    releaseSettlementHold,
+  };
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe('AIService.settleQueueLeaseAfterAction (NIM-591)', () => {
   const sessionId = 'settle-lease-session';
 
-  it('1. does not delete the lease until waitForCurrentTurnSettled resolves', async () => {
+  it('holds a settlement reservation through the DB sweep, blocking the NIM-590 claim reservation boundary', async () => {
     const instance = service(sessionId);
-    let resolveSettled!: (value: 'settled' | 'timeout') => void;
-    const waitForCurrentTurnSettled = vi.fn(
-      () => new Promise<'settled' | 'timeout'>((resolve) => { resolveSettled = resolve; }),
-    );
-    const provider = { waitForCurrentTurnSettled, isLeadBusy: vi.fn(() => false) };
+    const handle = exactHandle(['terminated']);
+    let nim590ReservationAdmitted = false;
+    const sweep = vi.fn(async () => {
+      // This is the exact NIM-590 admission predicate. The stale sweep runs
+      // while the settlement reservation still occupies the slot.
+      if (!leases(instance).has(sessionId)) {
+        leases(instance).set(sessionId, Symbol('nim-590-new-claim'));
+        nim590ReservationAdmitted = true;
+      }
+      expect(leases(instance).has(sessionId)).toBe(true);
+      return true;
+    });
 
-    const settlePromise = callSettle(instance, sessionId, provider);
+    await expect(callSettle(instance, sessionId, {
+      captureCurrentTurnTermination: vi.fn(() => handle),
+    }, sweep)).resolves.toBe('released');
 
-    // Flush a few microtasks while the provider's promise is still pending --
-    // the lease must NOT be gone yet.
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(leaseIsSet(instance, sessionId)).toBe(true);
-    expect(waitForCurrentTurnSettled).toHaveBeenCalledWith(3000);
-
-    resolveSettled('settled');
-    await settlePromise;
-
-    expect(leaseIsSet(instance, sessionId)).toBe(false);
+    expect(nim590ReservationAdmitted).toBe(false);
+    expect(sweep).toHaveBeenCalledTimes(1);
+    expect(leases(instance).has(sessionId)).toBe(false);
   });
 
-  it('2. CORE REGRESSION: leaves the lease SET (fail-closed) when waitForCurrentTurnSettled times out', async () => {
+  it('uses one captured handle across 3s + 30s, then runs the named hardClose recovery on that exact turn', async () => {
     const instance = service(sessionId);
-    const isLeadBusy = vi.fn(() => false); // even "definitely not busy" must not override a timeout
+    const handle = exactHandle(['timeout', 'timeout', 'terminated']);
     const provider = {
-      waitForCurrentTurnSettled: vi.fn(async () => 'timeout' as const),
-      isLeadBusy,
+      captureCurrentTurnTermination: vi.fn(() => handle),
+      isTurnCurrentForSettlement: vi.fn(() => true),
+      getHardRecoveryProviderType: vi.fn(() => 'claude-code' as const),
     };
+    const providerLookup = vi.spyOn(ProviderFactory, 'getProvider').mockReturnValue(provider as any);
+    const destroyProvider = vi.spyOn(ProviderFactory, 'destroyProvider').mockImplementation(() => {});
+    const sweep = vi.fn(async () => true);
 
-    await callSettle(instance, sessionId, provider);
+    await expect(callSettle(instance, sessionId, provider, sweep)).resolves.toBe('released');
 
-    expect(leaseIsSet(instance, sessionId)).toBe(true);
-    // Timeout is a straight fail-closed return -- isLeadBusy must never even
-    // be consulted, let alone allowed to override it.
-    expect(isLeadBusy).not.toHaveBeenCalled();
+    expect(provider.captureCurrentTurnTermination).toHaveBeenCalledTimes(2);
+    expect(handle.waitForTermination).toHaveBeenNthCalledWith(1, 3000);
+    expect(handle.waitForTermination).toHaveBeenNthCalledWith(2, 30_000);
+    expect(handle.waitForTermination).toHaveBeenNthCalledWith(3, 5000);
+    expect(handle.hardClose).toHaveBeenCalledWith(
+      'test-context: 3s + 30s termination recovery',
+    );
+    expect(sweep).toHaveBeenCalledTimes(1);
+    expect(logger.main.warn).toHaveBeenCalledWith(
+      expect.stringContaining('hardClose terminated exact turn turn-A'),
+    );
+    expect(providerLookup).toHaveBeenCalledWith('claude-code', sessionId);
+    expect(destroyProvider).toHaveBeenCalledWith(sessionId, 'claude-code');
+    expect(handle.acquireSettlementHold).toHaveBeenCalledTimes(1);
+    expect(handle.releaseSettlementHold).toHaveBeenCalledTimes(1);
+    expect(destroyProvider.mock.invocationCallOrder[0]).toBeLessThan(sweep.mock.invocationCallOrder[0]);
+    expect(sweep.mock.invocationCallOrder[0]).toBeLessThan(handle.releaseSettlementHold.mock.invocationCallOrder[0]);
+  });
+
+  it('retains the reservation and never sweeps when exact hardClose still cannot produce a termination receipt', async () => {
+    const instance = service(sessionId);
+    const handle = exactHandle(['timeout', 'timeout', 'timeout']);
+    const sweep = vi.fn(async () => true);
+
+    await expect(callSettle(instance, sessionId, {
+      captureCurrentTurnTermination: vi.fn(() => handle),
+    }, sweep)).resolves.toBe('retained');
+
+    expect(handle.hardClose).toHaveBeenCalledTimes(1);
+    expect(sweep).not.toHaveBeenCalled();
+    expect(leases(instance).has(sessionId)).toBe(true);
     expect(logger.main.error).toHaveBeenCalledWith(
-      expect.stringContaining(`turn for session ${sessionId} did not settle within timeout`),
+      expect.stringContaining('settlement reservation remains fail-closed'),
     );
   });
 
-  it('3. does not delete the lease when isLeadBusy() is true after settling (a newer turn started)', async () => {
+  it('waits only on A, then refuses the DB sweep when the provider has moved to B', async () => {
     const instance = service(sessionId);
-    const provider = {
-      waitForCurrentTurnSettled: vi.fn(async () => 'settled' as const),
-      isLeadBusy: vi.fn(() => true),
-    };
+    const handleA = exactHandle(['timeout', 'terminated'], 'turn-A');
+    const handleB = exactHandle(['timeout'], 'turn-B');
+    let current = handleA;
+    const capture = vi.fn(() => current);
+    handleA.waitForTermination.mockImplementationOnce(async () => {
+      current = handleB;
+      return 'timeout';
+    });
+    const sweep = vi.fn(async () => true);
 
-    await callSettle(instance, sessionId, provider);
+    await expect(callSettle(instance, sessionId, {
+      captureCurrentTurnTermination: capture,
+    }, sweep)).resolves.toBe('retained');
 
-    expect(leaseIsSet(instance, sessionId)).toBe(true);
+    expect(capture).toHaveBeenCalledTimes(2);
+    expect(handleA.waitForTermination).toHaveBeenNthCalledWith(1, 3000);
+    expect(handleA.waitForTermination).toHaveBeenNthCalledWith(2, 30_000);
+    expect(handleB.waitForTermination).not.toHaveBeenCalled();
+    expect(handleB.hardClose).not.toHaveBeenCalled();
+    expect(sweep).not.toHaveBeenCalled();
+    expect(leases(instance).has(sessionId)).toBe(true);
   });
 
-  it('4. deletes the lease when isLeadBusy() is false after settling', async () => {
+  it('does not sweep or delete a different owner that replaces the settlement reservation', async () => {
     const instance = service(sessionId);
-    const provider = {
-      waitForCurrentTurnSettled: vi.fn(async () => 'settled' as const),
-      isLeadBusy: vi.fn(() => false),
-    };
-
-    await callSettle(instance, sessionId, provider);
-
-    expect(leaseIsSet(instance, sessionId)).toBe(false);
-  });
-
-  it('5. deletes the lease immediately for a provider with neither waitForCurrentTurnSettled nor isLeadBusy', async () => {
-    const instance = service(sessionId);
-    const provider = {}; // e.g. a provider type that predates NIM-591 and implements neither method
-
-    await callSettle(instance, sessionId, provider);
-
-    expect(leaseIsSet(instance, sessionId)).toBe(false);
-  });
-
-  it('6. CORE REGRESSION (panel finding, Sonnet 5): does not delete a NEWER lease that replaced the watched one during the wait, even when isLeadBusy() reads false', async () => {
-    // isLeadBusy() is a real but imperfect proxy for "a newer turn owns this
-    // session" -- it doesn't go true until leadQuery is assigned, well after
-    // a new turn's own lease is set. This test forces exactly that gap: a
-    // second, different lease occupies the key by the time settlement
-    // resolves, while isLeadBusy() still (incorrectly, but realistically)
-    // reads false. Only the identity check protects the newer lease here.
-    const instance = service(sessionId);
-    let resolveSettled!: (value: 'settled' | 'timeout') => void;
-    const provider = {
-      waitForCurrentTurnSettled: vi.fn(
-        () => new Promise<'settled' | 'timeout'>((resolve) => { resolveSettled = resolve; }),
+    let resolveTermination!: (value: TerminationResult) => void;
+    const handle = {
+      id: 'turn-A',
+      waitForTermination: vi.fn(
+        () => new Promise<TerminationResult>((resolve) => { resolveTermination = resolve; }),
       ),
-      isLeadBusy: vi.fn(() => false), // stale/racy read -- a newer turn IS active
+      hardClose: vi.fn(),
+    };
+    const sweep = vi.fn(async () => true);
+    const settling = callSettle(instance, sessionId, {
+      captureCurrentTurnTermination: vi.fn(() => handle),
+    }, sweep);
+
+    await Promise.resolve();
+    const newerOwner = Symbol('newer-owner');
+    leases(instance).set(sessionId, newerOwner);
+    resolveTermination('terminated');
+
+    await expect(settling).resolves.toBe('retained');
+    expect(sweep).not.toHaveBeenCalled();
+    expect(leases(instance).get(sessionId)).toBe(newerOwner);
+  });
+
+  it('retains the settlement reservation when the DB sweep fails', async () => {
+    const instance = service(sessionId);
+    const sweep = vi.fn(async () => false);
+
+    await expect(callSettle(instance, sessionId, {
+      captureCurrentTurnTermination: vi.fn(() => exactHandle(['terminated'])),
+    }, sweep)).resolves.toBe('retained');
+
+    expect(leases(instance).has(sessionId)).toBe(true);
+  });
+
+  it('leaves a failed ticket participant-free so the next caller owns a recovery pass', async () => {
+    const instance = service(sessionId);
+    const handle = exactHandle(['terminated']);
+    const provider = {
+      captureCurrentTurnTermination: vi.fn(() => handle),
     };
 
-    const settlePromise = callSettle(instance, sessionId, provider);
+    await expect(callSettle(
+      instance,
+      sessionId,
+      provider,
+      vi.fn(async () => false),
+    )).resolves.toBe('retained');
 
-    // While still waiting, a different caller's turn claims a fresh lease
-    // for the SAME sessionId (simulating tryClaimAndDispatchNextQueuedPrompt
-    // dispatching a new turn before this call's watched turn settles).
-    const newerLease = Symbol('newer-lease');
-    (instance as any).queueProcessingLeases.set(sessionId, newerLease);
+    const retainedTicket = (instance as any).getActiveQueueSettlement(sessionId);
+    expect(retainedTicket).toMatchObject({ participants: 0 });
+    expect(handle.releaseSettlementHold).not.toHaveBeenCalled();
 
-    resolveSettled('settled');
-    await settlePromise;
+    const recoveryTicket = (instance as any).beginQueueSettlement(sessionId, provider);
+    expect(recoveryTicket).toBe(retainedTicket);
+    expect(recoveryTicket.participants).toBe(1);
 
-    // The newer lease must survive untouched -- this is the exact bug: a
-    // bare `.delete(sessionId)` would remove it regardless of which lease
-    // is actually present.
-    expect((instance as any).queueProcessingLeases.get(sessionId)).toBe(newerLease);
+    await expect((instance as any).settleQueueLeaseAfterAction(
+      sessionId,
+      provider,
+      'recovery-pass',
+      vi.fn(async () => true),
+      recoveryTicket,
+    )).resolves.toBe('released');
+
+    expect(leases(instance).has(sessionId)).toBe(false);
+    expect(handle.acquireSettlementHold).toHaveBeenCalledTimes(1);
+    expect(handle.releaseSettlementHold).toHaveBeenCalledTimes(1);
+  });
+
+  it('acquires and holds a settlement lock via the FIFO-predecessor fallback when the active-turn capture is null (NIM-591 null-capture admission fence)', async () => {
+    const instance = service(sessionId);
+    // captureCurrentTurnTermination() is null (the turn already finished
+    // naturally; ClaudeCodeProvider clears currentTurnTermination on exit)
+    // but captureLatestTurnTermination() still exposes that same turn as
+    // the FIFO predecessor a new turn's admission will be fenced against.
+    const handle = exactHandle(['terminated'], 'turn-A-latest');
+    const waitForCurrentTurnSettled = vi.fn(async () => 'settled' as const);
+    const isLeadBusy = vi.fn(() => false);
+    // Matches ClaudeCodeProvider, the only real implementer of the
+    // fallback: it also exposes isTurnCurrentForSettlement, which is what
+    // actually gates the capturedTurn pre-sweep recheck (isLeadBusy is only
+    // a defensive fallback for providers that lack it).
+    const isTurnCurrentForSettlement = vi.fn(() => true);
+    const sweep = vi.fn(async () => true);
+
+    await expect(callSettle(instance, sessionId, {
+      captureCurrentTurnTermination: vi.fn(() => null),
+      captureLatestTurnTermination: vi.fn(() => handle),
+      waitForCurrentTurnSettled,
+      isLeadBusy,
+      isTurnCurrentForSettlement,
+    }, sweep)).resolves.toBe('released');
+
+    // The fallback handle's own exact-process-termination proof gated the
+    // sweep -- the legacy compatibility wait (which has no fence against a
+    // newly starting generation) was never reached.
+    expect(handle.waitForTermination).toHaveBeenCalledWith(3000);
+    expect(waitForCurrentTurnSettled).not.toHaveBeenCalled();
+    expect(isLeadBusy).not.toHaveBeenCalled();
+    expect(handle.acquireSettlementHold).toHaveBeenCalledTimes(1);
+    expect(sweep).toHaveBeenCalledTimes(1);
+    expect(handle.releaseSettlementHold).toHaveBeenCalledTimes(1);
+    // The hold must still be held while the sweep is in flight -- released
+    // only after -- so a turn admitted during that async window would have
+    // blocked on it instead of racing the sweep unfenced.
+    expect(sweep.mock.invocationCallOrder[0])
+      .toBeLessThan(handle.releaseSettlementHold.mock.invocationCallOrder[0]);
+  });
+
+  it('falls back to the legacy compatibility wait only when the provider exposes no FIFO-predecessor capture at all', async () => {
+    const instance = service(sessionId);
+    const waitForCurrentTurnSettled = vi.fn(async () => 'settled' as const);
+    const isLeadBusy = vi.fn(() => false);
+    const sweep = vi.fn(async () => true);
+
+    // No captureLatestTurnTermination -- a provider that genuinely lacks
+    // the FIFO-predecessor capability (e.g. a non-Claude-Code provider),
+    // not merely a turn that happens to be idle right now.
+    await expect(callSettle(instance, sessionId, {
+      captureCurrentTurnTermination: vi.fn(() => null),
+      waitForCurrentTurnSettled,
+      isLeadBusy,
+    }, sweep)).resolves.toBe('released');
+
+    expect(waitForCurrentTurnSettled).toHaveBeenCalledTimes(1);
+    expect(isLeadBusy).toHaveBeenCalledTimes(1);
+    expect(sweep).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps one bounded compatibility wait for providers without an immutable handle', async () => {
+    const instance = service(sessionId);
+    const waitForCurrentTurnSettled = vi.fn(async () => 'settled' as const);
+    const sweep = vi.fn(async () => true);
+
+    await expect(callSettle(instance, sessionId, {
+      waitForCurrentTurnSettled,
+      isLeadBusy: vi.fn(() => false),
+    }, sweep)).resolves.toBe('released');
+
+    expect(waitForCurrentTurnSettled).toHaveBeenCalledTimes(1);
+    expect(waitForCurrentTurnSettled).toHaveBeenCalledWith(3000);
+  });
+
+  it('logs and retains on a legacy settlement timeout', async () => {
+    const instance = service(sessionId);
+    const waitForCurrentTurnSettled = vi.fn(async () => 'timeout' as const);
+    const sweep = vi.fn(async () => true);
+
+    await expect(callSettle(instance, sessionId, {
+      waitForCurrentTurnSettled,
+      isLeadBusy: vi.fn(() => false),
+    }, sweep)).resolves.toBe('retained');
+
+    expect(sweep).not.toHaveBeenCalled();
+    expect(leases(instance).has(sessionId)).toBe(true);
+    expect(logger.main.error).toHaveBeenCalledWith(
+      expect.stringContaining('did not settle within timeout'),
+    );
+  });
+
+  it('fails closed when a provider without capture or legacy wait still reports a busy lead', async () => {
+    const instance = service(sessionId);
+    const isLeadBusy = vi.fn(() => true);
+    const sweep = vi.fn(async () => true);
+
+    await expect(callSettle(instance, sessionId, { isLeadBusy }, sweep))
+      .resolves.toBe('retained');
+
+    expect(isLeadBusy).toHaveBeenCalledTimes(1);
+    expect(sweep).not.toHaveBeenCalled();
+    expect(leases(instance).has(sessionId)).toBe(true);
   });
 });

@@ -222,17 +222,42 @@ export async function publishQueuedPromptSnapshotForSession(
   });
 }
 
-// Narrow structural type for settleQueueLeaseAfterAction's provider param
-// (NIM-591). AIProvider itself doesn't declare these members (not every
-// provider type implements them), so a cast is unavoidable at some point --
-// this keeps it narrow and typo/rename-safe instead of a bare `unknown` +
-// `as any`, which silently compiles even if these members are ever renamed
-// (NIM-591 panel finding, Sonnet 5). Optional members mean any AIProvider
-// value is structurally assignable here without an explicit cast at the
-// call site.
+interface CapturedTurnTermination {
+  readonly id: string;
+  waitForTermination(timeoutMs: number): Promise<'terminated' | 'timeout'>;
+  hardClose(reason: string): void;
+  acquireSettlementHold?: () => { release(): void };
+}
+
+// Narrow structural type for settlement. Claude Code exposes an immutable
+// process-backed handle; optional legacy members preserve behavior for other
+// providers without pretending that two mutable reads identify one turn.
 interface TurnAwareProvider {
+  captureCurrentTurnTermination?: () => CapturedTurnTermination | null;
+  // Fallback capture for a settlement pass that begins after the active
+  // turn's clean finish (captureCurrentTurnTermination() already null) but
+  // before any replacement has started. Providers that fence new-turn
+  // admission against a FIFO-predecessor handle (ClaudeCodeProvider) expose
+  // that same handle here so beginQueueSettlement can still acquire a
+  // settlement hold and block the next admission -- otherwise nothing
+  // serializes the async session-wide DB sweep against a newly starting
+  // generation (NIM-591 null-capture admission fence).
+  captureLatestTurnTermination?: () => CapturedTurnTermination | null;
   waitForCurrentTurnSettled?: (timeoutMs?: number) => Promise<'settled' | 'timeout'>;
   isLeadBusy?: () => boolean;
+  hasExactSerializedReplacementAdmission?: () => boolean;
+  isTurnCurrentForSettlement?: (turnId: string) => boolean;
+  getHardRecoveryProviderType?: (turnId: string) => AIProviderType | null;
+}
+
+type QueueLeaseSettlementOutcome = 'released' | 'retained';
+interface QueueSettlementTicket {
+  reservation: symbol;
+  capturedTurn: CapturedTurnTermination | null;
+  turnHold: { release(): void } | null;
+  turnHoldReleased: boolean;
+  sweepCompleted: boolean;
+  participants: number;
 }
 
 export class AIService {
@@ -264,6 +289,7 @@ export class AIService {
   // the prior lease before priority delivery; a stale dispatch may settle
   // afterward, but cannot release a newer dispatch's lease or drain FIFO.
   private queueProcessingLeases = new Map<string, symbol>();
+  private queueSettlementTickets = new Map<string, QueueSettlementTicket>();
   private interactivePromptSettlements = new Map<string, Promise<{ success: boolean; error?: string }>>();
 
   /**
@@ -449,47 +475,219 @@ export class AIService {
   }
 
   /**
-   * Clear a session's queueProcessingLeases entry only once it's actually
-   * safe to: bounded wait for the turn's own teardown (BaseAgentProvider's
-   * turnSettled, via waitForCurrentTurnSettled), fail CLOSED on timeout --
-   * leave the lease set rather than risk a duplicate dispatch racing a turn
-   * that hasn't actually stopped -- then a final isLeadBusy() recheck in
-   * case a newer turn has since started while we were waiting. Used by
-   * ai:cancelRequest and interruptCurrentTurnForSession's plain-caller path
-   * (NOT the expectedState/priority path -- that keeps its own unchanged,
-   * immediate clear; see sweepPriorityQueue there). Both previously deleted
-   * the lease eagerly, before the actual abort()/interruptCurrentTurn()
-   * call, which is the race this closes (NIM-591/NIM-615 pressure-test:
-   * fail-open on timeout was independently rejected by all 3 reviewers --
-   * see _pending/nim591_design_v2.md §2.4).
+   * Revoke the old dispatch into an identity-scoped settlement reservation,
+   * wait for one captured turn/process identity, sweep while that reservation
+   * still blocks NIM-590 admission, then release. Timeout is fail-closed. After
+   * the 3s + 30s observation windows, Claude Code's concrete hardClose action
+   * terminates that same query/process and gets one final bounded observation.
    */
+  private beginQueueSettlement(
+    sessionId: string,
+    provider: TurnAwareProvider | null | undefined,
+  ): QueueSettlementTicket {
+    const existing = this.getActiveQueueSettlement(sessionId);
+    if (existing) {
+      existing.participants += 1;
+      return existing;
+    }
+
+    const reservation = Symbol(`queue-settlement:${sessionId}`);
+    this.queueProcessingLeases.set(sessionId, reservation);
+    // Prefer the actively-running turn. If none (settlement begins right
+    // after a clean finish, before any replacement has started), fall back
+    // to the FIFO-predecessor handle so a hold can still be acquired and
+    // block the next admission -- otherwise this ticket's async sweep races
+    // a newly starting generation with nothing fencing them (NIM-591
+    // null-capture admission fence).
+    const capturedTurn = provider?.captureCurrentTurnTermination?.()
+      ?? provider?.captureLatestTurnTermination?.()
+      ?? null;
+    const ticket = {
+      reservation,
+      capturedTurn,
+      turnHold: capturedTurn?.acquireSettlementHold?.() ?? null,
+      turnHoldReleased: false,
+      sweepCompleted: false,
+      participants: 1,
+    };
+    this.getQueueSettlementTickets().set(sessionId, ticket);
+    return ticket;
+  }
+
+  private getQueueSettlementTickets(): Map<string, QueueSettlementTicket> {
+    // Narrow unit tests construct AIService with Object.create so they can
+    // exercise settlement ownership without running Electron startup.
+    if (!this.queueSettlementTickets) {
+      this.queueSettlementTickets = new Map<string, QueueSettlementTicket>();
+    }
+    return this.queueSettlementTickets;
+  }
+
+  private getActiveQueueSettlement(sessionId: string): QueueSettlementTicket | null {
+    const tickets = this.getQueueSettlementTickets();
+    const ticket = tickets.get(sessionId);
+    if (!ticket) return null;
+    if (this.queueProcessingLeases.get(sessionId) === ticket.reservation) return ticket;
+    tickets.delete(sessionId);
+    this.releaseTurnSettlementHold(ticket);
+    return null;
+  }
+
+  private releaseTurnSettlementHold(ticket: QueueSettlementTicket): void {
+    if (ticket.turnHoldReleased) return;
+    ticket.turnHoldReleased = true;
+    ticket.turnHold?.release();
+  }
+
+  private releaseQueueSettlement(sessionId: string, ticket: QueueSettlementTicket): boolean {
+    if (this.queueProcessingLeases.get(sessionId) !== ticket.reservation) return false;
+    ticket.participants = Math.max(0, ticket.participants - 1);
+    if (ticket.participants > 0 || !ticket.sweepCompleted) {
+      return false;
+    }
+    this.queueProcessingLeases.delete(sessionId);
+    const tickets = this.getQueueSettlementTickets();
+    if (tickets.get(sessionId) === ticket) tickets.delete(sessionId);
+    this.releaseTurnSettlementHold(ticket);
+    return true;
+  }
+
+  private retainQueueSettlementParticipation(
+    sessionId: string,
+    ticket: QueueSettlementTicket,
+  ): void {
+    if (this.queueProcessingLeases.get(sessionId) !== ticket.reservation) return;
+    if (this.getQueueSettlementTickets().get(sessionId) !== ticket) return;
+    // A failed pass keeps the reservation and turn hold, but the caller that
+    // just finished is no longer active. Leaving its participant behind would
+    // make a later priority caller join an inert ticket instead of owning the
+    // next recovery pass.
+    ticket.participants = Math.max(0, ticket.participants - 1);
+  }
+
+  private abandonQueueSettlement(sessionId: string, ticket: QueueSettlementTicket): void {
+    const tickets = this.getQueueSettlementTickets();
+    if (tickets.get(sessionId) === ticket) tickets.delete(sessionId);
+    ticket.participants = 0;
+    this.releaseTurnSettlementHold(ticket);
+  }
+
   private async settleQueueLeaseAfterAction(
     sessionId: string,
     provider: TurnAwareProvider | null | undefined,
     logContext: string,
-  ): Promise<void> {
-    // Identity-checked: capture which lease we're watching BEFORE the wait,
-    // and only delete if it's still the SAME lease afterward. A newer
-    // caller may have legitimately claimed a fresh lease for this sessionId
-    // while we were waiting -- isLeadBusy() is a real but imperfect proxy
-    // for "is there a newer owner" (it doesn't go true until leadQuery is
-    // assigned, well after a new turn's own lease/controller setup), so the
-    // identity check is load-bearing, not redundant with it. Same pattern
-    // as ClaudeCodeProvider's `this.abortController === myAbortController`
-    // and queuedPromptDispatcher.ts's `processingLeases.get(id) === lease`
-    // (NIM-591 panel finding -- confirmed against both sibling patterns).
-    const myLease = this.queueProcessingLeases.get(sessionId);
-    if (provider?.waitForCurrentTurnSettled) {
-      const result = await provider.waitForCurrentTurnSettled(3000);
-      if (result === 'timeout') {
-        logger.main.error(`[AIService] ${logContext}: turn for session ${sessionId} did not settle within timeout -- leaving lease set, needs manual recovery if genuinely wedged`);
-        return;
+    sweepQueueDb: () => Promise<boolean>,
+    ticket = this.beginQueueSettlement(sessionId, provider),
+  ): Promise<QueueLeaseSettlementOutcome> {
+    // Replace, don't merely retain, the old lease. Its stale dispatch finally
+    // block is identity-checked and therefore cannot delete this reservation.
+    // This assignment is synchronous, leaving no release-to-sweep gap for the
+    // NIM-590 check-then-reserve path.
+    const settlementReservation = ticket.reservation;
+    const capturedTurn = ticket.capturedTurn;
+    let participationSettled = false;
+    try {
+      if (capturedTurn) {
+        let result = await capturedTurn.waitForTermination(3000);
+        if (result === 'timeout') {
+          logger.main.error(`[AIService] ${logContext}: exact turn ${capturedTurn.id} for session ${sessionId} did not terminate within 3000ms -- retaining settlement reservation during bounded recovery`);
+          result = await capturedTurn.waitForTermination(30_000);
+          if (result === 'timeout') {
+            logger.main.error(`[AIService] ${logContext}: exact turn ${capturedTurn.id} remained wedged after 30000ms -- invoking hardClose on that captured query/process`);
+            capturedTurn.hardClose(`${logContext}: 3s + 30s termination recovery`);
+            result = await capturedTurn.waitForTermination(5000);
+            if (result === 'timeout') {
+              logger.main.error(`[AIService] ${logContext}: hardClose did not terminate exact turn ${capturedTurn.id} for session ${sessionId} within 5000ms -- settlement reservation remains fail-closed`);
+              return 'retained';
+            }
+            this.retireHardClosedProvider(sessionId, provider, capturedTurn);
+            logger.main.warn(`[AIService] ${logContext}: hardClose terminated exact turn ${capturedTurn.id} for session ${sessionId}`);
+          } else {
+            logger.main.warn(`[AIService] ${logContext}: exact turn ${capturedTurn.id} terminated during bounded recovery`);
+          }
+        }
+      } else {
+        if (provider?.waitForCurrentTurnSettled) {
+          // Compatibility only: a provider without an immutable handle gets
+          // one bounded observation. Re-reading its mutable "current" promise
+          // would risk switching turn identity.
+          const result = await provider.waitForCurrentTurnSettled(3000);
+          if (result === 'timeout') {
+            logger.main.error(`[AIService] ${logContext}: turn for session ${sessionId} did not settle within timeout -- leaving settlement reservation set, needs manual recovery if genuinely wedged`);
+            return 'retained';
+          }
+        }
+        if (provider?.isLeadBusy?.()) {
+          logger.main.error(`[AIService] ${logContext}: provider still reports a busy lead for session ${sessionId} -- settlement remains fail-closed`);
+          return 'retained';
+        }
+      }
+
+      if (this.queueProcessingLeases.get(sessionId) !== settlementReservation) {
+        this.abandonQueueSettlement(sessionId, ticket);
+        participationSettled = true;
+        return 'retained';
+      }
+
+      if (capturedTurn) {
+        if (!ticket.turnHold) {
+          logger.main.error(`[AIService] ${logContext}: exact turn ${capturedTurn.id} exposes no settlement hold for session ${sessionId} -- refusing an unfenced queue sweep`);
+          return 'retained';
+        }
+        if (
+          provider?.isTurnCurrentForSettlement
+          && !provider.isTurnCurrentForSettlement(capturedTurn.id)
+        ) {
+          logger.main.error(`[AIService] ${logContext}: provider moved past exact turn ${capturedTurn.id} before queue sweep for session ${sessionId} -- settlement remains fail-closed`);
+          return 'retained';
+        }
+        const liveTurn = provider?.captureCurrentTurnTermination?.() ?? null;
+        if (liveTurn && liveTurn.id !== capturedTurn.id) {
+          logger.main.error(`[AIService] ${logContext}: newer provider turn ${liveTurn.id} replaced ${capturedTurn.id} before queue sweep for session ${sessionId} -- settlement remains fail-closed`);
+          return 'retained';
+        }
+        if (!provider?.isTurnCurrentForSettlement && provider?.isLeadBusy?.()) {
+          logger.main.error(`[AIService] ${logContext}: provider became busy before queue sweep for session ${sessionId} -- settlement remains fail-closed`);
+          return 'retained';
+        }
+      }
+
+      const sweepSucceeded = await sweepQueueDb();
+      if (!sweepSucceeded) {
+        logger.main.error(`[AIService] ${logContext}: queue sweep failed for session ${sessionId} -- settlement reservation remains fail-closed`);
+        return 'retained';
+      }
+      ticket.sweepCompleted = true;
+
+      if (this.queueProcessingLeases.get(sessionId) !== settlementReservation) {
+        this.abandonQueueSettlement(sessionId, ticket);
+        participationSettled = true;
+        return 'retained';
+      }
+      const released = this.releaseQueueSettlement(sessionId, ticket);
+      participationSettled = true;
+      return released ? 'released' : 'retained';
+    } finally {
+      if (!participationSettled) {
+        this.retainQueueSettlementParticipation(sessionId, ticket);
       }
     }
-    const stillBusy = provider?.isLeadBusy?.() ?? false;
-    if (!stillBusy && this.queueProcessingLeases.get(sessionId) === myLease) {
-      this.queueProcessingLeases.delete(sessionId);
-    }
+  }
+
+  private retireHardClosedProvider(
+    sessionId: string,
+    provider: TurnAwareProvider | null | undefined,
+    capturedTurn: CapturedTurnTermination,
+  ): void {
+    // The exact child is gone, but an outer async generator may still be
+    // parked at a yield and resume later. Remove this instance from the
+    // factory before releasing the queue reservation so the next prompt gets
+    // a fresh provider; stale JS can then mutate only the retired instance.
+    const providerType = provider?.getHardRecoveryProviderType?.(capturedTurn.id) ?? null;
+    if (!providerType) return;
+    const registered = ProviderFactory.getProvider(providerType, sessionId);
+    if (registered !== provider) return;
+    ProviderFactory.destroyProvider(sessionId, providerType);
   }
 
   private getQueueDrive(): QueueDriveService {
@@ -743,7 +941,7 @@ export class AIService {
       return { success: false, error: 'No active provider for session', nativeEntered: false };
     }
 
-    const sweepQueueDb = async () => {
+    const sweepQueueDb = async (): Promise<boolean> => {
       try {
         const { getQueuedPromptsStore } = await import('../RepositoryManager');
         const queueStore = getQueuedPromptsStore();
@@ -753,34 +951,84 @@ export class AIService {
             `[AIService] interruptCurrentTurn: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`
           );
         }
+        return true;
       } catch (sweepErr) {
         logger.main.error('[AIService] interruptCurrentTurn: sweepExecutingForSession failed:', sweepErr);
+        return false;
       }
     };
 
-    // Priority callers (expectedState set): UNCHANGED from pre-NIM-591 --
-    // immediate lease clear + DB sweep, no bounded wait. Their own
-    // DB-generation fencing (the stale-lifecycle check below) already
-    // protects this path. NIM-591 panel finding (GLM-5.2 + DeepSeek Pro +
-    // DeepSeek Flash, independently): an earlier draft of this fix
-    // accidentally routed this path through the new bounded-wait/
-    // fail-closed machinery too, adding up to 3s latency and fail-closed-
-    // wedge risk to MetaAgentService's live-steering -- kept out of scope.
+    // Priority callers participate in the same identity-scoped settlement
+    // reservation. Claude Code may retain the pre-NIM-591 low-latency path
+    // only because it explicitly exposes and enforces exact FIFO replacement
+    // admission. Any provider without that invariant uses the full bounded
+    // settlement before releasing the guard. If an ordinary cancel already
+    // owns the ticket, priority joins it and never starts a competing sweep.
+    let prioritySettlementTicket: QueueSettlementTicket | null = null;
+    let priorityOwnsSweep = false;
+    let priorityRecoversRetainedTicket = false;
+    let priorityParticipationSettled = false;
     const sweepPriorityQueue = async () => {
-      this.queueProcessingLeases.delete(sessionId);
-      await sweepQueueDb();
+      if (!prioritySettlementTicket || priorityParticipationSettled) return;
+      priorityParticipationSettled = true;
+      if (!priorityOwnsSweep) {
+        this.releaseQueueSettlement(sessionId, prioritySettlementTicket);
+        return;
+      }
+      // A retained ticket already carries one unconfirmed exact-process-
+      // termination attempt on its capturedTurn (the prior pass hit the 3s +
+      // 30s + hardClose recovery window and still could not prove the
+      // process died, or the DB sweep itself failed). The provider's static
+      // hasExactSerializedReplacementAdmission() flag only vouches for its
+      // OWN internal FIFO admission invariant going forward; it says nothing
+      // about whether THIS specific already-failed proof attempt can be
+      // skipped. Route every retained-ticket recovery through the full
+      // settleQueueLeaseAfterAction proof, regardless of that flag, so a
+      // wedged process from an earlier unconfirmed hard recovery cannot get
+      // laundered into a bare DB sweep by a later priority caller.
+      if (
+        priorityRecoversRetainedTicket
+        || (provider as TurnAwareProvider).hasExactSerializedReplacementAdmission?.() !== true
+      ) {
+        await this.settleQueueLeaseAfterAction(
+          sessionId,
+          provider as TurnAwareProvider,
+          'interruptCurrentTurn:priority',
+          sweepQueueDb,
+          prioritySettlementTicket,
+        );
+        return;
+      }
+      if (this.queueProcessingLeases.get(sessionId) !== prioritySettlementTicket.reservation) {
+        this.abandonQueueSettlement(sessionId, prioritySettlementTicket);
+        return;
+      }
+      if (await sweepQueueDb()) {
+        prioritySettlementTicket.sweepCompleted = true;
+        this.releaseQueueSettlement(sessionId, prioritySettlementTicket);
+      } else {
+        this.retainQueueSettlementParticipation(sessionId, prioritySettlementTicket);
+      }
     };
 
     // Plain (renderer ai:interruptCurrentTurn, expectedState undefined)
-    // caller: bounded wait for the turn's own teardown, fail-closed on
-    // timeout, isLeadBusy() + lease-identity gated
-    // (settleQueueLeaseAfterAction). Fired WITHOUT awaiting so the IPC
-    // response is not blocked for up to 3s on every interrupt -- design v2
-    // 3.3 specified fire-and-forget (NIM-591 panel finding, GLM-5.2 +
+    // caller: capture one process-backed turn identity, reserve the queue slot,
+    // then settle and sweep fail-closed. Fired WITHOUT awaiting so the IPC
+    // response is not blocked by the background settlement/recovery window --
+    // design v2 3.3 specified fire-and-forget (NIM-591 panel finding, GLM-5.2 +
     // DeepSeek Flash).
+    let plainSettlementTicket: QueueSettlementTicket | null = null;
+    let plainSettlementStarted = false;
     const settlePlainQueue = () => {
-      void this.settleQueueLeaseAfterAction(sessionId, provider as TurnAwareProvider, 'interruptCurrentTurn')
-        .then(() => sweepQueueDb())
+      if (plainSettlementStarted) return;
+      plainSettlementStarted = true;
+      void this.settleQueueLeaseAfterAction(
+        sessionId,
+        provider as TurnAwareProvider,
+        'interruptCurrentTurn',
+        sweepQueueDb,
+        plainSettlementTicket ?? undefined,
+      )
         .catch(err => logger.main.error('[AIService] interruptCurrentTurn: settlePlainQueue failed:', err));
     };
 
@@ -790,6 +1038,32 @@ export class AIService {
       && (!current || current.generation !== expectedState.generation || current.status !== expectedState.status)
     ) {
       return { success: false, error: 'stale lifecycle generation', nativeEntered: false };
+    }
+
+    if (expectedState) {
+      const activeSettlement = this.getActiveQueueSettlement(sessionId);
+      // A retained ticket has no active participant after its failed pass.
+      // The next priority caller must own a fresh recovery sweep instead of
+      // joining and immediately releasing an inert participant.
+      priorityOwnsSweep = activeSettlement === null || activeSettlement.participants === 0;
+      // Distinguish "nothing existed yet" (genuinely fresh reservation, the
+      // provider's serialized-admission invariant is the only claim in play)
+      // from "reviving a specific ticket that already failed to prove exact
+      // termination" (that prior unconfirmed attempt is the claim in play,
+      // and the fast path must not paper over it).
+      priorityRecoversRetainedTicket = activeSettlement !== null && activeSettlement.participants === 0;
+      prioritySettlementTicket = this.beginQueueSettlement(
+        sessionId,
+        provider as TurnAwareProvider,
+      );
+    } else {
+      // Reserve and capture immediately before the async provider action. No
+      // queue trigger can claim a new row, and the awaited interrupt cannot
+      // change which turn the later recovery windows observe.
+      plainSettlementTicket = this.beginQueueSettlement(
+        sessionId,
+        provider as TurnAwareProvider,
+      );
     }
 
     try {
@@ -3716,40 +3990,56 @@ export class AIService {
           reason: 'user_cancel'
         });
 
-        provider.abort();
-        // console.log(`[AIService] Cancelled request for session ${sessionId}`);
-        this.analytics.sendEvent('cancel_ai_request', {provider: providerType})
-
+        // Capture the exact turn and install the settlement reservation before
+        // signalling abort, keeping both turn identity and queue ownership
+        // stable across every later await.
+        const settlementTicket = this.beginQueueSettlement(
+          sessionId,
+          provider as TurnAwareProvider,
+        );
         // Defensive cleanup: if the in-flight turn was processing a queued
         // prompt, unwedge any DB row stuck in 'executing'. sweepExecutingForSession
         // is delivery-aware -- a prompt whose user message already landed in
         // ai_agent_messages is marked completed instead of rolled back, so the
         // queue trigger that follows the abort doesn't immediately re-claim and
-        // re-send the same input (NIM-615). The in-memory lease clear moved to
-        // AFTER abort() and is bounded-wait + isLeadBusy-gated
-        // (settleQueueLeaseAfterAction) -- was previously eager/before abort(),
-        // racing the actual teardown and reopening the window a third trigger
-        // could exploit to dispatch a second, genuinely concurrent turn
-        // (NIM-591). Fired without awaiting so the IPC response isn't blocked
-        // for up to 3s on every cancel -- design v2 3.3 specified
-        // fire-and-forget (NIM-591 panel finding, GLM-5.2 + DeepSeek Flash).
-        void this.settleQueueLeaseAfterAction(sessionId, provider as TurnAwareProvider, 'cancelRequest')
-          .then(async () => {
-            try {
-              const { getQueuedPromptsStore } = await import('../RepositoryManager');
-              const queueStore = getQueuedPromptsStore();
-              const { completed, failed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
-              if (completed > 0 || failed > 0 || rolledBack > 0) {
-                logger.main.info(
-                  `[AIService] cancelRequest: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`
-                );
-                await this.publishQueueStateToSync(sessionId);
-              }
-            } catch (sweepErr) {
-              logger.main.error('[AIService] cancelRequest: sweepExecutingForSession failed:', sweepErr);
+        // re-send the same input (NIM-615). The in-memory dispatch lease is
+        // replaced by a settlement reservation before abort and retained through
+        // exact process termination plus the DB sweep (NIM-591). Fired without
+        // awaiting so the IPC response isn't blocked by recovery.
+        const sweepQueueDb = async (): Promise<boolean> => {
+          try {
+            const { getQueuedPromptsStore } = await import('../RepositoryManager');
+            const queueStore = getQueuedPromptsStore();
+            const { completed, failed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
+            if (completed > 0 || failed > 0 || rolledBack > 0) {
+              logger.main.info(
+                `[AIService] cancelRequest: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`
+              );
+              await this.publishQueueStateToSync(sessionId);
             }
-          })
-          .catch(err => logger.main.error('[AIService] cancelRequest: settleQueueLeaseAfterAction failed:', err));
+            return true;
+          } catch (sweepErr) {
+            logger.main.error('[AIService] cancelRequest: sweepExecutingForSession failed:', sweepErr);
+            return false;
+          }
+        };
+        try {
+          provider.abort();
+          // console.log(`[AIService] Cancelled request for session ${sessionId}`);
+          this.analytics.sendEvent('cancel_ai_request', {provider: providerType})
+        } finally {
+          // Once beginQueueSettlement returns, every synchronous exit path must
+          // hand the ticket to a settlement pass. Provider or telemetry errors
+          // may still propagate to the caller, but cannot strand the FIFO hold.
+          void this.settleQueueLeaseAfterAction(
+            sessionId,
+            provider as TurnAwareProvider,
+            'cancelRequest',
+            sweepQueueDb,
+            settlementTicket,
+          )
+            .catch(err => logger.main.error('[AIService] cancelRequest: settleQueueLeaseAfterAction failed:', err));
+        }
 
         await this.forceSessionIdleOnCancel(sessionId);
         return { success: true };

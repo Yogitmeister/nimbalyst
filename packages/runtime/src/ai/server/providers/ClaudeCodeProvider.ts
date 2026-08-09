@@ -4,6 +4,9 @@
  */
 
 import { query, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { spawn } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
+import { EventEmitter } from 'node:events';
 import { randomUUID } from 'crypto';
 
 // Query interface not properly exported by SDK, so we define it inline
@@ -16,6 +19,370 @@ interface Query extends AsyncGenerator<SDKMessage, void> {
   reconnectMcpServer(serverName: string): Promise<void>;
   /** Close the query and terminate the underlying CLI subprocess. */
   close(): void;
+}
+
+// Mirrors the pinned SDK 0.3.221 SpawnedProcess/SpawnOptions contract. The
+// workspace's optional-dependency shim intentionally exposes only the SDK
+// surface used elsewhere, so these remain local instead of widening it.
+interface SDKSpawnedProcess {
+  stdin: NodeJS.WritableStream;
+  stdout: NodeJS.ReadableStream;
+  readonly killed: boolean;
+  readonly exitCode: number | null;
+  readonly signalCode?: NodeJS.Signals | null;
+  readonly pid?: number;
+  kill(signal: NodeJS.Signals): boolean;
+  on(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): void;
+  on(event: 'error', listener: (error: Error) => void): void;
+  once(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): void;
+  once(event: 'error', listener: (error: Error) => void): void;
+  off(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): void;
+  off(event: 'error', listener: (error: Error) => void): void;
+}
+
+interface SDKSpawnOptions {
+  command: string;
+  args: string[];
+  cwd?: string;
+  env: Record<string, string | undefined>;
+  signal: AbortSignal;
+}
+
+export interface TurnTerminationHandle {
+  readonly id: string;
+  waitForTermination(timeoutMs: number): Promise<'terminated' | 'timeout'>;
+  hardClose(reason: string): void;
+  acquireSettlementHold(): { release(): void };
+}
+
+/**
+ * One immutable turn identity spanning provider cleanup, its SDK Query, and the
+ * exact OS-process exit event exposed by the SDK's custom-spawn contract.
+ * Query.return() is still awaited because it cleans up transports and control
+ * requests, but the SDK bounds that internal wait at roughly two seconds. The
+ * process event below is therefore the load-bearing no-overlap receipt.
+ */
+class ClaudeTurnTermination implements TurnTerminationHandle {
+  readonly id = randomUUID();
+
+  private query: Query | null = null;
+  private process: SDKSpawnedProcess | null = null;
+  private hardCloseRequested = false;
+  private hardDetached = false;
+  private finished = false;
+  private processExited = false;
+  private settlementHolds = 0;
+  private settlementReleased: Promise<void> = Promise.resolve();
+  private resolveSettlementReleased: (() => void) | null = null;
+  private hardDetach: ((query: Query | null) => void) | null = null;
+  private exactExit: ((query: Query | null) => void) | null = null;
+  private resolveProcessExit!: () => void;
+  private resolveTermination!: () => void;
+  private readonly processExit = new Promise<void>((resolve) => {
+    this.resolveProcessExit = resolve;
+  });
+  private readonly termination = new Promise<void>((resolve) => {
+    this.resolveTermination = resolve;
+  });
+
+  constructor(private readonly abortController: AbortController) {}
+
+  setHardDetach(callback: (query: Query | null) => void): void {
+    this.hardDetach = callback;
+  }
+
+  setExactExit(callback: (query: Query | null) => void): void {
+    this.exactExit = callback;
+    if (this.processExited) callback(this.query);
+  }
+
+  isHardDetached(): boolean {
+    return this.hardDetached;
+  }
+
+  acquireSettlementHold(): { release(): void } {
+    if (this.settlementHolds === 0) {
+      this.settlementReleased = new Promise<void>((resolve) => {
+        this.resolveSettlementReleased = resolve;
+      });
+    }
+    this.settlementHolds += 1;
+    let released = false;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        this.settlementHolds = Math.max(0, this.settlementHolds - 1);
+        if (this.settlementHolds === 0) {
+          const resolve = this.resolveSettlementReleased;
+          this.resolveSettlementReleased = null;
+          resolve?.();
+        }
+      },
+    };
+  }
+
+  async waitForAdmission(timeoutMs: number): Promise<'terminated' | 'timeout'> {
+    const deadline = Date.now() + timeoutMs;
+    if (await this.waitForTermination(timeoutMs) === 'timeout') return 'timeout';
+    while (this.settlementHolds > 0) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return 'timeout';
+      if (await this.waitForPromise(this.settlementReleased, remaining) === 'timeout') return 'timeout';
+    }
+    return 'terminated';
+  }
+
+  installSpawnReceipt(options: Record<string, any>): void {
+    const configuredSpawn = options.spawnClaudeCodeProcess as
+      | ((spawnOptions: SDKSpawnOptions) => SDKSpawnedProcess)
+      | undefined;
+
+    options.spawnClaudeCodeProcess = (spawnOptions: SDKSpawnOptions): SDKSpawnedProcess => {
+      if (this.hardCloseRequested) {
+        const error = new Error('Turn hard-closed before SDK process spawn');
+        error.name = 'AbortError';
+        throw error;
+      }
+      const child = configuredSpawn
+        ? configuredSpawn(spawnOptions)
+        : this.spawnLocalProcess(spawnOptions, options.stderr);
+      this.attachProcess(child, !configuredSpawn);
+      return child;
+    };
+  }
+
+  attachQuery(queryHandle: Query): void {
+    this.query = queryHandle;
+    if (this.hardCloseRequested) {
+      this.closeQuery();
+    }
+  }
+
+  requestClose(): void {
+    this.abortController.abort();
+    this.closeQuery();
+  }
+
+  hardClose(reason: string): void {
+    this.hardCloseRequested = true;
+    console.error(`[CLAUDE-CODE] Hard-closing exact turn ${this.id}: ${reason}`);
+    if (!this.hardDetached) {
+      this.hardDetached = true;
+      this.hardDetach?.(this.query);
+    }
+    this.requestClose();
+    // With no process there is nothing to reap, even if a defensive/lazy SDK
+    // shape has already returned a Query. hardCloseRequested seals the spawn
+    // wrapper against any later process creation, so this is an exact
+    // no-process receipt even if the provider generator never reaches finish().
+    if (!this.process) {
+      this.markProcessExited();
+    }
+    void this.processExit.then(() => this.resolveTermination());
+    try {
+      this.process?.kill('SIGKILL');
+    } catch (error) {
+      console.error(`[CLAUDE-CODE] Failed to kill exact turn ${this.id}:`, error);
+    }
+  }
+
+  async finish(queryHandle: Query | null): Promise<void> {
+    if (this.finished) {
+      await this.termination;
+      return;
+    }
+    this.finished = true;
+    if (queryHandle) this.attachQuery(queryHandle);
+
+    if (this.hardDetached) {
+      if (!this.process) {
+        this.markProcessExited();
+      }
+      await this.processExit;
+      this.resolveTermination();
+      return;
+    }
+
+    // AsyncGenerator.return() invokes the SDK's cleanup path. It closes the
+    // transport and awaits waitForExit(), but only within the SDK's own bounded
+    // grace period. The independent processExit receipt below closes that gap.
+    if (this.query && typeof this.query.return === 'function') {
+      try {
+        await this.query.return(undefined);
+      } catch {
+        // The exact process receipt remains authoritative even if transport
+        // cleanup reports an already-closed generator.
+      }
+    }
+
+    // query() can fail before invoking the spawn callback. Once return() has
+    // completed there is no future transport spawn, so absence is terminal.
+    if (!this.process) {
+      this.markProcessExited();
+    }
+    await this.processExit;
+    this.resolveTermination();
+  }
+
+  async waitForTermination(timeoutMs: number): Promise<'terminated' | 'timeout'> {
+    return this.waitForPromise(this.termination, timeoutMs);
+  }
+
+  private async waitForPromise(
+    promise: Promise<void>,
+    timeoutMs: number,
+  ): Promise<'terminated' | 'timeout'> {
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), timeoutMs);
+    });
+    try {
+      return await Promise.race([
+        promise.then(() => 'terminated' as const),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private closeQuery(): void {
+    if (!this.query) return;
+    try {
+      this.query.close();
+    } catch {
+      // Idempotent best effort. Exact completion is observed through processExit.
+    }
+  }
+
+  private attachProcess(child: SDKSpawnedProcess, localNodeSpawn: boolean): void {
+    if (this.processExited) {
+      try {
+        child.kill('SIGKILL');
+      } finally {
+        throw new Error(`[CLAUDE-CODE] Turn ${this.id} spawned after its exact no-process termination receipt`);
+      }
+    }
+    if (this.process && this.process !== child) {
+      throw new Error(`[CLAUDE-CODE] Turn ${this.id} attempted to spawn more than one SDK process`);
+    }
+    this.process = child;
+    let settled = false;
+    const markExited = (): void => {
+      if (settled) return;
+      settled = true;
+      this.markProcessExited();
+    };
+    child.once('exit', markExited);
+    child.once('error', () => {
+      // A spawn failure has no OS child to reap. For Node ChildProcess this is
+      // identified by the absence of a pid; custom spawners can also report an
+      // already-terminal exitCode.
+      const pid = (child as SDKSpawnedProcess & { pid?: number }).pid;
+      if (child.exitCode !== null || (localNodeSpawn && pid === undefined)) markExited();
+    });
+    if (!localNodeSpawn && (child.exitCode !== null || child.signalCode != null)) markExited();
+    if (this.hardCloseRequested) {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // waitForTermination remains fail-closed if the process cannot be killed.
+      }
+    }
+  }
+
+  private markProcessExited(): void {
+    if (this.processExited) return;
+    this.processExited = true;
+    this.resolveProcessExit();
+    this.exactExit?.(this.query);
+  }
+
+  private spawnLocalProcess(
+    spawnOptions: SDKSpawnOptions,
+    stderr: ((data: string) => void) | undefined,
+  ): SDKSpawnedProcess {
+    const child = spawn(spawnOptions.command, spawnOptions.args, {
+      cwd: spawnOptions.cwd,
+      env: spawnOptions.env,
+      signal: spawnOptions.signal,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const exitEvents = new EventEmitter();
+    const decoder = new StringDecoder('utf8');
+    let stderrClosed = false;
+    let exitSeen = false;
+    let exitForwarded = false;
+    let exitCode: number | null = null;
+    let signalCode: NodeJS.Signals | null = null;
+    let stderrDrainTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const forwardExit = (): void => {
+      if (exitForwarded) return;
+      exitForwarded = true;
+      if (stderrDrainTimer) clearTimeout(stderrDrainTimer);
+      stderrDrainTimer = null;
+      exitEvents.emit('exit', exitCode, signalCode);
+      const stream = child.stderr as NodeJS.ReadableStream & {
+        unref?: () => void;
+        destroy?: () => void;
+      };
+      if (typeof stream.unref === 'function') stream.unref();
+      else stream.destroy?.();
+    };
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      const text = decoder.write(chunk);
+      if (text) stderr?.(text);
+    });
+    child.stderr.on('error', (error) => {
+      console.warn(`[CLAUDE-CODE-STDERR] stderr read failed: ${(error as NodeJS.ErrnoException).code ?? error.message}`);
+    });
+    child.stderr.once('close', () => {
+      const tail = decoder.end();
+      if (tail) stderr?.(tail);
+      stderrClosed = true;
+      if (exitSeen) forwardExit();
+    });
+    child.once('exit', (code, signal) => {
+      exitSeen = true;
+      exitCode = code;
+      signalCode = signal;
+      if (stderrClosed) {
+        forwardExit();
+      } else {
+        // Match the pinned SDK 0.3.221 ProcessTransport contract: surface
+        // process exit only after stderr drains, with the same 200ms ceiling.
+        stderrDrainTimer = setTimeout(forwardExit, 200);
+        stderrDrainTimer.unref?.();
+      }
+    });
+
+    const wrapped = {
+      stdin: child.stdin,
+      stdout: child.stdout,
+      get killed() { return child.killed; },
+      get exitCode() { return child.exitCode; },
+      get signalCode() { return child.signalCode; },
+      get pid() { return child.pid; },
+      kill: child.kill.bind(child),
+      on(event: 'exit' | 'error', listener: (...args: any[]) => void) {
+        if (event === 'exit') exitEvents.on(event, listener);
+        else child.on(event, listener);
+      },
+      once(event: 'exit' | 'error', listener: (...args: any[]) => void) {
+        if (event === 'exit') exitEvents.once(event, listener);
+        else child.once(event, listener);
+      },
+      off(event: 'exit' | 'error', listener: (...args: any[]) => void) {
+        if (event === 'exit') exitEvents.off(event, listener);
+        else child.off(event, listener);
+      },
+    };
+    return wrapped as SDKSpawnedProcess;
+  }
 }
 
 /** MCP server status as reported by the SDK */
@@ -299,6 +666,17 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   // Resolve function to break the for-await loop immediately when interrupt is called.
   // Racing this against .next() lets us unblock without waiting for the SDK transport.
   private interruptResolve: (() => void) | null = null;
+  // FIFO admission tail for replacement turns. A replacement may signal the
+  // active turn to stop, but it cannot publish a new controller (and therefore
+  // cannot reach SDK spawn) until the superseded turn's own Query.return() and
+  // exact process-exit receipt have settled. The tail also prevents two simultaneous replacements from both
+  // observing the same predecessor and spawning together (NIM-591 Race E5).
+  private turnStartAdmission: Promise<void> = Promise.resolve();
+  private static readonly TURN_START_SETTLEMENT_TIMEOUT_MS = 3000;
+  private currentTurnTermination: ClaudeTurnTermination | null = null;
+  private latestTurnTermination: ClaudeTurnTermination | null = null;
+  private latestStartedTurnId: string | null = null;
+  private hardRetiredTurnId: string | null = null;
   // Controller for the persistent prompt AsyncIterable. Ending it lets the
   // SDK's streamInput generator return and close the binary's stdin pipe.
   // Must be ended in the finally block of sendMessage and on abort.
@@ -491,6 +869,74 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
    */
   protected getCurrentAbortSignal(): AbortSignal | undefined {
     return this.abortController?.signal;
+  }
+
+  /**
+   * Admit one SDK turn at a time across the teardown/start boundary.
+   *
+   * This gate is intentionally narrower than the whole turn: the admitted
+   * caller closes the previous Query, waits for that exact turn's process exit
+   * and any AIService settlement hold, then publishes its own controller and
+   * releases the next caller. Timeout is fail-closed -- no replacement
+   * controller is created, so a wedged old subprocess or in-flight DB sweep
+   * can never overlap a newly published turn.
+   */
+  private async startSerializedTurn(sessionId: string | undefined): Promise<{
+    abortController: AbortController;
+    resolveTurnSettled: () => void;
+    turnTermination: ClaudeTurnTermination;
+  }> {
+    const previousAdmission = this.turnStartAdmission;
+    let releaseAdmission = () => {};
+    this.turnStartAdmission = new Promise<void>((resolve) => {
+      releaseAdmission = resolve;
+    });
+
+    await previousAdmission;
+    try {
+      if (this.hardRetiredTurnId) {
+        throw new Error('[CLAUDE-CODE] Provider was retired after hard recovery; retry on a fresh provider instance');
+      }
+      // Capture one immutable predecessor before signalling it. Never re-read a
+      // mutable provider field for the admission receipt.
+      // `currentTurnTermination` is cleared honestly once a turn finishes,
+      // but its settlement hold may remain through AIService's DB sweep. Keep
+      // the latest immutable handle as the FIFO predecessor until the next
+      // turn replaces it so post-exit callers cannot bypass that hold.
+      const previousTurn = this.latestTurnTermination;
+      previousTurn?.requestClose();
+      const previousTermination = previousTurn
+        ? await previousTurn.waitForAdmission(ClaudeCodeProvider.TURN_START_SETTLEMENT_TIMEOUT_MS)
+        : 'terminated';
+      if (previousTermination === 'timeout') {
+        throw new Error(
+          `[CLAUDE-CODE] Previous turn did not terminate and release its settlement hold within ${ClaudeCodeProvider.TURN_START_SETTLEMENT_TIMEOUT_MS}ms; replacement turn was not started`,
+        );
+      }
+      if (this.hardRetiredTurnId) {
+        throw new Error('[CLAUDE-CODE] Provider was retired after hard recovery; replacement turn was not started');
+      }
+
+      let resolveTurnSettled = () => {};
+      this.turnSettled = new Promise<void>((resolve) => {
+        resolveTurnSettled = resolve;
+      });
+      const abortController = new AbortController();
+      const turnTermination = new ClaudeTurnTermination(abortController);
+      turnTermination.setHardDetach((queryHandle) => {
+        this.detachHardClosedTurn(turnTermination, queryHandle);
+      });
+      turnTermination.setExactExit((queryHandle) => {
+        this.clearMcpStatusForTerminatedQuery(queryHandle, sessionId);
+      });
+      this.abortController = abortController;
+      this.currentTurnTermination = turnTermination;
+      this.latestTurnTermination = turnTermination;
+      this.latestStartedTurnId = turnTermination.id;
+      return { abortController, resolveTurnSettled, turnTermination };
+    } finally {
+      releaseAdmission();
+    }
   }
 
   /**
@@ -924,50 +1370,16 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       sessionId,
     });
 
-    // Abort any existing request before starting a new one -- a re-entrant
-    // call always supersedes and takes over "the current turn" for this
-    // provider instance (unchanged behavior from before this fix). Capture
-    // a LOCAL reference to the controller THIS turn creates; every
-    // subsequent read inside this generator body uses that local capture,
-    // never `this.abortController` again, so a LATER re-entrant call
-    // repointing the shared field can never silently redirect what THIS
-    // turn thinks it's checking or aborting (NIM-591).
-    //
-    // NOTE: this does NOT wait for the previous turn's teardown to
-    // complete before proceeding (deliberately conservative -- matches
-    // pre-fix behavior for latency). A stronger variant that adds
-    // `await this.turnSettled;` here (bounded by the existing stall
-    // watchdog below, not a new timeout) would close a residual rapid-
-    // sequential-reentrancy gap identified in pressure-test but changes
-    // latency behavior on rapid re-entrancy -- pending a scope decision,
-    // NOT implemented in this pass. Do not add it without being told to.
-    if (this.abortController) {
-      this.abortController.abort();
-    }
-    let resolveTurnSettled = () => {};
-    this.turnSettled = new Promise<void>(resolve => { resolveTurnSettled = resolve; });
-    const myAbortController = new AbortController();
-    this.abortController = myAbortController;
-
-    // For worktree sessions, use the parent project path for permission lookups
-    // This is passed via documentContext.permissionsPath from AIService
-    const permissionsPath = (documentContext as any)?.permissionsPath || workspacePath;
-
-    // For worktree sessions, use the parent project path for MCP config lookup
-    // .mcp.json and ~/.claude.json project entries are keyed by parent project path
-    const mcpConfigWorkspacePath = (documentContext as any)?.mcpConfigWorkspacePath || workspacePath;
-
-    // Create tool hooks service for this turn
-    // This service manages pre/post hooks, file tagging, and snapshot creation
-    this.toolHooksService = this.createToolHooksService(
-      workspacePath!,
-      sessionId,
-      permissionsPath,
-      false
-    );
-
-    // Clear edited files tracker for new turn
-    this.toolHooksService.clearEditedFiles();
+    // Supersede through the FIFO teardown/start gate. The new controller is
+    // not published until the previous turn's finally block has completed;
+    // on timeout this call fails closed before SDK spawn. Keep the returned
+    // controller local for every later read in this generator body so no
+    // external mutation can redirect this turn's abort ownership (NIM-591).
+    const {
+      abortController: myAbortController,
+      resolveTurnSettled,
+      turnTermination,
+    } = await this.startSerializedTurn(sessionId);
 
     // Capture stderr from the subprocess for diagnostics (populated inside try, read in catch)
     const stderrLines: string[] = [];
@@ -979,8 +1391,24 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     // Hoisted so the catch block can avoid double-yielding `complete` if the
     // result chunk's early-yield already fired before an error was thrown.
     let completeEmitted = false;
+    // Exact per-turn Query identity. Cleanup and process settlement must never
+    // re-read the mutable shared leadQuery field.
+    let myLeadQuery: Query | null = null;
 
     try {
+      // Everything after admission is protected by this finally. Any setup
+      // error must finish the exact turn handle instead of wedging all later
+      // FIFO callers behind a never-settling identity.
+      const permissionsPath = (documentContext as any)?.permissionsPath || workspacePath;
+      const mcpConfigWorkspacePath = (documentContext as any)?.mcpConfigWorkspacePath || workspacePath;
+      this.toolHooksService = this.createToolHooksService(
+        workspacePath!,
+        sessionId,
+        permissionsPath,
+        false
+      );
+      this.toolHooksService.clearEditedFiles();
+
       // Append document context to message using pre-built prompts from DocumentContextService
       // Skip adding system message if the prompt starts with a slash command
       const isSlashCommand = message.trimStart().startsWith('/');
@@ -1208,14 +1636,27 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         }
       };
 
+      // The SDK's Query.return() wait is internally bounded, so capture the
+      // custom-spawn process and its exact exit event for this turn before
+      // query() can spawn it.
+      turnTermination.installSpawnReceipt(options as Record<string, any>);
+
       const queryCallStart = Date.now();
+
+      if (myAbortController.signal.aborted) {
+        const abortError = new Error('Turn aborted before SDK query spawn');
+        abortError.name = 'AbortError';
+        throw abortError;
+      }
 
       const leadQuery: AsyncIterable<any> = query({
         prompt: promptInput as any,
         options
       });
 
-      this.leadQuery = leadQuery as unknown as Query;
+      myLeadQuery = leadQuery as unknown as Query;
+      this.leadQuery = myLeadQuery;
+      turnTermination.attachQuery(myLeadQuery);
       ClaudeCodeProvider.streamingInstances.add(this);
       this.teammateIdleMessagePending = false;
       // Reset per-turn background-drain state (defensive; also reset in finally).
@@ -2315,15 +2756,23 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         }
       }
     } finally {
-      // Don't stop MCP health checks or clear mcpQuery between turns -
-      // the SDK subprocess stays alive for session resume, so MCP operations
-      // (health checks, reconnect) should keep working between turns.
-      // They are cleaned up in abort() and when the provider is destroyed.
+      if (turnTermination.isHardDetached()) {
+        // hardClose synchronously detached every shared provider field owned by
+        // this turn. If this generator ever resumes, it must not run the normal
+        // shared cleanup and clobber a replacement turn.
+        resolveTurnSettled();
+        return;
+      }
+      // Keep MCP ownership until the exact Query/process termination receipt
+      // below; then clear it because this per-turn subprocess cannot service
+      // health requests after exit. A resumed turn publishes a fresh mcpQuery.
       // Kept for finalizeBackgroundDrain: after a drain, the subprocess must be
       // closed (not just stdin-ended) or it runs a doomed continuation turn
       // against the torn-down control channel and leaks. NIM-1470.
-      const queryForDrainCleanup = this.leadQuery;
-      this.leadQuery = null;
+      const queryForDrainCleanup = myLeadQuery;
+      if (this.leadQuery === myLeadQuery) {
+        this.leadQuery = null;
+      }
       ClaudeCodeProvider.streamingInstances.delete(this);
       // Identity-checked: only clear OUR OWN entry. A newer re-entrant call
       // may have already repointed `this.abortController` to ITS OWN
@@ -2369,16 +2818,14 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
 
       this.transportDied = false;
 
-      // Resolve LAST, after all other finally-block teardown above --
-      // "settled" must mean the turn's cleanup has actually completed
-      // (including promptController.end(), which signals the SDK to close
-      // stdin, and background-drain finalization), not just that the
-      // abortController field was cleared. An earlier draft resolved this
-      // right after the abortController clear, before that teardown ran --
-      // a caller awaiting waitForCurrentTurnSettled() could see "settled"
-      // while the SDK subprocess hadn't actually been signaled to tear down
-      // yet (NIM-591 panel finding, DeepSeek Flash, verified against this
-      // exact ordering).
+      // Resolve LAST, and only after Query.return() plus the exact spawned
+      // process exit event. The SDK's own waitForExit is bounded internally;
+      // turnTermination is the stronger no-overlap receipt.
+      await turnTermination.finish(queryForDrainCleanup);
+      this.clearMcpStatusForTerminatedQuery(queryForDrainCleanup, sessionId);
+      if (this.currentTurnTermination === turnTermination) {
+        this.currentTurnTermination = null;
+      }
       resolveTurnSettled();
     }
   }
@@ -2408,6 +2855,10 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       this.promptController.end('abort');
     }
 
+    // Close the exact current Query as well as signalling the controller. The
+    // later process-exit event is captured by currentTurnTermination.
+    this.currentTurnTermination?.requestClose();
+
     // Call base class abort (handles abortController and rejectAllPendingPermissions)
     super.abort();
 
@@ -2429,10 +2880,71 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       this.emitTaskUpdate(this.currentSessionId).catch(() => {});
     }
 
-    // Clean up MCP health checks and persistent query reference
+    // Keep MCP status until the exact process-exit callback. A failed/slow
+    // close must not advertise an empty server list while the process remains
+    // alive; normal and hard teardown share the same identity-scoped receipt.
+  }
+
+  /**
+   * Synchronously detach every shared provider field owned by a hard-closed
+   * turn. Its JS generator may remain wedged forever; if it later resumes, the
+   * hard-detached finally branch skips normal shared cleanup. This makes exact
+   * process exit a complete recovery receipt without letting stale JS cleanup
+   * mutate a replacement turn.
+   */
+  private detachHardClosedTurn(
+    turn: ClaudeTurnTermination,
+    queryHandle: Query | null,
+  ): void {
+    if (this.currentTurnTermination !== turn) return;
+
+    this.hardRetiredTurnId = turn.id;
+    this.currentTurnTermination = null;
+    if (!queryHandle || this.leadQuery === queryHandle) {
+      this.leadQuery = null;
+    }
+    ClaudeCodeProvider.streamingInstances.delete(this);
+    this.abortController = null;
+    this.interruptResolve = null;
+    this.wasInterrupted = false;
+    this.transportDied = false;
+
+    if (this.promptEndTimer) {
+      clearTimeout(this.promptEndTimer);
+      this.promptEndTimer = null;
+    }
+    if (this.promptController) {
+      this.promptController.end('hard-close-detach');
+      this.promptController = null;
+    }
+
+    this.drainingBackgroundTasks = false;
+    this.drainExitCause = 'aborted';
+    this.drainTerminalNotifications = [];
+  }
+
+  /** Clear the user-facing MCP cache only for the query that actually exited. */
+  private clearMcpStatusForTerminatedQuery(
+    queryHandle: Query | null,
+    sessionId: string | undefined,
+  ): void {
+    if (!queryHandle || this.mcpQuery !== queryHandle) return;
+    if (sessionId !== undefined && this.currentSessionId !== sessionId) return;
+
+    const statusSessionId = sessionId ?? this.currentSessionId;
     this.stopMcpHealthChecks();
     this.mcpQuery = null;
     this.currentSessionId = undefined;
+    this.mcpServerStatuses.clear();
+    this.mcpStatusesLastCheckedAt = null;
+    this.emit('mcpServerStatus:changed', {
+      sessionId: statusSessionId,
+      servers: [],
+      changes: [],
+      lastCheckedAt: null,
+      configuredNames: this.mcpSnapshotServerNames,
+      withheldNames: this.mcpWithheldServerNames,
+    });
   }
 
   // Per-session "transcript processing already scheduled" flag. The streaming
@@ -2839,6 +3351,45 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     return this.leadQuery !== null || this.teammateIdleMessagePending;
   }
 
+  /** Capture one immutable turn identity for bounded settlement/recovery. */
+  public captureCurrentTurnTermination(): TurnTerminationHandle | null {
+    return this.currentTurnTermination;
+  }
+
+  /**
+   * Capture the FIFO-predecessor identity startSerializedTurn() fences new-
+   * turn admission against (see latestTurnTermination), even after that
+   * turn's natural finish already cleared currentTurnTermination to null.
+   *
+   * AIService's settlement path uses this as a fallback when
+   * captureCurrentTurnTermination() is null, so a recovery pass that begins
+   * right after a clean finish -- before any replacement turn has started --
+   * can still acquire a settlement hold that blocks the next admission.
+   * Without it, nothing serializes that pass's async session-wide DB sweep
+   * against a newly starting generation (NIM-591 null-capture admission
+   * fence). Returns null only when no turn has ever started on this
+   * provider instance, which is the one case where there is genuinely
+   * nothing to fence.
+   */
+  public captureLatestTurnTermination(): TurnTerminationHandle | null {
+    return this.latestTurnTermination;
+  }
+
+  /** Exact FIFO/settlement capability consumed by AIService priority routing. */
+  public hasExactSerializedReplacementAdmission(): boolean {
+    return true;
+  }
+
+  /** Whether no newer provider turn has been published after the captured id. */
+  public isTurnCurrentForSettlement(turnId: string): boolean {
+    return this.latestStartedTurnId === turnId;
+  }
+
+  /** Provider-type-aware retirement authority for one exact hard-closed turn. */
+  public getHardRecoveryProviderType(turnId: string): 'claude-code' | null {
+    return this.hardRetiredTurnId === turnId ? 'claude-code' : null;
+  }
+
   /**
    * Check if the lead will resume after the current query completes.
    * Unlike isLeadBusy(), this does NOT check leadQuery (which is still set
@@ -2988,8 +3539,10 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         // Best effort — the process may already have exited.
       }
       if (this.mcpQuery === (query as unknown as Query)) {
+        // Keep the identity published until the exact process-exit receipt in
+        // sendMessage.finally clears both it and the user-facing status cache.
+        // Nulling only the query here would strand stale connected statuses.
         this.stopMcpHealthChecks();
-        this.mcpQuery = null;
       }
     }
 
