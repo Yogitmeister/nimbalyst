@@ -100,3 +100,84 @@ describe('ProviderFactory lifecycle cleanup', () => {
     expect(providerMap().size).toBe(0);
   });
 });
+
+describe('ProviderFactory.listExtensionAgentProvidersForSession', () => {
+  beforeEach(() => {
+    providerMap().clear();
+    providerOwnerMap().clear();
+  });
+
+  afterEach(() => {
+    providerMap().clear();
+    providerOwnerMap().clear();
+  });
+
+  it('finds a live extension-agent provider and parses its extension/contribution id', () => {
+    const agentProvider = { abort: vi.fn() };
+    cacheProvider('extension-agent:com.example.agent/example-agent-session-1', 'session-1', vi.fn());
+    providerMap().set('extension-agent:com.example.agent/example-agent-session-1', agentProvider as never);
+
+    const result = ProviderFactory.listExtensionAgentProvidersForSession('session-1');
+
+    expect(result).toEqual([{
+      extensionId: 'com.example.agent',
+      contributionId: 'example-agent',
+      provider: agentProvider,
+    }]);
+  });
+
+  it('excludes a suffix-colliding entry actually owned by a longer session id (NIM-590 batch item 5)', () => {
+    // 'extension-agent:.../example-agent-prefix-session-1' ends with the same
+    // '-session-1' suffix a naive string match on 'session-1' would accept --
+    // only the ownership check (providerOwners.get(key) === sessionId) tells
+    // these apart. If that check were ever "simplified" away as redundant
+    // with the suffix check, this collision would silently hand back another
+    // session's live agent provider.
+    const collidingProvider = { abort: vi.fn() };
+    cacheProvider(
+      'extension-agent:com.example.agent/example-agent-prefix-session-1',
+      'prefix-session-1',
+      vi.fn(),
+    );
+    providerMap().set('extension-agent:com.example.agent/example-agent-prefix-session-1', collidingProvider as never);
+
+    expect(ProviderFactory.listExtensionAgentProvidersForSession('session-1')).toEqual([]);
+    expect(ProviderFactory.listExtensionAgentProvidersForSession('prefix-session-1')).toEqual([{
+      extensionId: 'com.example.agent',
+      contributionId: 'example-agent',
+      provider: collidingProvider,
+    }]);
+  });
+
+  it('excludes a same-suffix built-in provider key that is not extension-agent-prefixed', () => {
+    cacheProvider('openai-codex-session-1', 'session-1', vi.fn());
+
+    expect(ProviderFactory.listExtensionAgentProvidersForSession('session-1')).toEqual([]);
+  });
+
+  it('excludes a malformed extension-agent key with no contribution separator', () => {
+    cacheProvider('extension-agent:malformed-session-1', 'session-1', vi.fn());
+
+    expect(ProviderFactory.listExtensionAgentProvidersForSession('session-1')).toEqual([]);
+  });
+
+  it('returns every distinct extension-agent entry for the session and none for others', () => {
+    const first = { abort: vi.fn() };
+    const second = { abort: vi.fn() };
+    const other = { abort: vi.fn() };
+    cacheProvider('extension-agent:com.example.one/agent-one-session-1', 'session-1', vi.fn());
+    providerMap().set('extension-agent:com.example.one/agent-one-session-1', first as never);
+    cacheProvider('extension-agent:com.example.two/agent-two-session-1', 'session-1', vi.fn());
+    providerMap().set('extension-agent:com.example.two/agent-two-session-1', second as never);
+    cacheProvider('extension-agent:com.example.one/agent-one-session-2', 'session-2', vi.fn());
+    providerMap().set('extension-agent:com.example.one/agent-one-session-2', other as never);
+
+    const result = ProviderFactory.listExtensionAgentProvidersForSession('session-1');
+
+    expect(result).toHaveLength(2);
+    expect(result).toEqual(expect.arrayContaining([
+      { extensionId: 'com.example.one', contributionId: 'agent-one', provider: first },
+      { extensionId: 'com.example.two', contributionId: 'agent-two', provider: second },
+    ]));
+  });
+});

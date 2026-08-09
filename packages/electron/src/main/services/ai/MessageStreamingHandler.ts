@@ -409,6 +409,36 @@ export async function runTerminalPromptTransition(params: {
   return { deferred, hasPendingPrompt };
 }
 
+export async function runQueueAwareSessionSettlement(params: {
+  hasOtherDeferral: boolean;
+  hasActiveQueueLease: () => boolean;
+  hasQueueDispatchAdmission: () => boolean;
+  tryDispatch: () => Promise<boolean>;
+  onDispatchDeclined?: () => void;
+  endSession: () => Promise<void>;
+}): Promise<{
+  deferred: boolean;
+  dispatched: boolean;
+  activeLease: boolean;
+  admissionBlocked: boolean;
+}> {
+  let dispatched = false;
+  if (!params.hasOtherDeferral && !params.hasActiveQueueLease()) {
+    dispatched = await params.tryDispatch();
+    if (!dispatched) params.onDispatchDeclined?.();
+  }
+
+  // The competing queue attempt may have converted its tentative claim
+  // reservation into a real dispatch lease while tryDispatch() was awaiting.
+  // Decide lifecycle ownership from the live post-attempt state, not the stale
+  // value observed before the await.
+  const activeLease = params.hasActiveQueueLease();
+  const admissionBlocked = params.hasQueueDispatchAdmission();
+  const deferred = params.hasOtherDeferral || dispatched || activeLease || admissionBlocked;
+  if (!deferred) await params.endSession();
+  return { deferred, dispatched, activeLease, admissionBlocked };
+}
+
 function resolveWorkspaceFileAttributionMode(
   providerName: string,
   provider: AIProvider | null | undefined,
@@ -459,6 +489,7 @@ interface AIServiceInternal {
   processingQueuedPromptIds: Set<string>;
   matchDebounceTimers: Map<string, ReturnType<typeof setTimeout>>;
   hasActiveQueueLease(sessionId: string): boolean;
+  hasQueueDispatchAdmission(sessionId: string): boolean;
   documentContextService: DocumentContextService;
   hooklessWatcher: HooklessAgentFileWatcher;
 
@@ -1460,6 +1491,12 @@ export class MessageStreamingHandler {
           logger.main.info(`[AIService] All teammates completed for ${data.sessionId}, but lead is busy — deferring endSession to sendMessage completion`);
           return;
         }
+        // A queued/continuation turn or an in-progress cancellation may
+        // already own this session's lifecycle. Mirrors onSubagentsDrainSettled
+        // below -- without this guard, an unknown/quarantined cancellation
+        // could be raced into idle by teammates completing at the same
+        // moment. See NIM-590 batch item 3.
+        if (this.svc.hasQueueDispatchAdmission(data.sessionId)) return;
 
         logger.main.info(`[AIService] All teammates completed for session ${data.sessionId}, ending deferred session`);
         await stateManager.endSession(data.sessionId);
@@ -1488,7 +1525,7 @@ export class MessageStreamingHandler {
         return;
       }
       // A queued/continuation turn may already be taking over; let it own the end.
-      if (this.svc.hasActiveQueueLease(data.sessionId)) return;
+      if (this.svc.hasQueueDispatchAdmission(data.sessionId)) return;
 
       logger.main.info(`[AIService] Sub-agent drain settled for session ${data.sessionId}, ending deferred session`);
       await stateManager.endSession(data.sessionId);
@@ -2577,7 +2614,7 @@ export class MessageStreamingHandler {
             if (
               isExtensionAgentSession
               && session?.id
-              && !this.svc.hasActiveQueueLease(session.id)
+              && !this.svc.hasQueueDispatchAdmission(session.id)
             ) {
               try {
                 await stateManager.updateActivity({ sessionId: session.id, status: 'error' });
@@ -2979,35 +3016,38 @@ export class MessageStreamingHandler {
             const willResume = session.provider === 'claude-code'
               && typeof (provider as any).willResumeAfterCompletion === 'function'
               && (provider as any).willResumeAfterCompletion();
-            const queuedChainAlreadyActive = this.svc.hasActiveQueueLease(session.id);
-            let queuedContinuationScheduled = false;
-            if (!hasTeammates && !willResume && !queuedChainAlreadyActive) {
-              queuedContinuationScheduled = await this.svc.tryDispatchNextQueuedPrompt(
+            const queueSettlement = await runQueueAwareSessionSettlement({
+              hasOtherDeferral: hasTeammates || willResume,
+              hasActiveQueueLease: () => this.svc.hasActiveQueueLease(session.id),
+              hasQueueDispatchAdmission: () => this.svc.hasQueueDispatchAdmission(session.id),
+              tryDispatch: () => this.svc.tryDispatchNextQueuedPrompt(
                 session.id,
                 workspacePath,
                 BrowserWindow.fromWebContents(event.sender),
                 'completion-handler queue',
-              );
-              if (!queuedContinuationScheduled) {
+              ),
+              onDispatchDeclined: () => {
                 // The direct dispatch declined (sender window gone, row claimed
                 // elsewhere, ...). Hand the session to the queue driver so any
                 // remaining rows retry instead of stranding until the user
                 // presses Escape or restarts (#962). It defers on session-busy
                 // and wakes on the endSession below.
                 this.svc.requestQueueDrive(session.id, workspacePath, 'fifo-continuation');
-              }
-            }
-            if (hasTeammates || willResume || queuedChainAlreadyActive || queuedContinuationScheduled) {
+              },
+              endSession: () => stateManager.endSession(session.id),
+            });
+            if (queueSettlement.deferred) {
               const reason = hasTeammates
                 ? 'teammates still active'
                 : willResume
                 ? 'lead resuming'
-                : queuedChainAlreadyActive
+                : queueSettlement.activeLease
                 ? 'queued continuation already active'
+                : queueSettlement.admissionBlocked
+                ? 'queue claim or cancellation admission pending'
                 : 'queued continuation scheduled';
               // logger.main.info(`[AIService] Deferring endSession for ${session.id} - ${reason}`);
             } else {
-              await stateManager.endSession(session.id);
               // Stop file watcher after a brief delay to let pending
               // watcher events drain through WorkspaceFileEditAttributionService.
               // The manager cancels the scheduled stop if a new turn starts
@@ -3156,7 +3196,7 @@ export class MessageStreamingHandler {
         sawComplete: sawCompleteChunk,
         providerError,
         alreadySettled: settledOnErrorChunk,
-        queuedChainActive: this.svc.hasActiveQueueLease(session.id),
+        queuedChainActive: this.svc.hasQueueDispatchAdmission(session.id),
       })) {
         logger.main.warn(
           `[AIService] Provider stream for ${session.id} ended on an error chunk without completing -- settling session`
@@ -3194,7 +3234,7 @@ export class MessageStreamingHandler {
       }
 
       // Clear executing and pending prompt flags for mobile sync
-      if (syncProvider && !this.svc.hasActiveQueueLease(session.id)) {
+      if (syncProvider && !this.svc.hasQueueDispatchAdmission(session.id)) {
         syncProvider.pushChange(session.id, {
           type: 'metadata_updated',
           metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },
@@ -3261,34 +3301,37 @@ export class MessageStreamingHandler {
         const willResumeOnError = session.provider === 'claude-code'
           && typeof (provider as any).willResumeAfterCompletion === 'function'
           && (provider as any).willResumeAfterCompletion();
-        const queuedChainAlreadyActiveOnError = this.svc.hasActiveQueueLease(session.id);
-        let queuedContinuationScheduledOnError = false;
-        if (!hasTeammatesOnError && !willResumeOnError && !queuedChainAlreadyActiveOnError) {
-          queuedContinuationScheduledOnError = await this.svc.tryDispatchNextQueuedPrompt(
+        const queueSettlementOnError = await runQueueAwareSessionSettlement({
+          hasOtherDeferral: hasTeammatesOnError || willResumeOnError,
+          hasActiveQueueLease: () => this.svc.hasActiveQueueLease(session.id),
+          hasQueueDispatchAdmission: () => this.svc.hasQueueDispatchAdmission(session.id),
+          tryDispatch: () => this.svc.tryDispatchNextQueuedPrompt(
             session.id,
             workspacePath,
             BrowserWindow.fromWebContents(event.sender),
             'error-handler queue',
-          );
-        }
-        if (hasTeammatesOnError || willResumeOnError || queuedChainAlreadyActiveOnError || queuedContinuationScheduledOnError) {
+          ),
+          endSession: () => stateManager.endSession(session.id),
+        });
+        if (queueSettlementOnError.deferred) {
           const reason = hasTeammatesOnError
             ? 'teammates still active'
             : willResumeOnError
             ? 'lead resuming'
-            : queuedChainAlreadyActiveOnError
+            : queueSettlementOnError.activeLease
             ? 'queued continuation already active'
+            : queueSettlementOnError.admissionBlocked
+            ? 'queue claim or cancellation admission pending'
             : 'queued continuation scheduled';
           logger.main.info(`[AIService] Deferring endSession for ${session.id} on error - ${reason}`);
         } else {
-          await stateManager.endSession(session.id);
           // Stop file watcher - session ended on error
           await this.svc.hooklessWatcher.stopForSession(session.id);
           codexEditWindowRegistry.clearSession(session.id);
         }
 
         // Clear executing and pending prompt flags for mobile sync on error
-        if (syncProvider && !this.svc.hasActiveQueueLease(session.id)) {
+        if (syncProvider && !this.svc.hasQueueDispatchAdmission(session.id)) {
           syncProvider.pushChange(session.id, {
             type: 'metadata_updated',
             metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },

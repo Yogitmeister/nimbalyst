@@ -50,7 +50,12 @@ import {
 } from '@nimbalyst/runtime/ai/server/types';
 // MCP imports removed - no longer using MCP HTTP server
 import { ToolExecutor, toolRegistry, BUILT_IN_TOOLS } from './tools';
-import { initMobileSessionControlHandler } from './MobileSessionControlHandler';
+import {
+  initMobileSessionControlHandler,
+  type NativeTurnCancellationOutcome,
+  type QueuedTurnCancellationResult,
+  type QueuedTurnCancellationTarget,
+} from './MobileSessionControlHandler';
 import { handleMobileVoiceToolCall } from '../voice/mobileVoiceToolHandler';
 import { SoundNotificationService } from '../SoundNotificationService';
 import { getTerminalSessionManager } from '../TerminalSessionManager';
@@ -146,11 +151,18 @@ import {
 } from './QueueDriveService';
 import { createWorkspaceWindowResolver } from './resolveWorkspaceWindow';
 import { runQueueDriveAttempt } from './queueDriveAttempt';
-import { clearStuckRunningState } from './clearStuckRunningState';
 import { publishQueuedPromptsToSync } from './queuedPromptSyncPublisher';
 import { onWorkspaceWindowAvailable } from '../../window/workspaceWindowAvailability';
 import { dispatchQueuedPromptToClaudeCli } from './claudeCliQueueDispatch';
-import { ensureClaudeCliSession, claudeCliSessionSupportsPlugins } from './claudeCliLauncherSingleton';
+import {
+  cancelAllNativeSessionOwners,
+  inspectNativeSessionOwners,
+} from './nativeSessionOwnerCensus';
+import {
+  ensureClaudeCliSession,
+  claudeCliSessionSupportsPlugins,
+  isClaudeCliLaunchInFlight,
+} from './claudeCliLauncherSingleton';
 import { supportsWorkspaceSlashWorkflowProvider } from '../../../shared/agentWorkflowProviders';
 import { toMillis } from '../../utils/timestampUtils';
 import {
@@ -222,6 +234,20 @@ export async function publishQueuedPromptSnapshotForSession(
   });
 }
 
+interface QueueCancellationFence {
+  generation: string;
+  quarantined: boolean;
+  targetLease?: symbol;
+  targetReservation?: symbol;
+  token: symbol;
+}
+
+interface QueueCancellationOperation {
+  fence: QueueCancellationFence;
+  promise: Promise<QueuedTurnCancellationResult>;
+  forceLifecycleSettlement: boolean;
+}
+
 export class AIService {
   private sessionManager: SessionManager;
   private settingsStore: Store<Record<string, unknown>> | null = null;
@@ -251,6 +277,23 @@ export class AIService {
   // the prior lease before priority delivery; a stale dispatch may settle
   // afterward, but cannot release a newer dispatch's lease or drain FIFO.
   private queueProcessingLeases = new Map<string, symbol>();
+  // Claim attempts reserve admission synchronously before their first await,
+  // but are not active dispatch chains and therefore must not make
+  // hasActiveQueueLease() defer session settlement.
+  private queueClaimReservations = new Map<string, symbol>();
+  // Set for the exact duration a queued dispatch is past its point of no
+  // return (inside sendMessageHandler). Unlike queueProcessingLeases, this is
+  // NEVER deleted by cancellation's fence-install step -- it exists so
+  // cancellation's native census can tell "nothing will ever start" (safe to
+  // report proven-no-owner) apart from "already committed but hasn't
+  // registered a native owner yet" (must not report proven-no-owner). See
+  // hasUncensusableAdmission() and NIM-590 batch item 1.
+  private queueDispatchCommitments = new Map<string, symbol>();
+  // Cancellation is a distinct admission owner. Unlike a claim reservation,
+  // it may outlive one operation when native liveness is unknown.
+  private queueCancellationFences = new Map<string, QueueCancellationFence>();
+  private queueCancellationOperations = new Map<string, QueueCancellationOperation>();
+  private queueCancellationGeneration = 0;
   private interactivePromptSettlements = new Map<string, Promise<{ success: boolean; error?: string }>>();
 
   /**
@@ -263,17 +306,302 @@ export class AIService {
     return this.queueProcessingLeases.has(sessionId);
   }
 
+  /**
+   * Full queue-side admission guard. The active-lease predicate above still
+   * identifies the actual dispatch-chain owner, while lifecycle exits also
+   * consult this broader guard so they cannot settle under a live claim or
+   * cancellation quarantine.
+   */
+  hasQueueDispatchAdmission(sessionId: string): boolean {
+    return this.queueProcessingLeases.has(sessionId)
+      || this.queueClaimReservations.has(sessionId)
+      || this.queueCancellationFences?.has(sessionId) === true;
+  }
+
+  /**
+   * The shared synchronous admission predicate for queue-driven, direct, and
+   * renderer-initiated turns. Every caller checks this predicate and installs
+   * its own owner before yielding, so whichever rail enters first fences the
+   * others. See NIM-590 batch item 1.
+   */
+  private hasTurnAdmission(sessionId: string): boolean {
+    return this.hasQueueDispatchAdmission(sessionId)
+      || this.directSendInFlight.has(sessionId)
+      || this.rendererSendInFlight.has(sessionId);
+  }
+
+  /**
+   * True while a turn is admitted (committed to running) but may not yet be
+   * visible to native-owner census -- a queued dispatch past its point of no
+   * return, a direct/renderer send mid-flight, or a `claude-code-cli` PTY
+   * still launching. Cancellation must not accept a zero-owner census result
+   * as proof of absence while any of these hold, or it will falsely declare
+   * a session idle while committed work is still about to register a real
+   * native owner. See NIM-590 batch items 1 and 2.
+   */
+  private hasUncensusableAdmission(sessionId: string): boolean {
+    // Optional-chained like hasQueueDispatchAdmission's queueCancellationFences
+    // check: this is reached from cancellation paths whose existing test
+    // harnesses (built via Object.create(AIService.prototype)) never needed
+    // to initialize direct/renderer-send tracking before this method existed.
+    return this.queueDispatchCommitments?.has(sessionId) === true
+      || this.directSendInFlight?.has(sessionId) === true
+      || this.rendererSendInFlight?.has(sessionId) === true
+      || isClaudeCliLaunchInFlight(sessionId);
+  }
+
+  private runQueuedTurnCancellation(
+    sessionId: string,
+    source: string,
+    cancelNativeTurn: (
+      target: QueuedTurnCancellationTarget,
+    ) => Promise<NativeTurnCancellationOutcome>,
+    options: { forceLifecycleSettlement?: boolean } = {},
+  ): Promise<QueuedTurnCancellationResult> {
+    const operations = this.queueCancellationOperations ??= new Map();
+    const existing = operations.get(sessionId);
+    if (existing) {
+      // Duplicate and cross-rail cancellation requests join the same captured
+      // generation. Their native callbacks never run late against a successor.
+      existing.forceLifecycleSettlement ||= options.forceLifecycleSettlement === true;
+      return existing.promise;
+    }
+
+    const fences = this.queueCancellationFences ??= new Map();
+    let fence = fences.get(sessionId);
+    if (!fence) {
+      const targetLease = this.queueProcessingLeases.get(sessionId);
+      const targetReservation = this.queueClaimReservations.get(sessionId);
+      const generationNumber = (this.queueCancellationGeneration ?? 0) + 1;
+      this.queueCancellationGeneration = generationNumber;
+      fence = {
+        generation: `cancel-${generationNumber}`,
+        quarantined: false,
+        targetLease,
+        targetReservation,
+        token: Symbol(`queued-turn-cancel:${source}:${sessionId}:${generationNumber}`),
+      };
+      fences.set(sessionId, fence);
+      if (targetLease && this.queueProcessingLeases.get(sessionId) === targetLease) {
+        this.queueProcessingLeases.delete(sessionId);
+      }
+      if (targetReservation && this.queueClaimReservations.get(sessionId) === targetReservation) {
+        this.queueClaimReservations.delete(sessionId);
+      }
+    }
+
+    // Defer execution by one microtask so the operation ledger is installed
+    // before a synchronously re-entrant duplicate can observe it.
+    let begin!: () => void;
+    const beginGate = new Promise<void>((resolve) => {
+      begin = resolve;
+    });
+    const operation = {
+      fence,
+      promise: Promise.resolve(null as unknown as QueuedTurnCancellationResult),
+      forceLifecycleSettlement: options.forceLifecycleSettlement === true,
+    } satisfies QueueCancellationOperation;
+    operation.promise = (async () => {
+      await beginGate;
+      return this.executeQueuedTurnCancellation(
+        sessionId,
+        source,
+        operation,
+        cancelNativeTurn,
+      );
+    })();
+    operations.set(sessionId, operation);
+    begin();
+    return operation.promise;
+  }
+
+  private async executeQueuedTurnCancellation(
+    sessionId: string,
+    source: string,
+    operation: QueueCancellationOperation,
+    cancelNativeTurn: (
+      target: QueuedTurnCancellationTarget,
+    ) => Promise<NativeTurnCancellationOutcome>,
+  ): Promise<QueuedTurnCancellationResult> {
+    const fences = this.queueCancellationFences ??= new Map();
+    const operations = this.queueCancellationOperations ??= new Map();
+    const target: QueuedTurnCancellationTarget = {
+      generation: operation.fence.generation,
+      isCurrent: () => fences.get(sessionId)?.token === operation.fence.token,
+    };
+    let nativeOutcome: NativeTurnCancellationOutcome;
+    try {
+      nativeOutcome = await cancelNativeTurn(target);
+      // A zero-owner census is only proof of absence when nothing is
+      // committed to starting. A queued dispatch past settleAdmission(true),
+      // a direct/renderer send mid-flight, or a claude-code-cli PTY still
+      // launching are all invisible to census yet guaranteed to register a
+      // real native owner shortly -- reporting proven-no-owner here would
+      // force the session idle while that committed work is still about to
+      // run. See NIM-590 batch items 1 and 2.
+      if (nativeOutcome.state === 'proven-no-owner' && this.hasUncensusableAdmission(sessionId)) {
+        nativeOutcome = {
+          state: 'unknown',
+          error: `a turn is committed to starting for ${sessionId} but has not yet registered a native owner`,
+        };
+      }
+    } catch (nativeCancelError) {
+      nativeOutcome = {
+        state: 'unknown',
+        error: nativeCancelError instanceof Error ? nativeCancelError.message : String(nativeCancelError),
+      };
+      logger.main.error(`[AIService] ${source}: native cancellation failed:`, nativeCancelError);
+    }
+
+    let rolledBack = 0;
+    let cleanupSucceeded = true;
+    const safeToRelease = nativeOutcome.state !== 'unknown';
+    if (safeToRelease) {
+      try {
+        const { getQueuedPromptsStore } = await import('../RepositoryManager');
+        const sweep = await getQueuedPromptsStore().sweepExecutingForSession(sessionId);
+        rolledBack = sweep.rolledBack;
+        const { completed, failed } = sweep;
+        if (completed > 0 || failed > 0 || rolledBack > 0) {
+          logger.main.info(
+            `[AIService] ${source}: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`,
+          );
+        }
+      } catch (sweepError) {
+        cleanupSucceeded = false;
+        logger.main.error(`[AIService] ${source}: sweepExecutingForSession failed:`, sweepError);
+      }
+      try {
+        await this.publishQueueStateToSync(sessionId);
+      } catch (publishError) {
+        // Best-effort UI nudge -- a stale mobile queue view is not a
+        // correctness problem, so this does not gate cleanupSucceeded.
+        logger.main.error(`[AIService] ${source}: queue-state publication failed:`, publishError);
+      }
+    }
+
+    const shouldSettleLifecycle = safeToRelease && (
+      operation.forceLifecycleSettlement
+      || nativeOutcome.state === 'proven-no-owner'
+      || (nativeOutcome.state === 'native-entered' && nativeOutcome.settleLifecycle !== false)
+    );
+    let lifecycleSettlementSucceeded = false;
+    if (shouldSettleLifecycle) {
+      try {
+        lifecycleSettlementSucceeded = await this.forceSessionIdleOnCancel(sessionId);
+      } catch (settlementError) {
+        // Native ownership is already gone/proven absent. A local-state repair
+        // failure must not leak the cancellation admission owner forever.
+        cleanupSucceeded = false;
+        logger.main.error(`[AIService] ${source}: revoked lifecycle settlement failed:`, settlementError);
+      }
+    }
+    // A cleanup-stage failure must not be reported as success: the durable
+    // row sweep or the local lifecycle settlement may not actually have
+    // happened even though native cancellation was entered, so the fence
+    // must stay in place (retry required) rather than silently declaring
+    // victory. See NIM-590 batch item 4.
+    const cleanupConfirmed = safeToRelease && cleanupSucceeded;
+    if (cleanupConfirmed && fences.get(sessionId)?.token === operation.fence.token) {
+      if (!lifecycleSettlementSucceeded) {
+        // This fence is clearing without us having settled the lifecycle
+        // (shouldSettleLifecycle was false -- an ordinary interrupt trusting
+        // the provider's own completion to own settlement). If that
+        // completion's onChainSettled/onTeammatesAllCompleted/
+        // onSubagentsDrainSettled callback already fired and was discarded
+        // because this fence made hasQueueDispatchAdmission true at the time,
+        // nothing will ever end the session -- it can silently report a
+        // clean cancel (quarantined: false) while staying "running" forever.
+        // forceSessionIdleOnCancel is already idempotent (shouldForceIdleOnCancel
+        // no-ops unless the session is still genuinely 'running'), and no new
+        // turn could have been admitted for this session while the fence we're
+        // about to delete still existed (hasQueueDispatchAdmission gates every
+        // admission rail on it) -- so this replay can only affect a session
+        // that a dropped completion left stranded, never a legitimate new
+        // turn. See NIM-590 batch item 3's residual gap (independent review,
+        // program-owner-directed bounded investigation, 2026-08-10).
+        //
+        // Wrapped exactly like the primary branch above: forceSessionIdleOnCancel
+        // now rejects on a genuine repair failure instead of swallowing it, so
+        // a real failure here must ALSO quarantine (re-checked below) rather
+        // than silently clearing the fence. Round-2 finding-3-fix correction:
+        // the true/false return also lets lifecycleSettlementSucceeded become
+        // accurately true when the replay finds a genuinely stranded session
+        // and forces it idle, not just when the primary branch already ran.
+        try {
+          lifecycleSettlementSucceeded = await this.forceSessionIdleOnCancel(sessionId);
+        } catch (replayError) {
+          cleanupSucceeded = false;
+          logger.main.error(`[AIService] ${source}: deferred-settlement replay failed:`, replayError);
+        }
+      }
+      // Re-check cleanupSucceeded (not the earlier cleanupConfirmed const):
+      // the replay above can turn a previously-confirmed cleanup into a
+      // failure, and that must still quarantine instead of clearing the fence.
+      if (cleanupSucceeded && fences.get(sessionId)?.token === operation.fence.token) {
+        fences.delete(sessionId);
+      } else if (fences.get(sessionId)?.token === operation.fence.token) {
+        operation.fence.quarantined = true;
+        logger.main.error(
+          `[AIService] ${source}: deferred-settlement replay failed for ${sessionId}; retaining admission quarantine`,
+        );
+      }
+    } else if (fences.get(sessionId)?.token === operation.fence.token) {
+      operation.fence.quarantined = true;
+      logger.main.error(
+        `[AIService] ${source}: ${!safeToRelease ? 'native liveness is unknown' : 'cleanup after native cancellation failed'} for ${sessionId}; retaining admission quarantine`,
+      );
+    }
+
+    if (operations.get(sessionId) === operation) {
+      operations.delete(sessionId);
+    }
+    return {
+      nativeOutcome,
+      quarantined: fences.get(sessionId)?.token === operation.fence.token,
+      rolledBack,
+      // Whether forceSessionIdleOnCancel was attempted AND actually
+      // succeeded, independent of nativeOutcome -- a joined cross-rail
+      // cancellation can settle the lifecycle because a DIFFERENT joiner
+      // requested it (forceLifecycleSettlement), so callers must not
+      // re-derive this from nativeOutcome.settleLifecycle. A THROWN
+      // settlement attempt must report false here even though it was
+      // attempted -- the receipt reflects what genuinely happened, never
+      // merely what was intended (independent review finding, NIM-590 batch
+      // item 9: the pre-fix version returned shouldSettleLifecycle here,
+      // which stayed true on a throw even though nothing was settled).
+      lifecycleSettled: lifecycleSettlementSucceeded,
+    };
+  }
+
+  private cancelQueuedPromptTurnForMobile(
+    sessionId: string,
+    cancelNativeTurn: (
+      target: QueuedTurnCancellationTarget,
+    ) => Promise<NativeTurnCancellationOutcome>,
+  ): Promise<QueuedTurnCancellationResult> {
+    return this.runQueuedTurnCancellation(
+      sessionId,
+      'mobile cancel',
+      cancelNativeTurn,
+      { forceLifecycleSettlement: true },
+    );
+  }
+
   // Track mobile session creation requests to prevent duplicate processing
   // (can happen if the same request is delivered multiple times)
   private processingMobileSessionRequests = new Set<string>();
 
-  // Dedicated re-entrancy guard for sendMessageDirect (compact_session and any
-  // other direct-invocation caller). Deliberately separate from
-  // queueProcessingLeases -- that map's interrupt/revocation semantics are
-  // owned by the queued-prompt dispatch chain, and a direct send is neither a
-  // dispatch nor an interrupt. Checked alongside hasActiveQueueLease() so a
-  // direct send still cannot overlap a queue-driven turn for the same session.
+  // Dedicated owner for sendMessageDirect (compact_session and other direct
+  // callers). It remains separate from queue lease revocation, while the
+  // shared hasTurnAdmission() predicate makes direct and queue entry mutual.
   private directSendInFlight = new Set<string>();
+  // Dedicated owner for the real renderer ai:sendMessage IPC entry point --
+  // reserved synchronously before the first await, symmetric with
+  // directSendInFlight, so a genuine chat-panel send participates in the same
+  // mutual-admission and census-safety guards as the direct and queued rails
+  // instead of running completely unfenced. See NIM-590 batch item 1.
+  private rendererSendInFlight = new Set<string>();
 
   // Service for preparing document context (transition detection, diff computation, etc.)
   private documentContextService = new DocumentContextService();
@@ -425,14 +753,25 @@ export class AIService {
    * a few seconds after every click. Clearing the state here means one click
    * always stops the session, whichever way the turn ended.
    */
-  private async forceSessionIdleOnCancel(sessionId: string): Promise<void> {
-    try {
-      const stateManager = getSessionStateManager();
-      if (!shouldForceIdleOnCancel(stateManager.getSessionState(sessionId))) return;
-      await stateManager.interruptSession(sessionId);
-    } catch (error) {
-      logger.main.error(`[AIService] Failed to clear session state on cancel for ${sessionId}:`, error);
-    }
+  /**
+   * Returns true only if the session was actually still 'running' and this
+   * call forced it idle; false if shouldForceIdleOnCancel found nothing to
+   * do (already idle/completed/errored). A genuine repair failure REJECTS
+   * -- it is not swallowed here -- so callers that need to distinguish
+   * "nothing was stranded" from "the repair itself failed" (and quarantine
+   * accordingly) can. Independent review finding, round 2 of the finding-3
+   * fix (2026-08-10): the prior void-returning version caught and logged
+   * `interruptSession` failures internally, so a genuine state-manager error
+   * was indistinguishable from a clean no-op to every caller -- both looked
+   * like a successful settlement, letting a real failure clear the
+   * cancellation fence and report a clean cancel while the session stayed
+   * stranded.
+   */
+  private async forceSessionIdleOnCancel(sessionId: string): Promise<boolean> {
+    const stateManager = getSessionStateManager();
+    if (!shouldForceIdleOnCancel(stateManager.getSessionState(sessionId))) return false;
+    await stateManager.interruptSession(sessionId);
+    return true;
   }
 
   private getQueueDrive(): QueueDriveService {
@@ -524,7 +863,7 @@ export class AIService {
     return runQueueDriveAttempt<Electron.BrowserWindow>(
       {
         listPendingIds: async (id) => (await queueStore.listPending(id)).map((row) => row.id),
-        isChainActive: (id) => this.queueProcessingLeases.has(id),
+        isChainActive: (id) => this.hasQueueDispatchAdmission(id),
         isSessionBusy: (id) => {
           const liveState = getSessionStateManager().getSessionState(id);
           return !!liveState && (liveState.status === 'running' || liveState.isStreaming);
@@ -649,66 +988,19 @@ export class AIService {
       return { success: false, error: 'Session not found', nativeEntered: false };
     }
 
-    if (session.provider === 'claude-code-cli') {
-      const terminalManager = getTerminalSessionManager();
-      if (!terminalManager.isTerminalActive(sessionId)) {
-        return { success: false, error: 'No active terminal for session', nativeEntered: false };
-      }
-      const current = await readLifecycle();
-      if (
-        expectedState
-        && (!current || current.generation !== expectedState.generation || current.status !== expectedState.status)
-      ) {
-        return { success: false, error: 'stale lifecycle generation', nativeEntered: false };
-      }
-      try {
-        terminalManager.writeToTerminal(sessionId, '\x03');
-        this.queueProcessingLeases.delete(sessionId);
-        try {
-          const { getQueuedPromptsStore } = await import('../RepositoryManager');
-          await getQueuedPromptsStore().sweepExecutingForSession(sessionId);
-        } catch (sweepError) {
-          logger.main.error('[AIService] CLI interrupt queue sweep failed:', sweepError);
-        }
-        logger.main.info(`[AIService] Interrupted claude-code-cli terminal for session ${sessionId}`);
-        return { success: true, method: 'terminal-ctrl-c', nativeEntered: true };
-      } catch (error) {
+    if (expectedState) {
+      const ownerCensus = inspectNativeSessionOwners(sessionId);
+      if (ownerCensus.failures.length > 0) {
         return {
           success: false,
-          error: error instanceof Error ? error.message : String(error),
-          nativeEntered: true,
+          error: `Native owner census incomplete: ${ownerCensus.failures.join('; ')}`,
+          nativeEntered: false,
         };
       }
-    }
-
-    const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);
-    if (!provider) {
-      return { success: false, error: 'No active provider for session', nativeEntered: false };
-    }
-
-    const sweepInterruptedQueue = async () => {
-      this.queueProcessingLeases.delete(sessionId);
-      try {
-        const { getQueuedPromptsStore } = await import('../RepositoryManager');
-        const queueStore = getQueuedPromptsStore();
-        const { completed, failed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
-        if (completed > 0 || failed > 0 || rolledBack > 0) {
-          logger.main.info(
-            `[AIService] interruptCurrentTurn: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`
-          );
-        }
-      } catch (sweepErr) {
-        logger.main.error('[AIService] interruptCurrentTurn: sweepExecutingForSession failed:', sweepErr);
+      if (ownerCensus.owners.length === 0) {
+        return { success: false, error: 'No active native owner for session', nativeEntered: false };
       }
-    };
-
-    // Preserve the manual IPC behavior. Priority callers pass an expected
-    // lifecycle token; for them, avoid mutating queue state until after the
-    // fenced provider interrupt has actually been entered.
-    if (!expectedState) {
-      await sweepInterruptedQueue();
     }
-
     const current = await readLifecycle();
     if (
       expectedState
@@ -716,38 +1008,51 @@ export class AIService {
     ) {
       return { success: false, error: 'stale lifecycle generation', nativeEntered: false };
     }
-
-    try {
-      const result = await provider.interruptCurrentTurn();
-      if (expectedState) {
-        await sweepInterruptedQueue();
+    const cancellation = await this.runQueuedTurnCancellation(
+      sessionId,
+      expectedState ? 'priority native-owner interrupt' : 'interruptCurrentTurn native owners',
+      (target) => cancelAllNativeSessionOwners(sessionId, target, 'interrupt'),
+    );
+    if (cancellation.nativeOutcome.state === 'native-entered') {
+      // Native entry succeeding does not guarantee cleanup succeeded -- the
+      // row sweep or the local lifecycle settlement can still fail after a
+      // clean native abort/interrupt. Independent review finding, NIM-590
+      // batch item 4: this branch previously returned success:true
+      // unconditionally here, the same class of bug as ai:cancelRequest.
+      if (cancellation.quarantined) {
+        logger.main.error(
+          `[AIService] Interrupted current turn for session ${sessionId} (method=${cancellation.nativeOutcome.method}) but cleanup could not be confirmed; retaining admission quarantine`,
+        );
+        return {
+          success: false,
+          error: 'Native cancellation entered but cleanup could not be confirmed; retry',
+          method: cancellation.nativeOutcome.method,
+          nativeEntered: true,
+          forcedIdle: cancellation.lifecycleSettled,
+        };
       }
-      logger.main.info(`[AIService] Interrupted current turn for session ${sessionId} (method=${result.method})`);
-
-      // A session stuck at running/streaming with no turn behind it would
-      // otherwise defer the follow-up queue drive on a `session:completed`
-      // that can never arrive (NIM-2434).
-      const stateManager = getSessionStateManager();
-      const forcedIdle = await clearStuckRunningState(
-        {
-          getSessionState: (id) => stateManager.getSessionState(id),
-          interruptSession: (id) => stateManager.interruptSession(id),
-          logWarn: (message) => logger.main.warn(message),
-        },
-        { sessionId, hadActiveTurn: result.hadActiveTurn },
+      logger.main.info(
+        `[AIService] Interrupted current turn for session ${sessionId} (method=${cancellation.nativeOutcome.method})`,
       );
-
-      return { success: true, method: result.method, nativeEntered: true, forcedIdle };
-    } catch (error) {
-      if (expectedState) {
-        await sweepInterruptedQueue();
-      }
       return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
+        success: true,
+        method: cancellation.nativeOutcome.method,
         nativeEntered: true,
+        // Read the operation's actual settlement outcome, not
+        // nativeOutcome.settleLifecycle -- a joining caller (e.g. a mobile
+        // cancel with forceLifecycleSettlement) can cause this operation to
+        // force the lifecycle idle even when the winning native outcome's own
+        // settleLifecycle bit says otherwise. See NIM-590 batch item 9.
+        forcedIdle: cancellation.lifecycleSettled,
       };
     }
+    return {
+      success: false,
+      error: cancellation.nativeOutcome.state === 'unknown'
+        ? cancellation.nativeOutcome.error
+        : 'No active native owner for session',
+      nativeEntered: false,
+    };
   }
 
   public async respondToInteractivePrompt(params: {
@@ -1406,8 +1711,10 @@ export class AIService {
     let settledChildErrored = false;
 
     return tryClaimAndDispatchNextQueuedPrompt({
+      claimReservations: this.queueClaimReservations,
       continueQueuedPromptChain: (nextSessionId, nextWorkspacePath, nextTargetWindow, nextSource) =>
         this.continueQueuedPromptChain(nextSessionId, nextWorkspacePath, nextTargetWindow, nextSource),
+      isTurnAdmissionBlocked: (candidateSessionId) => this.hasTurnAdmission(candidateSessionId),
       logError: (message, error) => logger.main.error(message, error),
       logInfo: (message) => logger.main.info(message),
       resolveLiveWindow: findWindowByWorkspace,
@@ -1449,6 +1756,15 @@ export class AIService {
         }
       },
       onChainSettled: async ({ sessionId: settledSessionId, source: settledSource }) => {
+        // A cancellation fence (native liveness unknown/quarantined) or a
+        // fresh claim reservation may have been installed for this session in
+        // the instant since the caller's own lease was released. Either one
+        // already owns -- or will own -- the session's lifecycle settlement;
+        // ending it here would race an unknown/quarantined cancellation into
+        // reporting idle underneath it. Mirrors onSubagentsDrainSettled in
+        // MessageStreamingHandler.ts. See NIM-590 batch item 3.
+        if (this.hasQueueDispatchAdmission(settledSessionId)) return;
+
         // The completion handler in MessageStreamingHandler deferred endSession
         // because processingLeases still contained this session while the inner
         // sendMessage was running. Now that the chain has fully drained, mark
@@ -1475,6 +1791,7 @@ export class AIService {
       preflight: preflightSessionPromptDispatch,
       queueStore,
       sendMessageHandler: this.sendMessageHandler,
+      sessionDispatchCommitments: this.queueDispatchCommitments,
       sessionId,
       source,
       startSession: ({ sessionId: activeSessionId, workspacePath: activeWorkspacePath }) =>
@@ -1565,12 +1882,10 @@ export class AIService {
     if (!this.sendMessageHandler) {
       throw new Error('AI service not initialized');
     }
-    // Guard against overlapping a turn already running for this session,
-    // whether owned by the queued-prompt dispatch chain (queueProcessingLeases,
-    // via hasActiveQueueLease) or another concurrent direct send
-    // (directSendInFlight) -- see that field's own comment for why these are
-    // separate guards rather than one shared set.
-    if (this.hasActiveQueueLease(sessionId) || this.directSendInFlight.has(sessionId)) {
+    // New-turn admission must respect both an active dispatch chain and the
+    // tentative claim window that precedes it. Lifecycle settlement still
+    // uses hasActiveQueueLease() so a declining probe never owns completion.
+    if (this.hasTurnAdmission(sessionId)) {
       throw new Error(`Session ${sessionId} is already processing a turn`);
     }
     const targetWindow = findWindowByWorkspace(workspacePath);
@@ -2199,16 +2514,11 @@ export class AIService {
       initMobileSessionControlHandler(syncProvider, findWindowByWorkspace, {
         triggerQueuedPromptProcessing: (sessionId, workspacePath) =>
           this.triggerQueuedPromptProcessingForSession(sessionId, workspacePath, 'mobile-control'),
-        rollbackExecutingPrompts: async (sessionId) => {
-          // Use the delivery-aware sweep so that a mobile-initiated cancel
-          // doesn't re-deliver a prompt that already landed in the
-          // conversation. Returns the count of rows that actually moved
-          // back to pending (matches the prior contract).
-          const { getQueuedPromptsStore } = await import('../RepositoryManager');
-          const { rolledBack } = await getQueuedPromptsStore().sweepExecutingForSession(sessionId);
-          await this.publishQueueStateToSync(sessionId);
-          return rolledBack;
-        },
+        // Keep one identity fence installed across provider/PTY resolution,
+        // native abort/Ctrl-C, delivery-aware sweep, and local lifecycle
+        // settlement. The returned count preserves the mobile rollback contract.
+        cancelQueuedPromptTurn: (sessionId, cancelNativeTurn) =>
+          this.cancelQueuedPromptTurnForMobile(sessionId, cancelNativeTurn),
       });
     } catch (error) {
       logger.main.error('[AIService] Failed to initialize mobile sync handler:', error);
@@ -2772,7 +3082,38 @@ export class AIService {
         workspacePath,
       );
     };
-    safeHandle('ai:sendMessage', this.sendMessageHandler);
+    safeHandle('ai:sendMessage', async (
+      event,
+      message: string,
+      documentContext?: DocumentContext,
+      sessionId?: string,
+      workspacePath?: string,
+    ) => {
+      if (sessionId && this.queueCancellationFences?.has(sessionId)) {
+        throw new Error(
+          'Session cancellation is incomplete; retry cancellation before sending another turn',
+        );
+      }
+      if (!sessionId) {
+        return this.sendMessageHandler!(event, message, documentContext, sessionId, workspacePath);
+      }
+      // The real renderer IPC entry point had no admission reservation of its
+      // own -- queued and direct dispatch each install one synchronously
+      // before their first await, but a plain chat-panel send went straight
+      // into sendMessageHandler unfenced. Without this, a concurrent
+      // cancellation's native census could find zero owners and force the
+      // session idle while this suspended send was still going to create a
+      // real provider a moment later. See NIM-590 batch item 1.
+      if (this.hasTurnAdmission(sessionId)) {
+        throw new Error(`Session ${sessionId} is already processing a turn`);
+      }
+      this.rendererSendInFlight.add(sessionId);
+      try {
+        return await this.sendMessageHandler!(event, message, documentContext, sessionId, workspacePath);
+      } finally {
+        this.rendererSendInFlight.delete(sessionId);
+      }
+    });
 
     // Get session history (full session data with messages - slow)
     safeHandle('ai:getSessions', async (event, workspacePath?: string) => {
@@ -3590,87 +3931,46 @@ export class AIService {
         return { success: false, error: 'Session model recovery is pending' };
       }
 
-      // Use repository directly - we just need session metadata (provider type),
-      // not the full session load with messages
-      const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
-      const session = await AISessionsRepository.get(sessionId);
-      if (!session) {
-        console.warn(`[AIService] Cancel failed - session not found: ${sessionId}`);
-        return { success: false, error: 'Session not found' };
-      }
-
-      if (session.provider === 'claude-code-cli') {
-        const terminalManager = getTerminalSessionManager();
-        if (!terminalManager.isTerminalActive(sessionId)) {
-          console.warn(`[AIService] Cancel failed - no active claude-code-cli terminal for session: ${sessionId}`);
-          return { success: false, error: 'No active terminal for session' };
-        }
-
-        terminalManager.writeToTerminal(sessionId, '\x03');
-        this.queueProcessingLeases.delete(sessionId);
-        try {
-          const { getQueuedPromptsStore } = await import('../RepositoryManager');
-          await getQueuedPromptsStore().sweepExecutingForSession(sessionId);
-        } catch (sweepError) {
-          logger.main.error('[AIService] CLI cancel queue sweep failed:', sweepError);
-        }
-        this.analytics.sendEvent('ai_stream_interrupted', {
-          provider: 'claude-code-cli',
-          chunksReceived: chunksReceived || 0,
-          reason: 'user_cancel'
-        });
-        this.analytics.sendEvent('cancel_ai_request', { provider: 'claude-code-cli' });
-        return { success: true };
-      }
-
-      // console.log(`[AIService] Session found, provider type: ${session.provider}`);
-      const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);
-      // console.log(`[AIService] Provider lookup result: ${provider ? 'found' : 'NOT FOUND'}`);
-      if (provider) {
-        // Get provider type
-        const providerType = (provider as any).providerType || 'unknown';
-
-        // Track stream interruption
-        this.analytics.sendEvent('ai_stream_interrupted', {
-          provider: providerType,
-          chunksReceived: chunksReceived || 0,
-          reason: 'user_cancel'
-        });
-
-        // Defensive cleanup: if the in-flight turn was processing a queued
-        // prompt, drop the in-memory guard and unwedge any DB row stuck in
-        // 'executing'. sweepExecutingForSession is delivery-aware -- a
-        // prompt whose user message already landed in ai_agent_messages is
-        // marked completed instead of rolled back, so the queue trigger
-        // that follows the abort doesn't immediately re-claim and re-send
-        // the same input (NIM-615).
-        this.queueProcessingLeases.delete(sessionId);
-        try {
-          const { getQueuedPromptsStore } = await import('../RepositoryManager');
-          const queueStore = getQueuedPromptsStore();
-          const { completed, failed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
-          if (completed > 0 || failed > 0 || rolledBack > 0) {
-            logger.main.info(
-              `[AIService] cancelRequest: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`
-            );
-            await this.publishQueueStateToSync(sessionId);
+      let cancelledProviderType: string | null = null;
+      const cancellation = await this.runQueuedTurnCancellation(
+        sessionId,
+        'cancelRequest',
+        async (target) => {
+          const outcome = await cancelAllNativeSessionOwners(sessionId, target, 'abort');
+          if (outcome.state === 'native-entered') {
+            cancelledProviderType = outcome.method;
           }
-        } catch (sweepErr) {
-          logger.main.error('[AIService] cancelRequest: sweepExecutingForSession failed:', sweepErr);
-        }
-
-        provider.abort();
-        // console.log(`[AIService] Cancelled request for session ${sessionId}`);
-        this.analytics.sendEvent('cancel_ai_request', {provider: providerType})
-        await this.forceSessionIdleOnCancel(sessionId);
-        return { success: true };
+          return outcome;
+        },
+        { forceLifecycleSettlement: true },
+      );
+      if (cancellation.nativeOutcome.state === 'unknown') {
+        return {
+          success: false,
+          error: `Native cancellation unresolved; admission quarantined: ${cancellation.nativeOutcome.error}`,
+        };
       }
-      // No live provider: the turn is already gone (e.g. it died on an in-band
-      // error chunk without settling). Cancel must still be authoritative --
-      // otherwise the stale 'running' state in SessionStateManager survives and
-      // the renderer's processing reconcile re-asserts the spinner seconds later.
-      console.warn(`[AIService] Cancel: no active provider for session ${sessionId} - clearing stale running state`);
-      await this.forceSessionIdleOnCancel(sessionId);
+      // Native cancellation can enter cleanly while durable cleanup (the row
+      // sweep or the local lifecycle settlement) still fails -- quarantined
+      // is a distinct fact from nativeOutcome.state and must gate the
+      // caller-facing receipt too, not just the internal fence. Independent
+      // review finding, NIM-590 batch item 4: this call site previously
+      // returned success:true whenever nativeOutcome wasn't 'unknown',
+      // silently reporting success on a cleanup failure.
+      if (cancellation.quarantined) {
+        return {
+          success: false,
+          error: 'Native cancellation entered but cleanup could not be confirmed; retry cancellation before sending another prompt',
+        };
+      }
+      if (cancelledProviderType) {
+        this.analytics.sendEvent('ai_stream_interrupted', {
+          provider: cancelledProviderType,
+          chunksReceived: chunksReceived || 0,
+          reason: 'user_cancel',
+        });
+        this.analytics.sendEvent('cancel_ai_request', { provider: cancelledProviderType });
+      }
       return { success: true };
     });
 

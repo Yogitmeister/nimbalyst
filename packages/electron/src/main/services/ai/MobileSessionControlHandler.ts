@@ -22,7 +22,12 @@ import {
   getRequestUserInputFallbackResponseChannel,
   getToolPermissionResponseChannel,
 } from '../../mcp/tools/interactiveToolHandlers';
-import { deliverMobilePromptResponse, resolveSessionProvider } from './MobilePromptDelivery';
+import { deliverMobilePromptResponse } from './MobilePromptDelivery';
+import {
+  cancelAllNativeSessionOwners,
+  type NativeTurnCancellationOutcome,
+  type QueuedTurnCancellationTarget,
+} from './nativeSessionOwnerCensus';
 import {
   getGitCommitProposalResponseChannel,
   resolveGitCommitProposalPromptId,
@@ -104,6 +109,27 @@ interface GitCommitResponse {
   message?: string;
 }
 
+export type {
+  NativeTurnCancellationOutcome,
+  QueuedTurnCancellationTarget,
+} from './nativeSessionOwnerCensus';
+
+export interface QueuedTurnCancellationResult {
+  nativeOutcome: NativeTurnCancellationOutcome;
+  quarantined: boolean;
+  rolledBack: number;
+  /**
+   * Whether this operation actually invoked local lifecycle settlement
+   * (forceSessionIdleOnCancel), independent of `nativeOutcome`. A joined
+   * cross-rail cancellation can settle the lifecycle because a DIFFERENT
+   * joiner requested it (forceLifecycleSettlement), even when the winning
+   * native outcome's own `settleLifecycle` bit says otherwise -- callers
+   * must read this field instead of re-deriving the answer from
+   * `nativeOutcome.settleLifecycle`. See NIM-590 batch item 9.
+   */
+  lifecycleSettled: boolean;
+}
+
 /**
  * Worktree sessions retain the parent project as `workspacePath` for session
  * listing and permissions. Commit execution must use the session's actual
@@ -133,11 +159,17 @@ export interface MobileSessionControlCallbacks {
   triggerQueuedPromptProcessing(sessionId: string, workspacePath: string): Promise<boolean>;
 
   /**
-   * Reset any prompts stuck in 'executing' back to 'pending' for the given
-   * session. Used by `case 'cancel'` so a queued prompt in-flight when
-   * mobile cancels isn't left permanently wedged.
+   * Revoke tentative/active queued-turn ownership, invoke cancelNativeTurn
+   * while that revocation fence is held, delivery-aware sweep the durable row,
+   * and settle any started local lifecycle. Unknown native liveness retains
+   * the fence as a quarantine until an explicit retry proves a safe outcome.
    */
-  rollbackExecutingPrompts(sessionId: string): Promise<number>;
+  cancelQueuedPromptTurn(
+    sessionId: string,
+    cancelNativeTurn: (
+      target: QueuedTurnCancellationTarget,
+    ) => Promise<NativeTurnCancellationOutcome>,
+  ): Promise<QueuedTurnCancellationResult>;
 }
 
 /**
@@ -155,7 +187,7 @@ export function initMobileSessionControlHandler(
   }
 
   const cleanup = syncProvider.onSessionControlMessage((message) => {
-    handleControlMessage(message, findWindowByWorkspace, callbacks);
+    handleControlMessage(message, syncProvider, findWindowByWorkspace, callbacks);
   });
 
   // log.info('Mobile session control handler initialized');
@@ -168,6 +200,7 @@ export function initMobileSessionControlHandler(
  */
 function handleControlMessage(
   message: SessionControlMessage,
+  syncProvider: SyncProvider,
   findWindowByWorkspace: (workspacePath: string) => BrowserWindow | null | undefined,
   callbacks: MobileSessionControlCallbacks
 ): void {
@@ -175,7 +208,7 @@ function handleControlMessage(
 
   switch (message.type) {
     case 'cancel':
-      void handleCancel(message.sessionId, callbacks);
+      void handleCancel(message.sessionId, syncProvider, callbacks);
       break;
 
     // Legacy handler - kept for backwards compatibility with older mobile versions
@@ -386,49 +419,85 @@ function handleRequestUserInputResponse(
  */
 async function handleCancel(
   sessionId: string,
+  syncProvider: SyncProvider,
   callbacks: MobileSessionControlCallbacks
 ): Promise<void> {
-  // Defensive cleanup (provider-agnostic): if a queued prompt was in-flight when
-  // mobile cancelled, the DB row would otherwise stay 'executing' and be invisible
-  // to listPending. Rollback so the queue isn't wedged after this cancel.
-  const rollbackQueuedPrompts = async () => {
-    try {
-      const rolledBack = await callbacks.rollbackExecutingPrompts(sessionId);
-      if (rolledBack > 0) {
-        log.info(`Mobile cancel: rolled back ${rolledBack} executing prompt(s) for session ${sessionId}`);
-      }
-    } catch (rollbackErr) {
-      log.error('Mobile cancel: rollbackExecutingPrompts failed:', rollbackErr);
+  // AIService installs one identity-owned fence before invoking the supplied
+  // native operation, and releases it only after provider/PTY resolution,
+  // abort/Ctrl-C, delivery-aware sweep, and local lifecycle settlement.
+  try {
+    const result = await callbacks.cancelQueuedPromptTurn(
+      sessionId,
+      (target) => cancelAllNativeSessionOwners(sessionId, target, 'abort'),
+    );
+    if (result.rolledBack > 0) {
+      log.info(`Mobile cancel: rolled back ${result.rolledBack} executing prompt(s) for session ${sessionId}`);
     }
-  };
-
-  // claude-code-cli is an external CLI process with NO in-process provider —
-  // abort it by sending Ctrl-C to the terminal PTY, mirroring the desktop
-  // `ai:cancelRequest` handler (AIService.ts).
-  const { providerType, provider } = await resolveSessionProvider(sessionId);
-  if (providerType === 'claude-code-cli') {
-    const { getTerminalSessionManager } = await import('../TerminalSessionManager');
-    const terminalManager = getTerminalSessionManager();
-    if (!terminalManager.isTerminalActive(sessionId)) {
-      log.warn('Mobile cancel: no active claude-code-cli terminal for session:', sessionId);
-      return;
+    if (result.quarantined) {
+      log.error(
+        `Mobile cancel: native liveness unknown; session ${sessionId} remains admission-quarantined`,
+      );
+      notifyAllWindows('ai:sessionCancelIncomplete', {
+        sessionId,
+        error: result.nativeOutcome.state === 'unknown'
+          ? result.nativeOutcome.error
+          : 'Native cancellation did not complete',
+        retryRequired: true,
+      });
+    } else {
+      notifyAllWindows('ai:sessionCancelled', { sessionId });
     }
-    await rollbackQueuedPrompts();
-    terminalManager.writeToTerminal(sessionId, '\x03');
-    log.info('Mobile cancel: sent Ctrl+C to CLI session', sessionId);
-    notifyAllWindows('ai:sessionCancelled', { sessionId });
-    return;
+    await reportCancelResult(syncProvider, {
+      sessionId,
+      type: 'cancel_result',
+      payload: {
+        success: !result.quarantined,
+        quarantined: result.quarantined,
+        rolledBack: result.rolledBack,
+        nativeState: result.nativeOutcome.state,
+        ...(result.nativeOutcome.state === 'unknown'
+          ? { error: result.nativeOutcome.error, retryRequired: true }
+          : {}),
+      },
+      timestamp: Date.now(),
+      sentBy: 'desktop',
+    });
+  } catch (cancelCleanupError) {
+    log.error('Mobile cancel: cancelQueuedPromptTurn failed:', cancelCleanupError);
+    const error = cancelCleanupError instanceof Error
+      ? cancelCleanupError.message
+      : String(cancelCleanupError);
+    notifyAllWindows('ai:sessionCancelIncomplete', {
+      sessionId,
+      error,
+      retryRequired: true,
+    });
+    await reportCancelResult(syncProvider, {
+      sessionId,
+      type: 'cancel_result',
+      payload: {
+        success: false,
+        quarantined: true,
+        retryRequired: true,
+        error,
+      },
+      timestamp: Date.now(),
+      sentBy: 'desktop',
+    });
   }
+}
 
-  if (provider && 'abort' in provider) {
-    log.info('Aborting session:', sessionId);
-    await rollbackQueuedPrompts();
-    (provider as { abort: () => void }).abort();
-
-    // Notify renderer to update UI
-    notifyAllWindows('ai:sessionCancelled', { sessionId });
-  } else {
-    log.warn('No provider found or provider does not support abort:', sessionId);
+async function reportCancelResult(
+  syncProvider: SyncProvider,
+  message: SessionControlMessage,
+): Promise<void> {
+  try {
+    await syncProvider.sendSessionControlMessage?.(message);
+  } catch (error) {
+    // The native cancellation result remains authoritative even when its
+    // best-effort mobile acknowledgement cannot be delivered. Do not turn a
+    // sync transport failure into a second cancellation attempt.
+    log.error('Mobile cancel: failed to report cancellation result:', error);
   }
 }
 

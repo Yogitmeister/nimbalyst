@@ -46,6 +46,7 @@ import { recordCodexActivity } from '../../store/listeners/codexUsageListeners';
 import { PendingReviewBanner } from '../AIChat/PendingReviewBanner';
 import { WakeupBanner } from '../AIChat/WakeupBanner';
 import { McpLockdownBanner } from '../AIChat/McpLockdownBanner';
+import { CancelIncompleteBanner } from '../AIChat/CancelIncompleteBanner';
 import type { AIMode } from './ModeTag';
 // Note: ExitPlanMode, AskUserQuestion, and ToolPermission use inline widgets via InteractiveWidgetHost (in runtime package)
 import { SlashCommandSuggestions } from './SlashCommandSuggestions';
@@ -2641,6 +2642,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
             fileEdits={sessionFileEdits}
             renderFilesHeader={mode === 'agent' ? () => (
               <>
+                <CancelIncompleteBanner sessionId={sessionId} />
                 <WakeupBanner sessionId={sessionId} />
                 <PendingReviewBanner workspacePath={workspacePath} sessionId={sessionId} />
               </>
@@ -2781,6 +2783,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       {mode === 'chat' && !collapseTranscript && (
         <>
           <McpLockdownBanner provider={typeof provider === 'string' ? provider : undefined} />
+          <CancelIncompleteBanner sessionId={sessionId} />
           <WakeupBanner sessionId={sessionId} />
           <PendingReviewBanner workspacePath={workspacePath} sessionId={sessionId} />
         </>

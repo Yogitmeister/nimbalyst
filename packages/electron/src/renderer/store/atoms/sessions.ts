@@ -190,6 +190,25 @@ export const sessionHasPendingInteractivePromptAtom = atomFamily((_sessionId: st
   atom(false)
 );
 
+export interface SessionCancelIncomplete {
+  error: string;
+  retryRequired: boolean;
+}
+
+/**
+ * Per-session "cancellation could not be proven" state. Set when the main
+ * process cannot confirm every native agent process actually stopped (see
+ * `ai:sessionCancelIncomplete`, emitted from a mobile-initiated cancel that
+ * comes back with unknown native liveness). Null once a subsequent
+ * cancellation proves the session is safely idle. Without a renderer
+ * consumer for this event, a desktop window with no request in flight of
+ * its own had no way to learn that a cancellation it did not initiate
+ * failed to complete. See NIM-590 batch item 6.
+ */
+export const sessionCancelIncompleteAtom = atomFamily((_sessionId: string) =>
+  atom<SessionCancelIncomplete | null>(null)
+);
+
 export type AgentBubbleColor = 'orange' | 'green' | 'blue';
 
 export interface AgentSessionAttentionGroups {

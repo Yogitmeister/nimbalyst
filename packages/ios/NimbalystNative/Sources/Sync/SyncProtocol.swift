@@ -767,6 +767,12 @@ struct SessionControlMessage: Encodable {
     let message: SessionControlPayload
 }
 
+struct SessionControlBroadcast: Codable {
+    let type: String
+    let message: SessionControlPayload
+    let fromConnectionId: String?
+}
+
 struct SessionControlPayload: Codable {
     let sessionId: String
     let messageType: String

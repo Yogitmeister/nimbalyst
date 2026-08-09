@@ -34,6 +34,7 @@ import {
   sessionLastReadAtom,
   sessionHasPendingInteractivePromptAtom,
   sessionPendingPromptsAtom,
+  sessionCancelIncompleteAtom,
   sessionRegistryAtom,
   sessionChildrenAtom,
   sessionStoreAtom,
@@ -756,6 +757,33 @@ export function initSessionStateListeners(): () => void {
   };
 
   /**
+   * A cancellation (from any window/device) proved this session safely idle.
+   * Clear any stale incomplete-cancellation state a prior attempt left behind
+   * for the same session, in addition to the usual pending-prompt cleanup.
+   */
+  const handleSessionCancelled = (data: { sessionId: string; questionId?: string }) => {
+    handleAskUserQuestionResolved(data);
+    if (!data.sessionId) return;
+    store.set(sessionCancelIncompleteAtom(data.sessionId), null);
+  };
+
+  /**
+   * A mobile-initiated cancellation could not prove every native agent
+   * process stopped. This desktop window may not have requested the cancel
+   * itself (it has no IPC return value to inspect), so this broadcast is its
+   * only signal -- without a listener the incomplete result was silently
+   * dropped and the UI had no way to know a retry was required.
+   */
+  const handleSessionCancelIncomplete = (data: { sessionId: string; error?: string; retryRequired?: boolean }) => {
+    const { sessionId } = data;
+    if (!sessionId) return;
+    store.set(sessionCancelIncompleteAtom(sessionId), {
+      error: data.error || 'The desktop could not prove every agent process stopped. Retry cancellation before sending another prompt.',
+      retryRequired: data.retryRequired !== false,
+    });
+  };
+
+  /**
    * Handle ExitPlanMode confirm events globally.
    * Sets pending interactive prompt indicator for the sidebar.
    */
@@ -1082,6 +1110,7 @@ export function initSessionStateListeners(): () => void {
   let cleanupAskUserQuestion: (() => void) | undefined;
   let cleanupAskUserQuestionAnswered: (() => void) | undefined;
   let cleanupSessionCancelled: (() => void) | undefined;
+  let cleanupSessionCancelIncomplete: (() => void) | undefined;
   let cleanupExitPlanModeConfirm: (() => void) | undefined;
   let cleanupExitPlanModeResolved: (() => void) | undefined;
   let cleanupToolPermission: (() => void) | undefined;
@@ -1105,7 +1134,8 @@ export function initSessionStateListeners(): () => void {
     cleanupTitleUpdated = window.electronAPI.on('session:title-updated', handleTitleUpdated);
     cleanupAskUserQuestion = window.electronAPI.on('ai:askUserQuestion', handleAskUserQuestion);
     cleanupAskUserQuestionAnswered = window.electronAPI.on('ai:askUserQuestionAnswered', handleAskUserQuestionResolved);
-    cleanupSessionCancelled = window.electronAPI.on('ai:sessionCancelled', handleAskUserQuestionResolved);
+    cleanupSessionCancelled = window.electronAPI.on('ai:sessionCancelled', handleSessionCancelled);
+    cleanupSessionCancelIncomplete = window.electronAPI.on('ai:sessionCancelIncomplete', handleSessionCancelIncomplete);
     cleanupExitPlanModeConfirm = window.electronAPI.on('ai:exitPlanModeConfirm', handleExitPlanModeConfirm);
     cleanupExitPlanModeResolved = window.electronAPI.on('ai:exitPlanModeResolved', handleExitPlanModeResolved);
     cleanupToolPermission = window.electronAPI.on('ai:toolPermission', handleToolPermission);
@@ -1164,6 +1194,7 @@ export function initSessionStateListeners(): () => void {
     cleanupAskUserQuestion?.();
     cleanupAskUserQuestionAnswered?.();
     cleanupSessionCancelled?.();
+    cleanupSessionCancelIncomplete?.();
     cleanupExitPlanModeConfirm?.();
     cleanupExitPlanModeResolved?.();
     cleanupToolPermission?.();
