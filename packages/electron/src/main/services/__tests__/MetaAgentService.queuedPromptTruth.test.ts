@@ -88,6 +88,7 @@ describe('MetaAgentService queued prompt truth', () => {
     expect(triggerQueuedPromptProcessingMock).toHaveBeenCalledWith(
       'target-session',
       '/workspace',
+      'meta-agent',
     );
   });
 });

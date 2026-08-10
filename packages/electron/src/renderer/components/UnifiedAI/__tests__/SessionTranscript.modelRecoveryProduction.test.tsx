@@ -80,6 +80,14 @@ vi.mock("@nimbalyst/runtime/ai/server/SessionStateManager", () => ({
     startSession: productionSeam.startSession,
     endSession: productionSeam.endSession,
     getSessionState: vi.fn(() => ({ status: "idle" })),
+    // The real SessionStateManager extends EventEmitter; QueueDriveService's
+    // onSessionIdle wake path subscribes to session:completed/error/interrupted
+    // via .on()/.removeListener() whenever a drive attempt defers with
+    // reason: 'session-busy'. No test here depends on that wake ever firing,
+    // so no-op stubs are enough to keep AIService's real onSessionIdle wiring
+    // from throwing.
+    on: vi.fn(),
+    removeListener: vi.fn(),
   }),
 }));
 vi.mock("../../../../main/window/WindowManager", () => ({
@@ -409,11 +417,15 @@ async function initializeProductionSeam() {
     { registerTerminalHandlers },
     { ProviderFactory },
     { logger },
+    { createWorkspaceWindowResolver },
+    { findWindowByWorkspace },
   ] = await Promise.all([
     import("../../../../main/services/ai/AIService"),
     import("../../../../main/ipc/TerminalHandlers"),
     import("@nimbalyst/runtime/ai/server"),
     import("../../../../main/utils/logger"),
+    import("../../../../main/services/ai/resolveWorkspaceWindow"),
+    import("../../../../main/window/WindowManager"),
   ]);
   productionSeam.loggerInfoSpy = vi.spyOn(logger.main, "info");
   productionSeam.providerGetSpy = vi
@@ -430,6 +442,24 @@ async function initializeProductionSeam() {
   aiService.directSendInFlight = new Set();
   aiService.sessionManager = { saveDraftInput: vi.fn(async () => true) };
   aiService.hooklessWatcher = { scheduleStop: vi.fn() };
+  // AIService's real constructor eagerly builds this field (used by the
+  // queued-prompt driver to resolve/auto-open a session's workspace window);
+  // Object.create() above skips the constructor, so it must be wired by hand
+  // here the same way, or every drive attempt for a session with pending
+  // prompts throws "Cannot read properties of undefined (reading 'resolve')"
+  // deep inside QueueDriveService, which swallows it into a silent
+  // 'provider-unavailable' defer that never retries into a real dispatch.
+  aiService.queueWindowResolver = createWorkspaceWindowResolver({
+    findWindow: (workspacePath: string) => findWindowByWorkspace(workspacePath),
+    isDestroyed: (window: { isDestroyed(): boolean }) => window.isDestroyed(),
+    workspaceExists: () => true,
+    createWindow: () => productionSeam.browserWindow,
+    waitForLoad: async () => undefined,
+    isQuitting: () => false,
+    now: () => 0,
+    logInfo: (message: string) => logger.main.info(message),
+    logWarn: (message: string) => logger.main.warn(message),
+  });
   aiService.setupIpcHandlers();
   registerTerminalHandlers();
   return aiService;
@@ -1518,12 +1548,18 @@ describe("SessionTranscript mounted production model-recovery seam", () => {
         await productionSeam.queueStore.get("sdk-blocked-queued")
       ).toMatchObject({ status: "completed" })
     );
+    // Both mounted "sdk-blocked" transcripts fire a renderer-trigger edge on
+    // recovery, but QueueDriveService.drive() coalesces concurrent edges for
+    // one session into a single in-flight attempt by design (see
+    // QueueDriveService.test.ts "collapses concurrent drive requests for one
+    // session into a single dispatch") -- so exactly one claim call is the
+    // correct outcome here, not a race that happens to resolve to one.
     expect(
       claim.mock.calls.filter(
         ([promptId, sessionId]) =>
           promptId === "sdk-blocked-queued" && sessionId === "sdk-blocked"
       ).length
-    ).toBeGreaterThanOrEqual(2);
+    ).toBe(1);
     expect(successfulClaims).toEqual(["sdk-blocked-queued"]);
     expect(create).not.toHaveBeenCalled();
     expect(remove).toHaveBeenCalledTimes(1);

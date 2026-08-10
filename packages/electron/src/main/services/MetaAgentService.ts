@@ -1307,7 +1307,10 @@ export class MetaAgentService {
       sessionId
     );
 
-    const normalizedPrompt = prompt.trim();
+    // Whitespace validation above is not payload normalization -- do not trim here.
+    // A queued prompt payload should preserve leading/trailing whitespace the
+    // caller may have deliberately sent (see MetaAgentService.queuedPromptTruth.test.ts).
+    const normalizedPrompt = prompt;
     const promptProvenance: PromptProvenance = {
       actor: 'agent',
       origin: 'session-orchestration',
@@ -1318,7 +1321,7 @@ export class MetaAgentService {
     const statusBeforeQueue = (statusRow?.status || 'idle') as SessionStatusValue;
 
     if (shouldBypassExecution) {
-      await this.persistSyntheticInputMessage(sessionId, normalizedPrompt);
+      await this.persistSyntheticInputMessage(sessionId, normalizedPrompt, promptProvenance);
       return JSON.stringify({
         sessionId,
         queuedPromptId: null,
@@ -1873,7 +1876,7 @@ export class MetaAgentService {
       interruptCurrentTurn: (targetSessionId, expectedState) =>
         this.aiService!.interruptCurrentTurnForSession(targetSessionId, expectedState),
       triggerProcessing: (targetSessionId, targetWorkspaceId) =>
-        this.aiService!.triggerQueuedPromptProcessingForSession(targetSessionId, targetWorkspaceId),
+        this.aiService!.triggerQueuedPromptProcessingForSession(targetSessionId, targetWorkspaceId, 'meta-agent'),
       getControlPrompt: async (promptId) =>
         await queueStore.get(promptId) as unknown as PriorityControlPrompt | null,
     });
