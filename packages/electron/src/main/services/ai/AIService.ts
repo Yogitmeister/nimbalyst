@@ -314,7 +314,7 @@ export class AIService {
    */
   hasQueueDispatchAdmission(sessionId: string): boolean {
     return this.queueProcessingLeases.has(sessionId)
-      || this.queueClaimReservations.has(sessionId)
+      || this.queueClaimReservations?.has(sessionId) === true
       || this.queueCancellationFences?.has(sessionId) === true;
   }
 
@@ -327,7 +327,7 @@ export class AIService {
   private hasTurnAdmission(sessionId: string): boolean {
     return this.hasQueueDispatchAdmission(sessionId)
       || this.directSendInFlight.has(sessionId)
-      || this.rendererSendInFlight.has(sessionId);
+      || this.rendererSendInFlight?.has(sessionId) === true;
   }
 
   /**
@@ -371,7 +371,7 @@ export class AIService {
     let fence = fences.get(sessionId);
     if (!fence) {
       const targetLease = this.queueProcessingLeases.get(sessionId);
-      const targetReservation = this.queueClaimReservations.get(sessionId);
+      const targetReservation = this.queueClaimReservations?.get(sessionId);
       const generationNumber = (this.queueCancellationGeneration ?? 0) + 1;
       this.queueCancellationGeneration = generationNumber;
       fence = {
@@ -1711,7 +1711,7 @@ export class AIService {
     let settledChildErrored = false;
 
     return tryClaimAndDispatchNextQueuedPrompt({
-      claimReservations: this.queueClaimReservations,
+      claimReservations: this.queueClaimReservations ??= new Map(),
       continueQueuedPromptChain: (nextSessionId, nextWorkspacePath, nextTargetWindow, nextSource) =>
         this.continueQueuedPromptChain(nextSessionId, nextWorkspacePath, nextTargetWindow, nextSource),
       isTurnAdmissionBlocked: (candidateSessionId) => this.hasTurnAdmission(candidateSessionId),
@@ -1791,7 +1791,7 @@ export class AIService {
       preflight: preflightSessionPromptDispatch,
       queueStore,
       sendMessageHandler: this.sendMessageHandler,
-      sessionDispatchCommitments: this.queueDispatchCommitments,
+      sessionDispatchCommitments: this.queueDispatchCommitments ??= new Map(),
       sessionId,
       source,
       startSession: ({ sessionId: activeSessionId, workspacePath: activeWorkspacePath }) =>
@@ -3107,7 +3107,7 @@ export class AIService {
       if (this.hasTurnAdmission(sessionId)) {
         throw new Error(`Session ${sessionId} is already processing a turn`);
       }
-      this.rendererSendInFlight.add(sessionId);
+      (this.rendererSendInFlight ??= new Set()).add(sessionId);
       try {
         return await this.sendMessageHandler!(event, message, documentContext, sessionId, workspacePath);
       } finally {

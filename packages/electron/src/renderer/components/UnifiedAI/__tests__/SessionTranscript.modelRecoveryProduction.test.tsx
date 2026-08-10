@@ -50,7 +50,14 @@ vi.mock("../../../../main/utils/ipcRegistry", () => ({
 vi.mock("../../../../main/services/TerminalSessionManager", () => ({
   getTerminalSessionManager: () => ({
     writeToTerminal: productionSeam.ptyWrite,
-    isTerminalActive: vi.fn(() => true),
+    // Real TerminalSessionManager.isTerminalActive keys per-sessionId
+    // (this.terminals.has(sessionId)); a blanket true here doesn't
+    // distinguish an SDK-backed session ("sdk-blocked") from the one
+    // genuinely PTY-backed session in this file ("cli-blocked"). The native
+    // owner census (nativeSessionOwnerCensus.ts, NIM-590 batch items 1-4)
+    // treats this as a real owner signal, so a blanket true made it send a
+    // spurious ctrl-c to every non-CLI session's cancel too.
+    isTerminalActive: vi.fn((sessionId: string) => sessionId === "cli-blocked"),
     getClaudeCliLiveTurnState: vi.fn(async () => "idle"),
     getTerminalInfo: vi.fn(),
     createTerminal: vi.fn(),
@@ -431,10 +438,24 @@ async function initializeProductionSeam() {
   productionSeam.loggerInfoSpy = vi.spyOn(logger.main, "info");
   productionSeam.providerGetSpy = vi
     .spyOn(ProviderFactory, "getProvider")
-    .mockReturnValue({
-      abort: productionSeam.providerAbort,
-      interruptCurrentTurn: productionSeam.providerInterrupt,
-    } as any);
+    .mockImplementation((type: unknown, sessionId: unknown) => {
+      // Real ProviderFactory.getProvider keys on `${type}-${sessionId}`, so a
+      // session only ever matches its own seeded provider type. The native
+      // owner census (nativeSessionOwnerCensus.ts, NIM-590 batch item 5)
+      // deliberately probes every AI_PROVIDER_TYPES entry per cancellation to
+      // find the live owner regardless of which slot it is registered under
+      // -- a blanket mockReturnValue here would falsely report all 9 types as
+      // live owners of the same session and multiply every abort()/
+      // interruptCurrentTurn() call by 9 instead of the real 1.
+      const seeded = store.get(sessionStoreAtom(sessionId as string)) as
+        | { provider?: string }
+        | undefined;
+      if (!seeded || seeded.provider !== type) return null;
+      return {
+        abort: productionSeam.providerAbort,
+        interruptCurrentTurn: productionSeam.providerInterrupt,
+      } as any;
+    });
   const aiService = Object.create(AIService.prototype) as any;
   aiService.streamingHandler = { handle: productionSeam.sdkSend };
   aiService.sendMessageHandler = productionSeam.sdkSend;
