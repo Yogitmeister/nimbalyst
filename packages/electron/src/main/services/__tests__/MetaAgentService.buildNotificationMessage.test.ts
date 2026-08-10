@@ -254,3 +254,157 @@ describe('MetaAgentService.buildNotificationMessage edited-files dedup + bounded
     expect(message).not.toContain('Files modified');
   });
 });
+
+describe('MetaAgentService.buildNotificationMessage real-world pointer signal grammar (NIM-604, CC review repair)', () => {
+  // These forms are grepped from actual usage in this workspace, not
+  // invented -- the recognizer's first cut only matched the brief's literal
+  // template and never matched any of them in production.
+  it('recognizes a bracketed-session-tag DONE signal with commit + session fields', () => {
+    const service = MetaAgentService.getInstance();
+    const signal =
+      '[efb4f366] DONE: fixed the queue drain bug | file: src/queue.ts | commit: eeb8f0f | session: efb4f366-9fed-44e6-8250-65c7179f85fa';
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      originalPrompt: 'Fix the queue drain bug',
+      recentMessages: [{ direction: 'output', text: signal }],
+    });
+
+    expect(message).toContain(signal);
+    expect(message).not.toContain('Original task:');
+  });
+
+  it('recognizes a report:/notion: signal with no file: or session: field at all', () => {
+    const service = MetaAgentService.getInstance();
+    const signal =
+      'DONE: migration complete | report: _pending/migration-report.md | notion: https://notion.so/workspace/page-abc123';
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      recentMessages: [{ direction: 'output', text: signal }],
+    });
+
+    expect(message).toContain(signal);
+  });
+
+  it('recognizes a BLOCKED ON signal with a report: pointer', () => {
+    const service = MetaAgentService.getInstance();
+    const signal = 'BLOCKED ON: waiting for API credentials | report: _pending/api-blocker.md';
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      recentMessages: [{ direction: 'output', text: signal }],
+    });
+
+    expect(message).toContain(signal);
+  });
+
+  it('recognizes CONSULTED and GATE-STOPPED status words from the child-brief template convention', () => {
+    const service = MetaAgentService.getInstance();
+    for (const signal of [
+      'CONSULTED: got a second opinion | report: _pending/consult-notes.md',
+      'GATE-STOPPED: waiting on Manual Gate review | report: _pending/gate-status.md',
+    ]) {
+      const message = (service as any).buildNotificationMessage('session:completed', {
+        ...BASE_RESULT,
+        recentMessages: [{ direction: 'output', text: signal }],
+      });
+      expect(message).toContain(signal);
+    }
+  });
+
+  it('recognizes the minimal file:-only form with no session field', () => {
+    const service = MetaAgentService.getInstance();
+    const signal = 'DONE: reconciliation complete | file: _pending/x.md';
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      recentMessages: [{ direction: 'output', text: signal }],
+    });
+
+    expect(message).toContain(signal);
+  });
+
+  it('keeps recognizing the original brief-literal form', () => {
+    const service = MetaAgentService.getInstance();
+    const signal = 'DONE | file: report.md | session: abc-123';
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      recentMessages: [{ direction: 'output', text: signal }],
+    });
+
+    expect(message).toContain(signal);
+  });
+
+  // Prose false-positive controls -- ordinary chatty wrap-ups must NOT be
+  // mistaken for a signal just because they start with the right word.
+  it('does not treat plain prose starting with "Done" as a signal (no pipe at all)', () => {
+    const service = MetaAgentService.getInstance();
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      originalPrompt: 'Investigate the flaky test',
+      recentMessages: [{ direction: 'output', text: 'Done for now, nothing else to check today.' }],
+    });
+
+    expect(message).toContain('Original task: Investigate the flaky test');
+  });
+
+  it('does not treat a message merely mentioning "done" mid-sentence as a signal', () => {
+    const service = MetaAgentService.getInstance();
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      originalPrompt: 'Review the PR',
+      recentMessages: [{ direction: 'output', text: 'All tests pass and the review is done. Nothing else to add.' }],
+    });
+
+    expect(message).toContain('Original task: Review the PR');
+  });
+
+  it('does not treat BLOCKED prose lacking the ON:/report:/file: structure as a signal', () => {
+    const service = MetaAgentService.getInstance();
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      originalPrompt: 'Deploy the service',
+      recentMessages: [{ direction: 'output', text: 'BLOCKED -- need your input on which environment to target.' }],
+    });
+
+    expect(message).toContain('Original task: Deploy the service');
+  });
+
+  it('rejects a signal-shaped line whose summary text before the pointer field is too long', () => {
+    // Proof of rejection is "Original task:" surviving -- once
+    // extractChildPointerSignal declines to treat this as a signal, the
+    // line falls through to the ordinary fallback path, where the
+    // pre-existing (NIM-427, out of scope here) recentMessages echo -- not
+    // this test -- governs whether/how much of it is later shown, capped in
+    // production by extractRecentMessages's real 2,000-char cap, which this
+    // synthetic recentMessages array deliberately bypasses.
+    const service = MetaAgentService.getInstance();
+    const overlong = `DONE: ${'padding '.repeat(80)}| file: report.md`;
+    expect(overlong.length).toBeGreaterThan(500);
+
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      originalPrompt: 'Long-running child task',
+      recentMessages: [{ direction: 'output', text: overlong }],
+    });
+
+    expect(message).toContain('Original task: Long-running child task');
+  });
+
+  it('rejects an otherwise well-formed signal whose overall line exceeds the length cap', () => {
+    // Structurally valid prefix (short summary, real file: pointer with a
+    // non-empty value) but the line keeps going past the pointer field --
+    // the regex alone has no trailing $ anchor, so only the explicit
+    // length gate in extractChildPointerSignal catches this case. Same
+    // rejection proof as above: "Original task:" surviving means the
+    // fallback path was taken, not the signal-preferred path.
+    const service = MetaAgentService.getInstance();
+    const overlong = `DONE: short summary | file: report.md | note: ${'x'.repeat(480)}`;
+    expect(overlong.length).toBeGreaterThan(500);
+
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      originalPrompt: 'Another long-running child task',
+      recentMessages: [{ direction: 'output', text: overlong }],
+    });
+
+    expect(message).toContain('Original task: Another long-running child task');
+  });
+});

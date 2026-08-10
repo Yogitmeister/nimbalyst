@@ -368,17 +368,33 @@ type ShowNotificationWithResult = (
 ) => Promise<NotificationResult>;
 
 /**
- * NIM-604: matches a child session's own bounded completion pointer -- e.g.
- * "DONE | file: report.md | session: abc-123" -- per this workspace's
- * file-backed-report convention. When the child's final message already IS
- * this one line, it is a complete, self-bounded summary; reconstructing a
- * second summary from raw originalPrompt/recentMessages/editedFiles beneath
- * it is exactly the unbounded duplication this ticket fixes. A trailing
- * " | ..." tail is tolerated (forward-compatible with extra fields); the
- * file/session values are whatever text sits between the surrounding pipes.
+ * NIM-604 (repaired per CC review 2026-08-10, commit eeb8f0f5): matches a
+ * child session's own bounded completion pointer line. The first cut of
+ * this pattern only accepted the brief's literal template and silently
+ * never matched any real signal in production. Grepping this workspace's
+ * actual usage turned up a family of forms, not one template -- e.g.:
+ *   DONE | file: report.md | session: abc-123
+ *   [efb4f366] DONE: fixed the thing | file: x.md | commit: sha | session: id
+ *   DONE: migration report ready | report: path/to/report.md | session: id
+ *   DONE: reconciliation complete | file: _pending/x.md            (no session at all)
+ *   <DONE|CONSULTED|GATE-STOPPED>: summary | report: link          (child_brief.progressive.template.md)
+ *   BLOCKED ON: waiting on X | report: path/to/report.md
+ * Common structure, not a single literal string: an optional leading
+ * "[sessionId] " tag, a status word (DONE / CONSULTED / GATE-STOPPED /
+ * BLOCKED, optionally "BLOCKED ON"), an optional colon, free-form summary
+ * text, then a pipe-delimited field list containing a file: or report:
+ * pointer with a non-empty value. "session:" is deliberately NOT required
+ * in the line -- the enclosing [Child Session Update] header already states
+ * the session (see buildNotificationMessage). Still bounded:
+ * CHILD_POINTER_SIGNAL_MAX_LENGTH rejects anything long enough to no longer
+ * be a "one-line" pointer, so a rambling message that merely starts with
+ * the right word (and happens to contain an unrelated pipe further in)
+ * cannot masquerade as a signal.
  */
+const CHILD_POINTER_SIGNAL_MAX_LENGTH = 500;
+
 const CHILD_POINTER_SIGNAL_PATTERN =
-  /^(?:DONE|BLOCKED)\s*\|\s*file:\s*[^|]+?\s*\|\s*session:\s*[^|]+?\s*(?:\|.*)?$/i;
+  /^(?:\[[^\]]{1,80}\]\s*)?(?:DONE|CONSULTED|GATE-STOPPED|BLOCKED(?:\s+ON)?)\s*:?\s*.{0,400}?\|\s*(?:file|report)\s*:\s*\S/i;
 
 /**
  * NIM-604: SessionFilesRepository intentionally keeps one row per edit
@@ -404,12 +420,12 @@ export function dedupeFilePaths(paths: string[]): string[] {
 
 /**
  * Returns the child's last output message trimmed to its final non-empty
- * line when that line matches CHILD_POINTER_SIGNAL_PATTERN, else null.
- * Reads from recentMessages (each entry capped at 2,000 chars -- see
- * extractRecentMessages) rather than the 500-char-capped lastResponse, so a
- * short wrap-up paragraph ahead of the signal line doesn't hide it; a
- * message long enough to get truncated by that cap ends in "..." and
- * correctly fails to match.
+ * line when that line matches CHILD_POINTER_SIGNAL_PATTERN and is within
+ * CHILD_POINTER_SIGNAL_MAX_LENGTH, else null. Reads from recentMessages
+ * (each entry capped at 2,000 chars -- see extractRecentMessages) rather
+ * than the 500-char-capped lastResponse, so a short wrap-up paragraph ahead
+ * of the signal line doesn't hide it; a message long enough to get
+ * truncated by that cap ends in "..." and correctly fails to match.
  */
 function extractChildPointerSignal(
   result: Pick<SessionResultData, 'recentMessages' | 'lastResponse'>,
@@ -421,7 +437,11 @@ function extractChildPointerSignal(
   }
   const lines = candidate.split('\n').map((line) => line.trim()).filter(Boolean);
   const lastLine = lines[lines.length - 1];
-  if (!lastLine || !CHILD_POINTER_SIGNAL_PATTERN.test(lastLine)) {
+  if (
+    !lastLine ||
+    lastLine.length > CHILD_POINTER_SIGNAL_MAX_LENGTH ||
+    !CHILD_POINTER_SIGNAL_PATTERN.test(lastLine)
+  ) {
     return null;
   }
   return lastLine;
