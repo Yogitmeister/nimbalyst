@@ -63,7 +63,7 @@ vi.mock('../ai/claudeCliLauncherSingleton', () => ({
   ClaudeCliLauncherConfig: { setMetaAgentServerPort: vi.fn() },
 }));
 
-import { MetaAgentService } from '../MetaAgentService';
+import { MetaAgentService, dedupeFilePaths } from '../MetaAgentService';
 
 const BASE_RESULT = {
   sessionId: 'child-1',
@@ -114,5 +114,143 @@ describe('MetaAgentService.buildNotificationMessage originalPrompt cap (NIM-427)
     });
 
     expect(message).not.toContain('Original task:');
+  });
+});
+
+describe('dedupeFilePaths (NIM-604)', () => {
+  it('collapses repeated identical paths to first-seen order', () => {
+    const raw = ['src/a.ts', 'src/a.ts', 'src/b.ts', 'src/a.ts', 'src/c.ts', 'src/b.ts'];
+    expect(dedupeFilePaths(raw)).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts']);
+  });
+
+  it('returns an empty array unchanged', () => {
+    expect(dedupeFilePaths([])).toEqual([]);
+  });
+
+  it('leaves an already-unique list untouched', () => {
+    const raw = ['src/a.ts', 'src/b.ts'];
+    expect(dedupeFilePaths(raw)).toEqual(raw);
+  });
+});
+
+describe('MetaAgentService.buildNotificationMessage child pointer signal (NIM-604)', () => {
+  it('prefers a DONE pointer signal and omits original task, recent messages, and edited files', () => {
+    const service = MetaAgentService.getInstance();
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      originalPrompt: 'A'.repeat(2000),
+      recentMessages: [
+        { direction: 'input', text: 'go fix it' },
+        { direction: 'output', text: 'DONE | file: report.md | session: abc-123' },
+      ],
+      editedFiles: ['src/a.ts', 'src/a.ts', 'src/a.ts'],
+    });
+
+    expect(message).toContain('DONE | file: report.md | session: abc-123');
+    expect(message).not.toContain('Original task:');
+    expect(message).not.toContain('Recent messages:');
+    expect(message).not.toContain('Files modified:');
+    expect(message).not.toContain('go fix it');
+  });
+
+  it('prefers a BLOCKED pointer signal the same way', () => {
+    const service = MetaAgentService.getInstance();
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      recentMessages: [{ direction: 'output', text: 'BLOCKED | file: notes.md | session: xyz-789' }],
+    });
+
+    expect(message).toContain('BLOCKED | file: notes.md | session: xyz-789');
+    expect(message).not.toContain('Last response:');
+  });
+
+  it('also recognizes a pointer signal via lastResponse when recentMessages is empty', () => {
+    const service = MetaAgentService.getInstance();
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      recentMessages: [],
+      lastResponse: 'DONE | file: report.md | session: abc-123',
+    });
+
+    expect(message).toContain('DONE | file: report.md | session: abc-123');
+    expect(message).not.toContain('Last response:');
+  });
+
+  it('falls back to the bounded summary when the last message is not a pointer signal', () => {
+    const service = MetaAgentService.getInstance();
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      originalPrompt: 'Fix the login bug',
+      recentMessages: [{ direction: 'output', text: 'All done, looks good to me!' }],
+    });
+
+    expect(message).toContain('Original task: Fix the login bug');
+    expect(message).toContain('Recent messages:');
+    expect(message).toContain('- Assistant: All done, looks good to me!');
+  });
+
+  it('does not treat a signal-shaped line as the signal unless it is the true last line', () => {
+    const service = MetaAgentService.getInstance();
+    // The pointer shape appears mid-message, not as the final line -- must
+    // NOT be treated as a signal (a child mentioning the convention in
+    // passing should not suppress the real recap).
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      originalPrompt: 'Investigate the flaky test',
+      recentMessages: [{ direction: 'output', text: 'DONE | file: x.md | session: y\nOne more thing to check.' }],
+    });
+
+    expect(message).toContain('Original task: Investigate the flaky test');
+  });
+});
+
+describe('MetaAgentService.buildNotificationMessage edited-files dedup + bounded pointer (NIM-604)', () => {
+  it('renders a deduped unique-file count, never a repeated path list, when there is no pointer signal', () => {
+    // Simulates SessionFilesRepository returning several edit EVENTS for the
+    // same file plus one other file -- buildSessionResultData's own call to
+    // dedupeFilePaths() is what collapses these before they ever reach
+    // buildNotificationMessage; this test drives that same production path.
+    const rawEditEvents = ['src/parser.ts', 'src/parser.ts', 'src/parser.ts', 'src/index.ts', 'src/parser.ts'];
+    const editedFiles = dedupeFilePaths(rawEditEvents);
+    expect(editedFiles).toEqual(['src/parser.ts', 'src/index.ts']);
+
+    const service = MetaAgentService.getInstance();
+    const longPrompt = 'X'.repeat(5000);
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      originalPrompt: longPrompt,
+      editedFiles,
+    });
+
+    // Bounded: the 5,000-char prompt is capped, and no file path is echoed
+    // (let alone repeated) -- only a unique count with a get_session_result
+    // pointer for the detail.
+    expect(message.length).toBeLessThan(1000);
+    expect(message).toContain('Files modified: 2 unique files');
+    expect(message).toContain('get_session_result');
+    expect(message).not.toContain('src/parser.ts');
+    expect(message).not.toContain('src/index.ts');
+    // No duplicated file paths can appear, because none appear at all.
+    expect(message.split('src/parser.ts').length - 1).toBe(0);
+  });
+
+  it('uses singular "file" for exactly one unique edited file', () => {
+    const service = MetaAgentService.getInstance();
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      editedFiles: dedupeFilePaths(['src/only.ts', 'src/only.ts']),
+    });
+
+    expect(message).toContain('Files modified: 1 unique file ');
+  });
+
+  it('omits the Files modified line entirely when nothing was edited', () => {
+    const service = MetaAgentService.getInstance();
+    const message = (service as any).buildNotificationMessage('session:completed', {
+      ...BASE_RESULT,
+      editedFiles: [],
+    });
+
+    expect(message).not.toContain('Files modified');
   });
 });
