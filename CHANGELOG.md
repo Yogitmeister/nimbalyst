@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- Tapping a mobile push notification now opens the session's own project on iPhone and iPad, instead of leaving whatever project was already active on screen.
 - Queued chat messages now continue through a replacement project window after the original window reloads or closes.
 - Windows and Linux get the File/Edit/View menus back, now drawn in the project window's title bar.
 - Structured agent prompts now retain their actionable state until exactly one answer settles and reliably resume their waiting session.

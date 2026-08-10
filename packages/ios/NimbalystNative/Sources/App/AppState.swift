@@ -65,6 +65,12 @@ public final class AppState: ObservableObject {
     @Published public var voiceNavigationRequest: String?
     #endif
 
+    /// Session the UI should navigate to because the user tapped a push
+    /// notification. Observed by the navigation views (iPhone stack / iPad
+    /// split) to open the session, switching project first if needed. Set
+    /// back to nil by the view once handled. Mirrors `voiceNavigationRequest`.
+    @Published public var notificationNavigationRequest: String?
+
     private var cryptoManager: CryptoManager?
     public private(set) var syncManager: SyncManager?
     public private(set) var documentSyncManager: DocumentSyncManager?
@@ -717,6 +723,25 @@ public final class AppState: ObservableObject {
         voiceNavigationRequest = sessionId
     }
     #endif
+
+    /// Publish a navigation request for a session opened via push-notification
+    /// tap, once its row has synced into the local database. A cold-launch tap
+    /// can race the post-launch index resync, so we briefly wait for the row
+    /// rather than navigate to a session the views can't yet resolve. Mirrors
+    /// `navigateWhenSessionAvailable` but does not touch the voice agent -- a
+    /// notification tap is not a voice trigger.
+    @MainActor
+    public func navigateToNotificationSession(_ sessionId: String) async {
+        for _ in 0..<25 { // ~5s max (25 * 200ms)
+            if let db = databaseManager, (try? db.session(byId: sessionId)) != nil {
+                notificationNavigationRequest = sessionId
+                return
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        // Fall back: navigate anyway; the view retries the row lookup itself.
+        notificationNavigationRequest = sessionId
+    }
 
     // MARK: - Screenshot Mode
 

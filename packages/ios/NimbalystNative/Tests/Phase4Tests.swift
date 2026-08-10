@@ -208,4 +208,46 @@ final class Phase4Tests: XCTestCase {
         // Cleanup
         UserDefaults.standard.removeObject(forKey: "pushNotificationsEnabled")
     }
+
+    // MARK: - Notification Tap Navigation (NIM-448)
+    //
+    // `navigateToNotificationSession` is the shared trigger both the iPhone
+    // stack (MainNavigationView) and the iPad split view (IPadNavigationView)
+    // observe via `notificationNavigationRequest`. These tests cover the
+    // async polling logic directly; the two view-layer consumers are plain
+    // SwiftUI wiring with no independent branching, mirroring the untested
+    // `voiceNavigationRequest` / `navigateWhenSessionAvailable` pattern this
+    // was modeled on.
+
+    @MainActor
+    func testNotificationNavigationResolvesImmediatelyWhenSessionAlreadySynced() async throws {
+        let db = try DatabaseManager()
+        try db.upsertProject(Project(id: "/Users/test/project", name: "project"))
+        try db.upsertSession(Session(id: "session-1", projectId: "/Users/test/project", createdAt: 1, updatedAt: 1))
+        let appState = AppState(databaseManager: db)
+
+        await appState.navigateToNotificationSession("session-1")
+
+        XCTAssertEqual(appState.notificationNavigationRequest, "session-1")
+    }
+
+    /// Regression test for the cold-launch race: a notification tap can arrive
+    /// before the tapped session has synced into the local database (the index
+    /// resync is still in flight). `navigateToNotificationSession` must wait
+    /// for the row instead of giving up on the first miss.
+    @MainActor
+    func testNotificationNavigationWaitsForSessionThatArrivesMidPoll() async throws {
+        let db = try DatabaseManager()
+        try db.upsertProject(Project(id: "/Users/test/project", name: "project"))
+        let appState = AppState(databaseManager: db)
+
+        Task {
+            try? await Task.sleep(nanoseconds: 250_000_000) // after >= 1 poll tick
+            try? db.upsertSession(Session(id: "late-session", projectId: "/Users/test/project", createdAt: 1, updatedAt: 1))
+        }
+
+        await appState.navigateToNotificationSession("late-session")
+
+        XCTAssertEqual(appState.notificationNavigationRequest, "late-session")
+    }
 }

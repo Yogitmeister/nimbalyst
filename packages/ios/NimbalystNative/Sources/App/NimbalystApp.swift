@@ -356,8 +356,16 @@ public struct MainNavigationView: View {
         #endif
         .onChange(of: notificationManager.pendingSessionId) { _, newValue in
             guard let sessionId = newValue else { return }
-            navigateToSession(sessionId)
             notificationManager.pendingSessionId = nil
+            Task { await appState.navigateToNotificationSession(sessionId) }
+        }
+        // Fires once the session has confirmed-synced locally (see
+        // AppState.navigateToNotificationSession). iPad handles its own case
+        // in IPadNavigationView's matching observer.
+        .onChange(of: appState.notificationNavigationRequest) { _, newValue in
+            guard sizeClass != .regular, let sessionId = newValue else { return }
+            navigateToSession(sessionId)
+            appState.notificationNavigationRequest = nil
         }
         #if os(iOS)
         // Voice agent created a session on this device — open it. iPhone navigates
@@ -378,8 +386,8 @@ public struct MainNavigationView: View {
 
             // Handle notification tap that launched the app
             if let sessionId = notificationManager.pendingSessionId {
-                navigateToSession(sessionId)
                 notificationManager.pendingSessionId = nil
+                Task { await appState.navigateToNotificationSession(sessionId) }
             }
 
             // Show one-time push notification prompt after pairing + auth
@@ -573,6 +581,11 @@ struct IPadNavigationView: View {
             appState.voiceNavigationRequest = nil
         }
         #endif
+        .onChange(of: appState.notificationNavigationRequest) { _, newValue in
+            guard let sessionId = newValue else { return }
+            openNotificationSession(sessionId)
+            appState.notificationNavigationRequest = nil
+        }
     }
 
     /// Open a session the voice agent just created (iPad split view): select its
@@ -584,6 +597,25 @@ struct IPadNavigationView: View {
            let project = try? db.writer.read({ db in try Project.fetchOne(db, id: session.projectId) }) {
             selectedProject = project
             configureVoiceForProject(project)
+        }
+        selectedDocument = nil
+        selectedSession = session
+    }
+
+    /// Open a session from a tapped push notification (iPad split view): select
+    /// its project if different, then show it in the detail column. Unlike
+    /// `openVoiceCreatedSession`, this does not reconfigure the voice agent --
+    /// a notification tap is not a voice-agent trigger. Previously this case
+    /// had no handler at all: `navigateToSession` (the iPhone path) explicitly
+    /// bails out for the regular size class, so a notification tap on iPad
+    /// silently did nothing and the split view kept showing whichever project
+    /// `startObservingProjects()` had auto-selected.
+    private func openNotificationSession(_ sessionId: String) {
+        guard let db = appState.databaseManager,
+              let session = try? db.session(byId: sessionId) else { return }
+        if selectedProject?.id != session.projectId,
+           let project = try? db.writer.read({ db in try Project.fetchOne(db, id: session.projectId) }) {
+            selectedProject = project
         }
         selectedDocument = nil
         selectedSession = session
