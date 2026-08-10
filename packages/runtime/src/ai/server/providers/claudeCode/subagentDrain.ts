@@ -154,6 +154,30 @@ export function shouldArmGraceTimerForResult(
   return !isNotificationFlushResult(chunk, sawTaskNotificationThisTurn, sawAssistantOutputThisTurn);
 }
 
+/**
+ * Decide whether a `result` chunk should immediately yield `complete` to the
+ * consumer (flipping the session UI to "ready"). False once a compact
+ * boundary has been observed this turn: `system_compact` is this codebase's
+ * own confirmed multi-result-turn signal (see the promptEndTimer field
+ * comment on ClaudeCodeProvider) -- a `result` chunk that follows compaction
+ * is not reliably the turn's last chunk, so yielding `complete` on it reports
+ * ready while the SDK is still streaming real work.
+ *
+ * Suppressing the yield here is safe, not just silent: the caller's own
+ * post-result grace timer (PROMPT_GRACE_MS) keeps the loop alive for further
+ * chunks, and the existing iterator-done fallback completion path already
+ * builds the same payload (including contextCompacted) once the SDK truly
+ * stops emitting. This function only decides which of those two paths gets
+ * to complete the turn. See NIM-597.
+ */
+export function shouldYieldCompleteForResult(
+  chunk: { type?: string },
+  completeEmitted: boolean,
+  receivedCompactBoundary: boolean,
+): boolean {
+  return chunk.type === 'result' && !completeEmitted && !receivedCompactBoundary;
+}
+
 /** Terminal task_notification captured while draining, for the continuation turn. */
 export interface TaskTerminalNotification {
   taskId: string;
