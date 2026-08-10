@@ -100,6 +100,7 @@ vi.mock('../../window/WindowManager', () => ({
 }));
 
 import { notificationService } from '../NotificationService';
+import { logger } from '../../utils/logger';
 
 interface FakeWindow {
   isDestroyed: () => boolean;
@@ -141,7 +142,7 @@ function makeFakeWindow(): FakeWindow {
 
 async function clickNotification(options: {
   sessionId?: string;
-  workspacePath: string;
+  workspacePath?: string;
   sourceLabel?: string;
 }): Promise<void> {
   await notificationService.showNotification({
@@ -316,6 +317,33 @@ describe('NotificationService agent notifications', () => {
       workspacePath: '/workspace/alpha',
       sourceLabel: 'Build release',
     });
+  });
+
+  it('warns instead of throwing when a clicked notification has no workspace path', async () => {
+    await clickNotification({ sessionId: 'session-missing-workspace' });
+
+    expect(logger.main.warn).toHaveBeenCalledWith(
+      '[NotificationService] Cannot route notification click without workspacePath:',
+      { sessionId: 'session-missing-workspace' },
+    );
+  });
+
+  it('warns instead of propagating a notification-click send failure', async () => {
+    const targetWindow = makeFakeWindow();
+    targetWindow.webContents.send.mockImplementation(() => {
+      throw new Error('webContents destroyed');
+    });
+    mocks.findWindowByWorkspace.mockReturnValue(targetWindow);
+
+    await clickNotification({
+      sessionId: 'session-send-failure',
+      workspacePath: '/workspace/alpha',
+    });
+
+    expect(logger.main.warn).toHaveBeenCalledWith(
+      '[NotificationService] Failed to route notification click to window:',
+      expect.any(Error),
+    );
   });
 
   it('queues navigation and opens an unloaded workspace once', async () => {
