@@ -367,6 +367,86 @@ type ShowNotificationWithResult = (
   options: NotificationOptions
 ) => Promise<NotificationResult>;
 
+/**
+ * NIM-604 (repaired per CC review 2026-08-10, commit eeb8f0f5): matches a
+ * child session's own bounded completion pointer line. The first cut of
+ * this pattern only accepted the brief's literal template and silently
+ * never matched any real signal in production. Grepping this workspace's
+ * actual usage turned up a family of forms, not one template -- e.g.:
+ *   DONE | file: report.md | session: abc-123
+ *   [efb4f366] DONE: fixed the thing | file: x.md | commit: sha | session: id
+ *   DONE: migration report ready | report: path/to/report.md | session: id
+ *   DONE: reconciliation complete | file: _pending/x.md            (no session at all)
+ *   <DONE|CONSULTED|GATE-STOPPED>: summary | report: link          (child_brief.progressive.template.md)
+ *   BLOCKED ON: waiting on X | report: path/to/report.md
+ * Common structure, not a single literal string: an optional leading
+ * "[sessionId] " tag, a status word (DONE / CONSULTED / GATE-STOPPED /
+ * BLOCKED, optionally "BLOCKED ON"), an optional colon, free-form summary
+ * text, then a pipe-delimited field list containing a file: or report:
+ * pointer with a non-empty value. "session:" is deliberately NOT required
+ * in the line -- the enclosing [Child Session Update] header already states
+ * the session (see buildNotificationMessage). Still bounded:
+ * CHILD_POINTER_SIGNAL_MAX_LENGTH rejects anything long enough to no longer
+ * be a "one-line" pointer, so a rambling message that merely starts with
+ * the right word (and happens to contain an unrelated pipe further in)
+ * cannot masquerade as a signal.
+ */
+const CHILD_POINTER_SIGNAL_MAX_LENGTH = 500;
+
+const CHILD_POINTER_SIGNAL_PATTERN =
+  /^(?:\[[^\]]{1,80}\]\s*)?(?:DONE|CONSULTED|GATE-STOPPED|BLOCKED(?:\s+ON)?)\s*:?\s*.{0,400}?\|\s*(?:file|report)\s*:\s*\S/i;
+
+/**
+ * NIM-604: SessionFilesRepository intentionally keeps one row per edit
+ * EVENT (not per file), so the same path can appear many times in a raw
+ * getFilesBySession() read. Collapse to first-seen order so every reader of
+ * SessionResultData.editedFiles -- buildNotificationMessage,
+ * get_session_result, list_spawned_sessions -- sees a unique file list, not
+ * a repeated event list. Exported for direct unit coverage rather than only
+ * exercising it indirectly through buildSessionResultData's full repository
+ * mock chain.
+ */
+export function dedupeFilePaths(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const path of paths) {
+    if (!seen.has(path)) {
+      seen.add(path);
+      deduped.push(path);
+    }
+  }
+  return deduped;
+}
+
+/**
+ * Returns the child's last output message trimmed to its final non-empty
+ * line when that line matches CHILD_POINTER_SIGNAL_PATTERN and is within
+ * CHILD_POINTER_SIGNAL_MAX_LENGTH, else null. Reads from recentMessages
+ * (each entry capped at 2,000 chars -- see extractRecentMessages) rather
+ * than the 500-char-capped lastResponse, so a short wrap-up paragraph ahead
+ * of the signal line doesn't hide it; a message long enough to get
+ * truncated by that cap ends in "..." and correctly fails to match.
+ */
+function extractChildPointerSignal(
+  result: Pick<SessionResultData, 'recentMessages' | 'lastResponse'>,
+): string | null {
+  const lastOutputMessage = [...result.recentMessages].reverse().find((message) => message.direction === 'output');
+  const candidate = (lastOutputMessage?.text ?? result.lastResponse ?? '').trim();
+  if (!candidate) {
+    return null;
+  }
+  const lines = candidate.split('\n').map((line) => line.trim()).filter(Boolean);
+  const lastLine = lines[lines.length - 1];
+  if (
+    !lastLine ||
+    lastLine.length > CHILD_POINTER_SIGNAL_MAX_LENGTH ||
+    !CHILD_POINTER_SIGNAL_PATTERN.test(lastLine)
+  ) {
+    return null;
+  }
+  return lastLine;
+}
+
 export class MetaAgentService {
   private static instance: MetaAgentService | null = null;
   private starting: Promise<void> | null = null;
@@ -1654,35 +1734,48 @@ export class MetaAgentService {
       `Event: ${eventType}`,
     ];
 
-    if (result.originalPrompt) {
-      // Cap the echo -- a long parent task prompt must not blow up the
-      // notification unbounded. Matches extractLastAgentResponse's preview
-      // cap (500 chars + ellipsis) used for the sibling "Last response" line.
-      const ORIGINAL_PROMPT_PREVIEW_LENGTH = 500;
-      const promptPreview = result.originalPrompt.length > ORIGINAL_PROMPT_PREVIEW_LENGTH
-        ? `${result.originalPrompt.slice(0, ORIGINAL_PROMPT_PREVIEW_LENGTH)}...`
-        : result.originalPrompt;
-      lines.push(`Original task: ${promptPreview}`);
-    }
-    if (result.recentMessages.length > 0) {
-      lines.push('Recent messages:');
-      for (const message of result.recentMessages) {
-        const label = message.direction === 'input' ? 'User' : 'Assistant';
-        lines.push(`- ${label}: ${message.text}`);
+    // NIM-604: a compliant child's final message is already a complete,
+    // self-bounded pointer -- trust it and skip reconstructing a second
+    // summary from raw originalPrompt/recentMessages/editedFiles beneath it.
+    const pointerSignal = extractChildPointerSignal(result);
+    if (pointerSignal) {
+      lines.push(pointerSignal);
+    } else {
+      if (result.originalPrompt) {
+        // Cap the echo -- a long parent task prompt must not blow up the
+        // notification unbounded. Matches extractLastAgentResponse's preview
+        // cap (500 chars + ellipsis) used for the sibling "Last response" line.
+        const ORIGINAL_PROMPT_PREVIEW_LENGTH = 500;
+        const promptPreview = result.originalPrompt.length > ORIGINAL_PROMPT_PREVIEW_LENGTH
+          ? `${result.originalPrompt.slice(0, ORIGINAL_PROMPT_PREVIEW_LENGTH)}...`
+          : result.originalPrompt;
+        lines.push(`Original task: ${promptPreview}`);
       }
-    } else if (result.lastResponse) {
-      lines.push(`Last response: ${result.lastResponse}`);
-    }
-    if (result.editedFiles.length > 0) {
-      lines.push('Files modified:');
-      for (const filePath of result.editedFiles) {
-        lines.push(`- ${filePath}`);
+      if (result.recentMessages.length > 0) {
+        lines.push('Recent messages:');
+        for (const message of result.recentMessages) {
+          const label = message.direction === 'input' ? 'User' : 'Assistant';
+          lines.push(`- ${label}: ${message.text}`);
+        }
+      } else if (result.lastResponse) {
+        lines.push(`Last response: ${result.lastResponse}`);
+      }
+      // NIM-604: editedFiles is already deduped by file path at the source
+      // (buildSessionResultData) regardless of how many separate edit
+      // EVENTS SessionFilesRepository recorded for the same path -- but even
+      // a deduped list can still be long for a wide-reaching child, so the
+      // notification itself only ever echoes a count, never the raw paths.
+      if (result.editedFiles.length > 0) {
+        const fileWord = result.editedFiles.length === 1 ? 'file' : 'files';
+        lines.push(
+          `Files modified: ${result.editedFiles.length} unique ${fileWord} (call get_session_result with sessionId "${result.sessionId}" for the path list).`,
+        );
       }
     }
     if (result.toolScope === 'read' || result.toolScope === 'write') {
       const denied = result.toolScope === 'read' ? 'write_file or run_command' : 'run_command';
       lines.push(
-        `Tool scope: ${result.toolScope} (this child had NO ${denied}). Any claim it ran, built, or tested anything is false; "Files modified" above is the complete list of files it changed.`,
+        `Tool scope: ${result.toolScope} (this child had NO ${denied}). Any claim it ran, built, or tested anything is false.`,
       );
     }
     if (result.errorMessage) {
@@ -1800,7 +1893,8 @@ export class MetaAgentService {
     let editedFiles: string[] = [];
     try {
       const fileLinks = await SessionFilesRepository.getFilesBySession(sessionId, 'edited');
-      editedFiles = fileLinks.map((file: any) => this.stripWorkspacePath(file.filePath, workspaceId));
+      const rawPaths = (fileLinks as any[]).map((file) => this.stripWorkspacePath(file.filePath, workspaceId));
+      editedFiles = dedupeFilePaths(rawPaths);
     } catch {
       editedFiles = [];
     }
