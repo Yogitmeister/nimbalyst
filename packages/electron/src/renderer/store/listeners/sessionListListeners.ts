@@ -63,6 +63,7 @@ export function initSessionListListeners(): () => void {
     // console.log('[sessionListListeners] session-updated received:', sessionId, updates);
     const registry = new Map(store.get(sessionRegistryAtom));
     const meta = registry.get(sessionId);
+    let registryChanged = false;
     if (meta) {
       registry.set(sessionId, {
         ...meta,
@@ -82,6 +83,25 @@ export function initSessionListListeners(): () => void {
         ...(updates.isArchived !== undefined && { isArchived: updates.isArchived as boolean }),
         ...(updates.isPinned !== undefined && { isPinned: updates.isPinned as boolean }),
       });
+      registryChanged = true;
+    }
+
+    // PGLiteSessionStore cascades workstream archive state to direct children.
+    // Mirror that authoritative write in the renderer cache so archived children
+    // stop driving Agent attention indicators without waiting for a full refresh.
+    if (updates.isArchived !== undefined) {
+      for (const [candidateId, candidate] of registry) {
+        if (candidate.parentSessionId === sessionId && candidate.isArchived !== updates.isArchived) {
+          registry.set(candidateId, {
+            ...candidate,
+            isArchived: updates.isArchived as boolean,
+          });
+          registryChanged = true;
+        }
+      }
+    }
+
+    if (registryChanged) {
       store.set(sessionRegistryAtom, registry);
     }
   };
