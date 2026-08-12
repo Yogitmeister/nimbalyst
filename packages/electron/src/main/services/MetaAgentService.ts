@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import type { OrchestrationMessageKind } from '@nimbalyst/runtime/ai/server/types';
 import path from 'path';
 import { BrowserWindow } from 'electron';
@@ -30,6 +31,7 @@ import { extractMessageText, extractUserPrompts } from './metaAgentMessageText';
 import type { NotificationOptions, NotificationResult } from './NotificationService';
 import type { MobilePushResult } from '@nimbalyst/runtime/sync/types';
 import { composeNotificationTitle } from '../../shared/notificationTitle';
+import { getSyncProvider, isDesktopTrulyAway } from './SyncManager';
 
 type SessionStatusValue = 'idle' | 'running' | 'waiting_for_input' | 'error' | 'interrupted';
 type PromptType = 'permission_request' | 'ask_user_question_request' | 'exit_plan_mode_request';
@@ -161,9 +163,21 @@ interface NotifyUserArgs {
   body?: string;
   sessionId?: string;
   bypassFocusCheck?: boolean;
+  mobilePush?: 'never' | 'when_desktop_away' | 'always';
   silent?: boolean;
   urgency?: 'normal' | 'critical' | 'low';
 }
+
+interface SendPromptNowArgs {
+  sessionId: string;
+  prompt: string;
+  idempotencyKey?: string;
+  controlOperation?: string;
+  interruptWaitingForInput?: boolean;
+}
+
+const DIRECT_FORCED_NOTIFICATION_RATE_WINDOW_MS = 60 * 1000;
+const DIRECT_FORCED_NOTIFICATION_RATE_LIMIT = 10;
 
 type ShowNotificationWithResult = (
   options: NotificationOptions
@@ -193,6 +207,7 @@ export class MetaAgentService {
   private ipcHandlersRegistered = false;
   private showNotificationWithResult: ShowNotificationWithResult | null = null;
   private requestMobilePush: RequestMobilePush | null = null;
+  private directForcedNotificationAttempts = new Map<string, number[]>();
 
   private constructor() {}
 
@@ -314,6 +329,7 @@ export class MetaAgentService {
     this.unsubscribeStateListener = null;
     this.notificationSignatures.clear();
     this.showNotificationWithResult = null;
+    this.directForcedNotificationAttempts.clear();
     // No standalone HTTP server to tear down (Phase 7); the injected toolFns are
     // process-lifetime singletons.
     this.serverPort = null;
@@ -1148,11 +1164,17 @@ export class MetaAgentService {
       throw new Error('Notification delivery is not initialized');
     }
 
+    const mobilePushMode = args.mobilePush ?? (args.urgency === 'critical' ? 'always' : 'never');
+    if (mobilePushMode === 'always') {
+      this.consumeForcedNotificationRateLimit(callerSessionId, targetSessionId);
+    }
+
     const boundedBody = body.length > 1000 ? `${body.slice(0, 997)}...` : body;
     const rawSourceLabel = session.title || session.provider || `Session ${targetSessionId.slice(0, 8)}`;
     const sourceLabel = rawSourceLabel.trim().slice(0, 60) || `Session ${targetSessionId.slice(0, 8)}`;
+    const notificationTitle = composeNotificationTitle(sourceLabel, title);
     const result = await this.showNotificationWithResult({
-      title: composeNotificationTitle(sourceLabel, title),
+      title: notificationTitle,
       body: boundedBody,
       kind: 'agent-complete',
       sessionId: targetSessionId,
@@ -1164,31 +1186,68 @@ export class MetaAgentService {
       urgency: args.urgency || 'normal',
     });
 
-    // Forced (#1268): `urgency: 'critical'` is the agent saying the human is
-    // needed now, which is exactly the case the server's presence suppression
-    // must not swallow. Anything below critical stays desktop-only.
-    const isUrgent = args.urgency === 'critical';
-    let mobilePush: MobilePushResult | null = null;
-    if (isUrgent && this.requestMobilePush) {
-      try {
-        mobilePush = await this.requestMobilePush(targetSessionId, sourceLabel, boundedBody, {
-          force: true,
-          reason: 'notify_urgent',
-        });
-      } catch (err) {
-        console.warn('[MetaAgentService] notify_user mobile push failed:', err);
+    const desktopTrulyAway = isDesktopTrulyAway();
+    let mobilePushAttempted = false;
+    let mobilePushResult: MobilePushResult | null = null;
+    let mobilePushSkippedReason: string | null = mobilePushMode === 'never' ? 'not_requested' : null;
+    let mobilePushError: string | null = null;
+    if (mobilePushMode !== 'never') {
+      const syncProvider = getSyncProvider();
+      const requestPush = this.requestMobilePush ?? syncProvider?.requestMobilePush?.bind(syncProvider);
+      if (!requestPush) {
+        mobilePushSkippedReason = 'sync_provider_unavailable';
+      } else if (mobilePushMode === 'when_desktop_away' && !desktopTrulyAway) {
+        mobilePushSkippedReason = 'desktop_not_truly_away';
+      } else {
+        mobilePushAttempted = true;
+        try {
+          mobilePushResult = await requestPush(targetSessionId, notificationTitle, boundedBody, {
+            force: mobilePushMode === 'always',
+            reason: args.urgency === 'critical' ? 'notify_urgent' : 'notify_explicit',
+          });
+        } catch (error) {
+          mobilePushError = error instanceof Error ? error.message : String(error);
+          mobilePushSkippedReason = 'provider_rejected';
+        }
       }
     }
 
     return JSON.stringify({
       tool: 'notify_user',
-      deliveryChannel: mobilePush ? 'os_notification+mobile_push' : 'os_notification',
-      mobilePushAttempted: mobilePush !== null,
-      mobilePush: mobilePush ?? undefined,
+      deliveryChannel: mobilePushResult ? 'os_notification+mobile_push' : 'os_notification',
+      mobilePushAttempted,
+      mobilePush: {
+        ...mobilePushResult,
+        mode: mobilePushMode,
+        requested: mobilePushMode !== 'never',
+        attempted: mobilePushAttempted,
+        skippedReason: mobilePushSkippedReason,
+        desktopTrulyAway,
+        forced: mobilePushMode === 'always',
+        // A provider call is not a socket-write or delivery receipt.
+        acknowledgementReceived: mobilePushResult !== null && mobilePushResult.rejection !== 'no_ack',
+        ...(mobilePushError ? { error: mobilePushError } : {}),
+      },
       sessionId: targetSessionId,
       bypassFocusCheck: args.bypassFocusCheck === true,
       result,
     }, null, 2);
+  }
+
+  private consumeForcedNotificationRateLimit(
+    callerSessionId: string,
+    targetSessionId: string
+  ): void {
+    const key = `${callerSessionId}\u0000${targetSessionId}`;
+    const now = Date.now();
+    const recent = (this.directForcedNotificationAttempts.get(key) || []).filter(
+      (timestamp) => now - timestamp < DIRECT_FORCED_NOTIFICATION_RATE_WINDOW_MS
+    );
+    if (recent.length >= DIRECT_FORCED_NOTIFICATION_RATE_LIMIT) {
+      throw new Error('notify_user rate limit exceeded for this caller and target session');
+    }
+    recent.push(now);
+    this.directForcedNotificationAttempts.set(key, recent);
   }
 
   private async respondToPrompt(workspaceId: string, args: {

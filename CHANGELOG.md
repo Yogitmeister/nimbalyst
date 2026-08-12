@@ -583,6 +583,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Text in the git Output tab is selectable.
 - A full-screen window has a visible way out again: an exit button in the title bar, and on macOS the window buttons reappear at the top of the screen.
 - The inbox's organization filter no longer opens onto an empty menu when there is nothing to narrow by.
+- Configured attention watchers can restore their pending deadlines after Nimbalyst restarts.
+- Explicit agent attention alerts can reach mobile even while the desktop app is active.
 
 ### Removed
 <!-- Removed features go here -->

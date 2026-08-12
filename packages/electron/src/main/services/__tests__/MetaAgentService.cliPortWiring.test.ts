@@ -1,4 +1,10 @@
+// [ASTRA-ORCH]
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const syncMocks = vi.hoisted(() => ({
+  requestMobilePush: vi.fn(),
+  isDesktopTrulyAway: vi.fn(() => false),
+}));
 
 // NIM-828 (original): MetaAgentService.start() had to wire the standalone
 // meta-agent MCP port into ClaudeCliLauncherConfig so claude-code-cli sessions
@@ -42,7 +48,13 @@ vi.mock('electron', () => ({
   BrowserWindow: { getAllWindows: () => [] },
 }));
 
-vi.mock('../SyncManager', () => ({ getSyncProvider: () => ({ pushChange: vi.fn() }) }));
+vi.mock('../SyncManager', () => ({
+  getSyncProvider: () => ({
+    pushChange: vi.fn(),
+    requestMobilePush: syncMocks.requestMobilePush,
+  }),
+  isDesktopTrulyAway: syncMocks.isDesktopTrulyAway,
+}));
 vi.mock('../../utils/ipcRegistry', () => ({ safeHandle: vi.fn() }));
 vi.mock('../../utils/store', () => ({ getDefaultAIModel: () => null }));
 vi.mock('../../utils/timestampUtils', () => ({ toMillis: (v: unknown) => v }));
@@ -68,6 +80,10 @@ import { MetaAgentService } from '../MetaAgentService';
 describe('MetaAgentService tool-fn injection (Phase 7: no standalone server)', () => {
   beforeEach(() => {
     vi.mocked(setMetaAgentToolFns).mockReset();
+    syncMocks.requestMobilePush.mockReset().mockResolvedValue({
+      accepted: true, attemptedCount: 1, deliveredCount: 1, skipped: [],
+    });
+    syncMocks.isDesktopTrulyAway.mockReturnValue(false);
   });
 
   it('injects the meta-agent tool fns into the unified-server dispatch on start', async () => {
@@ -121,7 +137,51 @@ describe('MetaAgentService tool-fn injection (Phase 7: no standalone server)', (
       urgency: 'normal',
     });
     expect(result.result.shown).toBe(true);
+    expect(syncMocks.requestMobilePush).not.toHaveBeenCalled();
 
+    const forcedResult = JSON.parse(await fns.notifyUser('caller-session', '/workspace', {
+      title: 'Decision needed',
+      body: 'Please check the session',
+      mobilePush: 'always',
+    }));
+    expect(syncMocks.requestMobilePush).toHaveBeenCalledWith(
+      'caller-session',
+      'Build release -- Decision needed',
+      'Please check the session',
+      {
+        force: true,
+        reason: 'notify_explicit',
+      }
+    );
+    expect(forcedResult.mobilePush).toMatchObject({
+      mode: 'always',
+      attempted: true,
+      accepted: true,
+      deliveredCount: 1,
+      acknowledgementReceived: true,
+    });
+
+    syncMocks.requestMobilePush.mockClear();
+    const awayResult = JSON.parse(await fns.notifyUser('caller-session', '/workspace', {
+      title: 'Quiet', body: 'Only when away', mobilePush: 'when_desktop_away',
+    }));
+    expect(syncMocks.requestMobilePush).not.toHaveBeenCalled();
+    expect(awayResult.mobilePush.skippedReason).toBe('desktop_not_truly_away');
+    syncMocks.requestMobilePush.mockResolvedValueOnce({
+      accepted: false, attemptedCount: 0, deliveredCount: 0, skipped: [], rejection: 'rate_limited',
+    });
+    const urgentResult = JSON.parse(await fns.notifyUser('caller-session', '/workspace', {
+      title: 'Urgent', body: 'Attention', urgency: 'critical',
+    }));
+    expect(syncMocks.requestMobilePush).toHaveBeenLastCalledWith(
+      'caller-session', 'Build release -- Urgent', 'Attention', { force: true, reason: 'notify_urgent' },
+    );
+    expect(urgentResult.mobilePush).toMatchObject({ accepted: false, rejection: 'rate_limited' });
+    syncMocks.requestMobilePush.mockRejectedValueOnce(new Error('provider unavailable'));
+    const failure = JSON.parse(await fns.notifyUser('caller-session', '/workspace', {
+      title: 'Retry', body: 'Attention', mobilePush: 'always',
+    }));
+    expect(failure.mobilePush).toMatchObject({ attempted: true, acknowledgementReceived: false, error: 'provider unavailable' });
     vi.mocked(AISessionsRepository.get).mockResolvedValueOnce({
       id: 'other-session',
       workspacePath: '/other-workspace',
@@ -131,7 +191,7 @@ describe('MetaAgentService tool-fn injection (Phase 7: no standalone server)', (
       body: 'Do not deliver',
       sessionId: 'other-session',
     })).rejects.toThrow('Session other-session not found');
-    expect(showNotificationWithResult).toHaveBeenCalledTimes(1);
+    expect(showNotificationWithResult).toHaveBeenCalledTimes(5);
 
     await service.shutdown();
   });
