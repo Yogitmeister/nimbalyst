@@ -158,4 +158,46 @@ describe('PGLiteQueuedPromptsStore SQLite parity', () => {
     await expect(store.deletePending('editable', 'session-1')).resolves.toBe(true);
     await expect(store.deletePending('owned', 'session-1')).resolves.toBe(false);
   });
+
+  it('creates one durable row when same-ID mobile ingestion races', async () => {
+    const store = createPGLiteQueuedPromptsStore(createSQLiteStoreAdapter(database));
+    const input = {
+      id: 'mobile-race-1',
+      sessionId: 'session-1',
+      prompt: 'same prompt',
+      attachments: [{ id: 'attachment-1', filename: 'one.png' }],
+    };
+
+    const results = await Promise.all([
+      store.createOrReplayMobilePrompt(input),
+      store.createOrReplayMobilePrompt(input),
+    ]);
+
+    expect(results.filter((result) => result.created)).toHaveLength(1);
+    expect(results.filter((result) => !result.created)).toHaveLength(1);
+    expect(results.map((result) => result.row.id)).toEqual(['mobile-race-1', 'mobile-race-1']);
+    expect(await store.listForSession('session-1')).toHaveLength(1);
+  });
+
+  it('accepts an identical replay but rejects same-ID session, prompt, or attachment mismatches', async () => {
+    const store = createPGLiteQueuedPromptsStore(createSQLiteStoreAdapter(database));
+    const input = {
+      id: 'mobile-replay-1',
+      sessionId: 'session-1',
+      prompt: 'same prompt',
+      attachments: [{ id: 'attachment-1', filename: 'one.png' }],
+    };
+
+    await expect(store.createOrReplayMobilePrompt(input)).resolves.toMatchObject({ created: true });
+    await expect(store.createOrReplayMobilePrompt(input)).resolves.toMatchObject({
+      created: false,
+      row: { id: input.id, sessionId: input.sessionId, prompt: input.prompt },
+    });
+    await expect(store.createOrReplayMobilePrompt({ ...input, sessionId: 'session-2' }))
+      .rejects.toThrow(/idempotency_conflict/);
+    await expect(store.createOrReplayMobilePrompt({ ...input, prompt: 'different prompt' }))
+      .rejects.toThrow(/idempotency_conflict/);
+    await expect(store.createOrReplayMobilePrompt({ ...input, attachments: [] }))
+      .rejects.toThrow(/idempotency_conflict/);
+  });
 });

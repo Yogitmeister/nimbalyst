@@ -1449,7 +1449,7 @@ public final class SyncManager: ObservableObject {
 
     /// Send a prompt to the current session via the queued prompts system.
     /// Desktop picks up prompts from index_update broadcasts (not session room messages).
-    public func sendPrompt(sessionId: String, text: String, attachments: [PendingAttachment] = []) async throws {
+    public func sendPrompt(sessionId: String, text: String, attachments: [PendingAttachment] = []) async throws -> String {
         logger.info("[SendPrompt] Starting: sessionId=\(sessionId), textLength=\(text.count), attachments=\(attachments.count), wsConnected=\(self.indexClient.isConnected), roomOrgId=\(self.orgId ?? "nil")")
         guard indexClient.isConnected else {
             logger.error("[SendPrompt] WebSocket not connected - cannot send prompt")
@@ -1548,6 +1548,7 @@ public final class SyncManager: ObservableObject {
             createdAt: now
         )
         try database.appendMessage(localMessage)
+        return promptId
     }
 
     // MARK: - Interactive Prompt Responses
