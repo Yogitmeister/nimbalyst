@@ -64,10 +64,10 @@ public func reducePromptDeliveryAcknowledgement(
 ) -> PromptDeliveryAcknowledgementState {
     switch event {
     case let .submitted(id, sessionWasExecuting):
-        .confirming(id: id, sessionWasExecuting: sessionWasExecuting)
+        return .confirming(id: id, sessionWasExecuting: sessionWasExecuting)
 
     case .reset:
-        .idle
+        return .idle
 
     case let .observedQueuedPromptIds(ids):
         guard let submissionId = state.submissionId, ids.contains(submissionId) else {
@@ -75,20 +75,20 @@ public func reducePromptDeliveryAcknowledgement(
         }
         switch state {
         case let .confirming(id, sessionWasExecuting):
-            .queued(id: id, sessionWasExecuting: sessionWasExecuting)
+            return .queued(id: id, sessionWasExecuting: sessionWasExecuting)
         case .idle, .queued, .executing:
-            state
+            return state
         }
 
     case let .observedExecution(isExecuting):
         guard isExecuting else { return state }
         switch state {
         case let .confirming(id, sessionWasExecuting) where !sessionWasExecuting:
-            .executing(id: id)
+            return .executing(id: id)
         case let .queued(id, sessionWasExecuting) where !sessionWasExecuting:
-            .executing(id: id)
+            return .executing(id: id)
         case .idle, .confirming, .queued, .executing:
-            state
+            return state
         }
     }
 }
