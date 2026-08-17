@@ -119,6 +119,9 @@ export interface CreateQueuedPromptInput {
   };
 }
 
+/** Input accepted by the mobile sync idempotency boundary. */
+export interface CreateOrReplayMobileQueuedPromptInput extends CreateQueuedPromptInput {}
+
 export interface CreatePriorityControlQueuedPromptInput {
   id: string;
   sessionId: string;
@@ -132,6 +135,15 @@ export interface CreatePriorityControlQueuedPromptInput {
 export interface QueuedPromptsStore {
   /** Create a new queued prompt */
   create(input: CreateQueuedPromptInput): Promise<QueuedPrompt>;
+
+  /**
+   * Atomically create a mobile prompt or return the existing row for an
+   * identical sync replay. Reusing an ID with different content is an error.
+   */
+  createOrReplayMobilePrompt(input: CreateOrReplayMobileQueuedPromptInput): Promise<{
+    row: QueuedPrompt;
+    created: boolean;
+  }>;
 
   /** Create or replay an idempotent high-priority control prompt. */
   createPriorityControlPrompt(input: CreatePriorityControlQueuedPromptInput): Promise<{
@@ -360,6 +372,10 @@ function rowToQueuedPrompt(row: any): QueuedPrompt {
   };
 }
 
+function areAttachmentPayloadsEqual(left: any[] | undefined, right: any[] | undefined): boolean {
+  return JSON.stringify(left ?? []) === JSON.stringify(right ?? []);
+}
+
 export function createPGLiteQueuedPromptsStore(
   db: PGliteLike,
   ensureDbReady?: EnsureReadyFn
@@ -574,6 +590,88 @@ export function createPGLiteQueuedPromptsStore(
 
       console.log(`[QueuedPromptsStore] Created prompt ${input.id} for session ${input.sessionId}`);
       return rowToQueuedPrompt(rows[0]);
+    },
+
+    async createOrReplayMobilePrompt(input: CreateOrReplayMobileQueuedPromptInput) {
+      await ensureReady();
+      const metadataReadyClause = await getMetadataReadyClause();
+      const truth = createQueuedPromptTruth({
+        queueRowId: input.id,
+        clientSubmissionId: input.clientSubmissionId,
+        sourceSessionId: input.sessionId,
+        sourceRoomId: input.sourceRoomId,
+        producer: input.producer ?? 'mobile-sync',
+        payload: input.prompt,
+      });
+
+      // A same-ID replay may consume a sequence gap, but never another durable
+      // queue row. This preserves the current source-order accounting while
+      // moving the duplicate decision into the database transaction boundary.
+      const allocation = await db.query<{ submission_sequence: number }>(
+        `INSERT INTO queued_prompt_source_sequences (source_session_id, next_sequence)
+         VALUES ($1, 2)
+         ON CONFLICT (source_session_id)
+         DO UPDATE SET next_sequence = queued_prompt_source_sequences.next_sequence + 1
+         RETURNING next_sequence - 1 AS submission_sequence`,
+        [input.sessionId],
+      );
+      const submissionSequence = Number(allocation.rows[0]?.submission_sequence);
+      if (!Number.isSafeInteger(submissionSequence) || submissionSequence < 1) {
+        throw new Error('Unable to allocate queued prompt sequence');
+      }
+
+      const { rows } = await db.query<any>(
+        `INSERT INTO queued_prompts (
+           id, session_id, prompt, attachments, document_context, producer,
+           client_submission_id, source_session_id, source_room_id, submission_sequence,
+           payload_utf8_bytes, payload_unicode_scalars, payload_sha256
+         )
+         SELECT $1, $2, $3, $4, $5, $6, $7, $2, $8,
+           $9,
+           $10, $11, $12
+         FROM ai_sessions s
+         WHERE s.id = $2
+           AND ${metadataReadyClause}
+         ON CONFLICT (id) DO NOTHING
+         RETURNING *`,
+        [
+          input.id,
+          input.sessionId,
+          input.prompt,
+          input.attachments ? JSON.stringify(input.attachments) : null,
+          input.documentContext ? JSON.stringify(input.documentContext) : null,
+          truth.producer,
+          truth.clientSubmissionId,
+          truth.sourceRoomId,
+          submissionSequence,
+          truth.payload.utf8Bytes,
+          truth.payload.unicodeScalars,
+          truth.payload.sha256,
+        ],
+      );
+
+      if (rows.length > 0) {
+        console.log(`[QueuedPromptsStore] Created mobile prompt ${input.id} for session ${input.sessionId}`);
+        return { row: rowToQueuedPrompt(rows[0]), created: true };
+      }
+
+      const existing = await db.query<any>(
+        `SELECT * FROM queued_prompts WHERE id = $1 LIMIT 1`,
+        [input.id],
+      );
+      if (existing.rows.length === 0) {
+        throw new Error('Failed to create or replay mobile queued prompt');
+      }
+
+      const row = rowToQueuedPrompt(existing.rows[0]);
+      if (
+        row.sessionId !== input.sessionId ||
+        row.prompt !== input.prompt ||
+        !areAttachmentPayloadsEqual(row.attachments, input.attachments)
+      ) {
+        throw new Error('idempotency_conflict: prompt ID was already used for different mobile prompt content');
+      }
+      return { row, created: false };
     },
 
     async createPriorityControlPrompt(

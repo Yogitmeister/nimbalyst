@@ -99,6 +99,8 @@ public struct SessionDetailView: View {
     @State private var deliveryWarning: String?
     /// Timer that fires if desktop doesn't start executing after a prompt send.
     @State private var deliveryTimeoutItem: DispatchWorkItem?
+    /// Monotonic acknowledgement for the active mobile submission.
+    @State private var deliveryAcknowledgement = PromptDeliveryAcknowledgementState.idle
 
     /// Queued prompts for this session (from GRDB observation).
     @State private var queuedPrompts: [QueuedPrompt] = []
@@ -225,6 +227,7 @@ public struct SessionDetailView: View {
                     }
                 ),
                 isExecuting: displaySession.isExecuting,
+                deliveryStatus: deliveryAcknowledgement.composeStatus,
                 commands: projectCommands,
                 onSend: sendPrompt,
                 onCancel: cancelSession,
@@ -331,6 +334,9 @@ public struct SessionDetailView: View {
             messagesCancellable?.cancel()
             projectCancellable?.cancel()
             queuedPromptsCancellable?.cancel()
+            deliveryTimeoutItem?.cancel()
+            deliveryAcknowledgement = .idle
+            deliveryWarning = nil
             timeoutWorkItem?.cancel()
             promptRefreshWorkItem?.cancel()
             draftDebounceItem?.cancel()
@@ -390,12 +396,7 @@ public struct SessionDetailView: View {
             Text(deliveryWarning ?? "")
         }
         .onChange(of: liveSession?.isExecuting) { _, isExec in
-            // Desktop picked up the prompt - cancel the delivery timeout
-            if isExec == true {
-                deliveryTimeoutItem?.cancel()
-                deliveryTimeoutItem = nil
-                deliveryWarning = nil
-            }
+            reduceDeliveryAcknowledgement(.observedExecution(isExec == true))
         }
         .onChange(of: messages.count) { _, _ in
             // Re-check reveal: messages may have arrived after onReady fired
@@ -716,6 +717,7 @@ public struct SessionDetailView: View {
         draftDebounceItem = nil
         deliveryTimeoutItem?.cancel()
         deliveryTimeoutItem = nil
+        deliveryAcknowledgement = .idle
         promptRefreshWorkItem?.cancel()
         promptRefreshWorkItem = nil
 
@@ -936,6 +938,7 @@ public struct SessionDetailView: View {
             },
             onChange: { prompts in
                 queuedPrompts = prompts
+                reduceDeliveryAcknowledgement(.observedQueuedPromptIds(prompts.map(\.id)))
             }
         )
     }
@@ -947,6 +950,10 @@ public struct SessionDetailView: View {
             sendError = "Sync not connected. Try closing and reopening the session."
             return
         }
+        // Capture this before the asynchronous send. A prompt submitted while
+        // another turn is executing remains queued even if that earlier turn
+        // finishes before the index write returns.
+        let sessionWasExecuting = displaySession.isExecuting
 
         // Immediately clear draft input to prevent stale draft from bouncing back via sync.
         // Cancel the pending debounce so it doesn't race with the immediate clear.
@@ -958,29 +965,57 @@ public struct SessionDetailView: View {
 
         Task {
             do {
-                try await syncManager.sendPrompt(sessionId: session.id, text: text, attachments: attachments)
+                let promptId = try await syncManager.sendPrompt(sessionId: session.id, text: text, attachments: attachments)
                 AnalyticsManager.shared.capture("mobile_ai_message_sent", properties: [
                     "hasAttachments": !attachments.isEmpty,
                     "attachmentCount": attachments.count,
                 ])
 
-                // Start a delivery timeout -- if the session doesn't start executing
-                // within 10s, warn the user that the desktop may not have received it.
-                deliveryTimeoutItem?.cancel()
-                let timeout = DispatchWorkItem { [self] in
-                    // Only warn if session still hasn't started executing
-                    if !(liveSession?.isExecuting ?? false) {
-                        deliveryWarning = "Your prompt was sent but the desktop hasn't started processing it. Make sure the desktop app is running and connected."
+                reduceDeliveryAcknowledgement(.submitted(
+                    id: promptId,
+                    sessionWasExecuting: sessionWasExecuting
+                ))
+                // A fast desktop may have started execution before the send
+                // completion resumed this task, so replay the current snapshot
+                // after the submission state exists. The reducer deliberately
+                // ignores this for prompts sent behind an already-running turn.
+                reduceDeliveryAcknowledgement(.observedExecution(liveSession?.isExecuting == true))
+                // The queue observation may have won the race with the send
+                // completion. Reconcile its latest value after opening the
+                // acknowledgement window.
+                reduceDeliveryAcknowledgement(.observedQueuedPromptIds(queuedPrompts.map(\.id)))
+
+                // Start a delivery timeout only until this exact submission is
+                // acknowledged as queued or executing.
+                if !deliveryAcknowledgement.isAcknowledged {
+                    deliveryTimeoutItem?.cancel()
+                    let timeout = DispatchWorkItem { [self, promptId] in
+                        if deliveryAcknowledgement.submissionId == promptId && !deliveryAcknowledgement.isAcknowledged {
+                            deliveryWarning = "Your prompt was sent but the desktop hasn't started processing it. Make sure the desktop app is running and connected."
+                        }
                     }
+                    deliveryTimeoutItem = timeout
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
                 }
-                deliveryTimeoutItem = timeout
-                DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
             } catch {
                 // Restore the draft so the user doesn't lose their text
                 composeText = text
                 sendError = "Failed to send: \(error.localizedDescription)"
             }
         }
+    }
+
+    private func reduceDeliveryAcknowledgement(_ event: PromptDeliveryAcknowledgementEvent) {
+        deliveryAcknowledgement = reducePromptDeliveryAcknowledgement(deliveryAcknowledgement, event: event)
+        if case .submitted = event {
+            deliveryTimeoutItem?.cancel()
+            deliveryTimeoutItem = nil
+            deliveryWarning = nil
+        }
+        guard deliveryAcknowledgement.isAcknowledged else { return }
+        deliveryTimeoutItem?.cancel()
+        deliveryTimeoutItem = nil
+        deliveryWarning = nil
     }
 
     private func handleOpenFile(_ filePath: String) {

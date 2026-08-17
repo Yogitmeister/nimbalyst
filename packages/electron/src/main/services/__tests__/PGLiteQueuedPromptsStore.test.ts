@@ -314,6 +314,52 @@ describe('PGLiteQueuedPromptsStore dispatch fencing', () => {
   });
 });
 
+describe('PGLiteQueuedPromptsStore mobile replay admission', () => {
+  const mobileInput = {
+    id: 'mobile-replay',
+    sessionId: 'session-a',
+    prompt: 'from the phone',
+    attachments: [{ id: 'attachment-1', type: 'image' }],
+    documentContext: {
+      promptProvenance: {
+        actor: 'human' as const,
+        origin: 'mobile' as const,
+        queuedPromptId: 'mobile-replay',
+      },
+    },
+  };
+
+  it('persists one row for concurrent identical mobile callbacks', async () => {
+    const db = await createDatabase();
+    const store = createPGLiteQueuedPromptsStore(db as any);
+
+    const results = await Promise.all([
+      store.createOrReplayMobilePrompt(mobileInput),
+      store.createOrReplayMobilePrompt(mobileInput),
+    ]);
+
+    expect(results.filter((result) => result.created)).toHaveLength(1);
+    expect(results.filter((result) => !result.created)).toHaveLength(1);
+    await expect(store.listForSession('session-a')).resolves.toEqual([
+      expect.objectContaining({
+        id: 'mobile-replay',
+        prompt: 'from the phone',
+        attachments: [{ id: 'attachment-1', type: 'image' }],
+      }),
+    ]);
+  });
+
+  it('rejects a same-ID replay with different prompt identity', async () => {
+    const db = await createDatabase();
+    const store = createPGLiteQueuedPromptsStore(db as any);
+    await store.createOrReplayMobilePrompt(mobileInput);
+
+    await expect(
+      store.createOrReplayMobilePrompt({ ...mobileInput, prompt: 'different prompt' }),
+    ).rejects.toThrow('idempotency_conflict');
+  });
+});
+
 describe('PGLiteQueuedPromptsStore boot re-drive helpers', () => {
   it('listSessionIdsWithPending returns each session once, pending rows only', async () => {
     const query = vi.fn(async (sql: string, params?: any[]) => {

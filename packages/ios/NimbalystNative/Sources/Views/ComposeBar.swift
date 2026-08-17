@@ -9,6 +9,7 @@ import UIKit
 public struct ComposeBar: View {
     @Binding var text: String
     let isExecuting: Bool
+    let deliveryStatus: PromptDeliveryComposeStatus
     let commands: [SyncedSlashCommand]
     let onSend: (String, [PendingAttachment]) -> Void
     let onCancel: () -> Void
@@ -38,6 +39,18 @@ public struct ComposeBar: View {
 
     public var body: some View {
         VStack(spacing: 0) {
+            if deliveryStatus != .idle && !isExecuting {
+                HStack(spacing: 6) {
+                    Image(systemName: deliveryStatus == .confirming ? "arrow.triangle.2.circlepath" : "clock.fill")
+                    Text(deliveryStatus == .confirming ? "Confirming delivery…" : "Queued for delivery")
+                }
+                .font(.caption)
+                .foregroundStyle(NimbalystColors.warning)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+            }
+
             // Slash command suggestions overlay
             if let filter = slashFilter, !commands.isEmpty {
                 CommandSuggestionView(
