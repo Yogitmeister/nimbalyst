@@ -16,8 +16,45 @@ import type {
   ToolProgressPayload,
   InteractivePromptPayload,
   SubagentPayload,
+  SubagentLaunchParameter,
   TurnEndedPayload,
 } from './types';
+
+function mergeSubagentLaunchParameters(
+  existing: SubagentLaunchParameter[],
+  incoming: SubagentLaunchParameter[],
+): SubagentLaunchParameter[] {
+  const merged = [...existing];
+  const indexByKey = new Map(merged.map((parameter, index) => [parameter.key, index]));
+  const sourcePriority: Record<SubagentLaunchParameter['source'], number> = {
+    default: 0,
+    requested: 1,
+    effective_session: 2,
+    tool_argument: 3,
+    observed: 4,
+  };
+
+  for (const parameter of incoming) {
+    const existingIndex = indexByKey.get(parameter.key);
+    if (existingIndex === undefined) {
+      indexByKey.set(parameter.key, merged.length);
+      merged.push(parameter);
+    } else if (sourcePriority[parameter.source] >= sourcePriority[merged[existingIndex].source]) {
+      merged[existingIndex] = parameter;
+    }
+  }
+
+  return merged;
+}
+
+function launchParameterText(
+  parameters: SubagentLaunchParameter[],
+  key: string,
+): string | null | undefined {
+  const parameter = parameters.find(item => item.key === key);
+  if (!parameter) return undefined;
+  return parameter.value === null ? null : String(parameter.value);
+}
 
 export class TranscriptWriter {
   private seededSequence: number | null = null;
@@ -310,8 +347,11 @@ export class TranscriptWriter {
       teammateName?: string | null;
       teamName?: string | null;
       teammateMode?: string | null;
+      provider?: string | null;
       model?: string | null;
       reasoningEffort?: string | null;
+      extendedThinking?: string | null;
+      launchParameters?: SubagentLaunchParameter[];
       color?: string | null;
       isBackground?: boolean;
       prompt: string;
@@ -324,8 +364,11 @@ export class TranscriptWriter {
       teammateName: params.teammateName ?? null,
       teamName: params.teamName ?? null,
       teammateMode: params.teammateMode ?? null,
+      provider: params.provider ?? null,
       model: params.model ?? null,
       reasoningEffort: params.reasoningEffort ?? null,
+      extendedThinking: params.extendedThinking ?? null,
+      launchParameters: params.launchParameters ?? [],
       color: params.color ?? null,
       isBackground: params.isBackground ?? false,
       prompt: params.prompt,
@@ -344,25 +387,50 @@ export class TranscriptWriter {
   async updateSubagent(
     eventId: number,
     update: {
-      status: 'completed';
+      status?: 'completed';
       resultSummary?: string;
       toolCallCount?: number;
       durationMs?: number;
+      provider?: string | null;
       model?: string | null;
       reasoningEffort?: string | null;
+      extendedThinking?: string | null;
+      launchParameters?: SubagentLaunchParameter[];
     },
   ): Promise<void> {
     const existing = await this.store.getEventById(eventId);
     if (!existing) {
       throw new Error(`TranscriptWriter: event ${eventId} not found`);
     }
+    const existingLaunchParameters = Array.isArray((existing.payload as Partial<SubagentPayload>).launchParameters)
+      ? (existing.payload as Partial<SubagentPayload>).launchParameters!
+      : [];
+    const launchParameters = update.launchParameters
+      ? mergeSubagentLaunchParameters(existingLaunchParameters, update.launchParameters)
+      : undefined;
+    const provider = launchParameters
+      ? launchParameterText(launchParameters, 'provider')
+      : update.provider;
+    const model = launchParameters
+      ? launchParameterText(launchParameters, 'model')
+      : update.model;
+    const reasoningEffort = launchParameters
+      ? launchParameterText(launchParameters, 'reasoningEffort')
+      : update.reasoningEffort;
+    const extendedThinking = launchParameters
+      ? launchParameterText(launchParameters, 'extendedThinking')
+      : update.extendedThinking;
+
     await this.store.mergeEventPayload(eventId, {
-      status: update.status,
+      ...(update.status !== undefined ? { status: update.status } : {}),
       ...(update.resultSummary !== undefined ? { resultSummary: update.resultSummary } : {}),
       ...(update.toolCallCount !== undefined ? { toolCallCount: update.toolCallCount } : {}),
       ...(update.durationMs !== undefined ? { durationMs: update.durationMs } : {}),
-      ...(update.model !== undefined ? { model: update.model } : {}),
-      ...(update.reasoningEffort !== undefined ? { reasoningEffort: update.reasoningEffort } : {}),
+      ...(provider !== undefined ? { provider } : {}),
+      ...(model !== undefined ? { model } : {}),
+      ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+      ...(extendedThinking !== undefined ? { extendedThinking } : {}),
+      ...(launchParameters !== undefined ? { launchParameters } : {}),
     });
   }
 

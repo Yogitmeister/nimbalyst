@@ -11,7 +11,7 @@
  */
 
 import type { RawMessage } from '../TranscriptTransformer';
-import type { TranscriptEvent, InteractivePromptPayload, TurnEndedPayload, UserMessagePayload, PermissionDeniedReasonType } from '../types';
+import type { TranscriptEvent, InteractivePromptPayload, TurnEndedPayload, UserMessagePayload, PermissionDeniedReasonType, SubagentLaunchParameter } from '../types';
 
 // ---------------------------------------------------------------------------
 // Parse context (provided by the transformer to parsers)
@@ -142,11 +142,24 @@ export interface SubagentStartedDescriptor {
   teammateName?: string | null;
   teamName?: string | null;
   teammateMode?: string | null;
+  provider?: string | null;
   model?: string | null;
   reasoningEffort?: string | null;
+  extendedThinking?: string | null;
+  launchParameters?: SubagentLaunchParameter[];
   isBackground?: boolean;
   prompt: string;
   createdAt?: Date;
+}
+
+export interface SubagentUpdatedDescriptor {
+  type: 'subagent_updated';
+  subagentId: string;
+  provider?: string | null;
+  model?: string | null;
+  reasoningEffort?: string | null;
+  extendedThinking?: string | null;
+  launchParameters?: SubagentLaunchParameter[];
 }
 
 export interface SubagentCompletedDescriptor {
@@ -154,8 +167,11 @@ export interface SubagentCompletedDescriptor {
   subagentId: string;
   status: 'completed';
   resultSummary?: string;
+  provider?: string | null;
   model?: string | null;
   reasoningEffort?: string | null;
+  extendedThinking?: string | null;
+  launchParameters?: SubagentLaunchParameter[];
 }
 
 export interface InteractivePromptCreatedDescriptor {
@@ -189,6 +205,7 @@ export type CanonicalEventDescriptor =
   | ToolCallCompletedDescriptor
   | ToolProgressDescriptor
   | SubagentStartedDescriptor
+  | SubagentUpdatedDescriptor
   | SubagentCompletedDescriptor
   | InteractivePromptCreatedDescriptor
   | InteractivePromptUpdatedDescriptor

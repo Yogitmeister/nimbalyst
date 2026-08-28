@@ -147,6 +147,11 @@ import {
 import { classifyAbnormalChildExit } from './claudeCode/abnormalExit';
 import { normalizeStructuredContextUsage, type ParsedContextUsage } from '../utils/contextUsage';
 import { applyTaskListMutation, sortTaskList, type TaskListItem } from './claudeCode/taskListReconstruct';
+import {
+  applyClaudeInitToSubagentLaunchConfig,
+  createSubagentLaunchConfigMetadata,
+  shouldAttachSubagentLaunchConfig,
+} from './claudeCode/subagentLaunchAudit';
 
 
 /**
@@ -901,6 +906,10 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       this.helperMethod = sdkResult.helperMethod;
       this.promptController = promptController;
       spawnDiagContext = { binaryPath: options.pathToClaudeCodeExecutable, cwd: options.cwd };
+      const subagentLaunchConfig = createSubagentLaunchConfigMetadata(
+        options as Record<string, any>,
+        this.config,
+      );
 
       // Meta-agent: the profile-specific MCP map was frozen by buildSdkOptions
       // through getMcpServersSnapshot; only native-tool restrictions remain here.
@@ -940,7 +949,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
             allowedTools: options.allowedTools,
             disallowedTools: options.disallowedTools,
             permissionMode: options.permissionMode,
-            thinking: options.thinking
+            effort: options.effort ?? options.env?.CLAUDE_CODE_EFFORT_LEVEL,
+            thinking: options.thinking,
+            thinkingMode: this.config.thinkingMode
           }
         }), metadataToLog, hideMessages, undefined, true /* searchable */);
 
@@ -1288,6 +1299,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
           // reacted to them, and the persistent reparse path (ClaudeCodeRawParser)
           // ignores them, so persisting just inflates ai_agent_messages + sync churn.
           if (sessionId && !isTransientClaudeCodeChunk(chunk)) {
+            if (chunk?.type === 'system' && chunk?.subtype === 'init') {
+              applyClaudeInitToSubagentLaunchConfig(subagentLaunchConfig, chunk);
+            }
             // Two storage passes, both on clones -- the live dispatch loop below
             // still uses the untouched `chunk`:
             //   1. slim: drop dead-weight fields (tool_use_result.originalFile/
@@ -1304,7 +1318,24 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
             // Only assistant messages with text content (no tool_use/tool_result) are searchable
             const isSearchable = isSearchableAssistantChunk(chunk);
 
-            this.logAgentMessageNonBlocking(sessionId, 'claude-code', 'output', rawChunkJson, undefined, hideMessages, providerMessageId, isSearchable);
+            const launchMetadata = shouldAttachSubagentLaunchConfig(chunk)
+              ? {
+                  subagentLaunchConfig: {
+                    provider: subagentLaunchConfig.provider,
+                    parameters: subagentLaunchConfig.parameters.map(parameter => ({ ...parameter })),
+                  },
+                }
+              : undefined;
+            this.logAgentMessageNonBlocking(
+              sessionId,
+              'claude-code',
+              'output',
+              rawChunkJson,
+              launchMetadata,
+              hideMessages,
+              providerMessageId,
+              isSearchable,
+            );
             // Drive incremental transcript transformation. Without this, the
             // canonical store only advances on the next aiLoadSession from
             // the renderer, which never fires when the user's active session

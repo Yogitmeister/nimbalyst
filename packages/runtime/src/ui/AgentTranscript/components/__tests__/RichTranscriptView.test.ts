@@ -539,4 +539,15 @@ describe('sub-agent audit labels', () => {
     expect(formatSubagentAuditLabel(null, undefined)).toBeNull();
     expect(formatSubagentAuditLabel('gpt-5.4', null)).toBe('Model: gpt-5.4');
   });
+
+  it('includes provider and extended reasoning state when supplied', () => {
+    expect(formatSubagentAuditLabel(
+      'claude-sonnet-4-6-20260801',
+      'high',
+      'on',
+      'claude-code',
+    )).toBe(
+      'Provider: claude-code; Model: claude-sonnet-4-6-20260801; Reasoning effort: high; Extended reasoning: on',
+    );
+  });
 });

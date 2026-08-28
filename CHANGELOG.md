@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 <!-- New features go here -->
+- Sub-agent transcript cards show the provider, actual model, reasoning effort, extended-reasoning state and every safe model launch parameter on desktop and iOS.
 - The macOS menu bar shows your session fleet at a glance, and names a session for a few seconds whenever it starts, finishes, blocks or fails.
 - Animations can show a spinning indicator for a running or loading state.
 

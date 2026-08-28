@@ -24,6 +24,7 @@ import type {
   ParseContext,
   CanonicalEventDescriptor,
 } from './IRawMessageParser';
+import type { SubagentLaunchParameter } from '../types';
 
 /**
  * Item types that are NOT treated as "generic tool-like". Each either has its
@@ -401,8 +402,10 @@ export class CodexAppServerRawParser implements IRawMessageParser {
         subagentId: item.id,
         agentType: 'Session',
         prompt: item.prompt ?? '',
+        provider: 'openai-codex',
         ...(item.model != null ? { model: item.model } : {}),
         ...(item.reasoningEffort != null ? { reasoningEffort: item.reasoningEffort } : {}),
+        launchParameters: this.buildSpawnAgentLaunchParameters(item),
         createdAt: msg.createdAt,
       }];
     }
@@ -423,8 +426,10 @@ export class CodexAppServerRawParser implements IRawMessageParser {
         subagentId: item.id,
         status: 'completed',
         resultSummary: this.buildSpawnAgentResultSummary(item),
+        provider: 'openai-codex',
         ...(item.model != null ? { model: item.model } : {}),
         ...(item.reasoningEffort != null ? { reasoningEffort: item.reasoningEffort } : {}),
+        launchParameters: this.buildSpawnAgentLaunchParameters(item),
       }];
     }
 
@@ -815,5 +820,31 @@ export class CodexAppServerRawParser implements IRawMessageParser {
       parts.push('receiver_thread_ids: none');
     }
     return parts.join('\n');
+  }
+
+  private buildSpawnAgentLaunchParameters(item: AppServerItem): SubagentLaunchParameter[] {
+    const parameters: SubagentLaunchParameter[] = [{
+      key: 'provider',
+      label: 'Provider',
+      value: 'openai-codex',
+      source: 'effective_session',
+    }];
+    if (item.model != null) {
+      parameters.push({
+        key: 'model',
+        label: 'Model',
+        value: item.model,
+        source: 'observed',
+      });
+    }
+    if (item.reasoningEffort != null) {
+      parameters.push({
+        key: 'reasoningEffort',
+        label: 'Reasoning effort',
+        value: item.reasoningEffort,
+        source: 'observed',
+      });
+    }
+    return parameters;
   }
 }

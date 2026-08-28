@@ -616,11 +616,40 @@ export { stripMcpPrefix, isInteractiveWidgetTool };
 export function formatSubagentAuditLabel(
   model: string | null | undefined,
   reasoningEffort: string | null | undefined,
+  extendedThinking?: string | null,
+  provider?: string | null,
 ): string | null {
   const parts: string[] = [];
+  if (provider) parts.push(`Provider: ${provider}`);
   if (model) parts.push(`Model: ${model}`);
   if (reasoningEffort) parts.push(`Reasoning effort: ${reasoningEffort}`);
+  if (extendedThinking) parts.push(`Extended reasoning: ${extendedThinking}`);
   return parts.length > 0 ? parts.join('; ') : null;
+}
+
+function formatSubagentAuditSummary(
+  provider: string | null | undefined,
+  model: string | null | undefined,
+  reasoningEffort: string | null | undefined,
+  extendedThinking: string | null | undefined,
+): string {
+  return [
+    provider,
+    model,
+    reasoningEffort ? `effort ${reasoningEffort}` : null,
+    extendedThinking ? `reasoning ${extendedThinking}` : null,
+  ].filter((value): value is string => Boolean(value)).join(' · ');
+}
+
+function formatSubagentParameterSource(source: string): string {
+  switch (source) {
+    case 'observed': return 'observed from child output';
+    case 'effective_session': return 'effective session';
+    case 'requested': return 'requested';
+    case 'tool_argument': return 'launch argument';
+    case 'default': return 'provider default';
+    default: return source;
+  }
 }
 
 const isFileModifyingTool = (name?: string): boolean => {
@@ -1814,8 +1843,24 @@ export const RichTranscriptView = React.forwardRef<
     const description = (isSubAgent && toolArgs?.description ? toolArgs.description : null) as string | null;
     const prompt = (isSubAgent && toolArgs?.prompt ? toolArgs.prompt : null) as string | null;
     const subagentAuditLabel = isSubAgent
-      ? formatSubagentAuditLabel(toolMsg.subagent?.model, toolMsg.subagent?.reasoningEffort)
+      ? formatSubagentAuditLabel(
+          toolMsg.subagent?.model,
+          toolMsg.subagent?.reasoningEffort,
+          toolMsg.subagent?.extendedThinking,
+          toolMsg.subagent?.provider,
+        )
       : null;
+    const subagentAuditSummary = isSubAgent
+      ? formatSubagentAuditSummary(
+          toolMsg.subagent?.provider,
+          toolMsg.subagent?.model,
+          toolMsg.subagent?.reasoningEffort,
+          toolMsg.subagent?.extendedThinking,
+        )
+      : '';
+    const subagentLaunchParameters = isSubAgent && Array.isArray(toolMsg.subagent?.launchParameters)
+      ? toolMsg.subagent.launchParameters
+      : [];
 
     // Extract result text
     const resultText = tool.result ? extractResultText(tool.result) : null;
@@ -1832,7 +1877,7 @@ export const RichTranscriptView = React.forwardRef<
     return (
       <div key={toolRenderKey} className={`rich-transcript-tool-container mb-2 ${depth > 0 ? 'nested ml-0' : ''}`} style={{ marginLeft: depth > 0 ? '1rem' : '0' }}>
         <div className={cardClass}>
-          <button onClick={() => toggleToolExpand(toolId)} className="rich-transcript-tool-button w-full py-1 px-2 flex items-center gap-1.5 text-left border-none cursor-pointer text-sm bg-transparent">
+          <button onClick={() => toggleToolExpand(toolId)} className={`rich-transcript-tool-button w-full py-1 px-2 flex ${isSubAgent ? 'items-start' : 'items-center'} gap-1.5 text-left border-none cursor-pointer text-sm bg-transparent`}>
             {isTeammate ? (
               // Group icon for team teammates
               <MaterialSymbol icon="group" size={16} className="rich-transcript-tool-icon sub-agent-icon w-4 h-4 text-[var(--nim-primary)] shrink-0" />
@@ -1846,28 +1891,30 @@ export const RichTranscriptView = React.forwardRef<
               // Wrench icon for regular tools
               <MaterialSymbol icon="build" size={16} className="rich-transcript-tool-icon w-4 h-4 text-[var(--nim-primary)] shrink-0" />
             )}
-            <span className="rich-transcript-tool-name font-mono text-sm text-[var(--nim-text)] font-medium" title={tool.toolName || undefined}>
-              {isTeammate
-                ? (toolMsg.subagent?.teammateName || 'Teammate')
-                : isSubAgent
-                  ? (toolArgs?.run_in_background ? 'Background Agent' : 'Sub-Agent')
-                  : toolDisplayName}
-              {isTeammate && toolMsg.subagent?.teammateMode && (
-                <span className="rich-transcript-tool-subagent-type text-[var(--nim-text-muted)] font-normal text-xs ml-1">({toolMsg.subagent?.teammateMode})</span>
-              )}
-              {isSubAgent && !isTeammate && toolMsg.subagent?.agentType && (
-                <span className="rich-transcript-tool-subagent-type text-[var(--nim-primary)] font-semibold"> [{toolMsg.subagent?.agentType}]</span>
+            <span className={isSubAgent ? 'min-w-0 flex-1' : 'shrink-0'}>
+              <span className="rich-transcript-tool-name block font-mono text-sm text-[var(--nim-text)] font-medium" title={tool.toolName || undefined}>
+                {isTeammate
+                  ? (toolMsg.subagent?.teammateName || 'Teammate')
+                  : isSubAgent
+                    ? (toolArgs?.run_in_background ? 'Background Agent' : 'Sub-Agent')
+                    : toolDisplayName}
+                {isTeammate && toolMsg.subagent?.teammateMode && (
+                  <span className="rich-transcript-tool-subagent-type text-[var(--nim-text-muted)] font-normal text-xs ml-1">({toolMsg.subagent?.teammateMode})</span>
+                )}
+                {isSubAgent && !isTeammate && toolMsg.subagent?.agentType && (
+                  <span className="rich-transcript-tool-subagent-type text-[var(--nim-primary)] font-semibold"> [{toolMsg.subagent?.agentType}]</span>
+                )}
+              </span>
+              {subagentAuditLabel && (
+                <span
+                  className="rich-transcript-subagent-audit block break-words text-[11px] leading-4 text-[var(--nim-text-muted)]"
+                  aria-label={subagentAuditLabel}
+                  title={subagentAuditLabel}
+                >
+                  {subagentAuditSummary}
+                </span>
               )}
             </span>
-            {subagentAuditLabel && (
-              <span
-                className="rich-transcript-subagent-audit min-w-0 max-w-40 truncate text-[11px] text-[var(--nim-text-muted)]"
-                aria-label={subagentAuditLabel}
-                title={subagentAuditLabel}
-              >
-                {toolMsg.subagent?.model}{toolMsg.subagent?.model && toolMsg.subagent?.reasoningEffort ? ' · ' : ''}{toolMsg.subagent?.reasoningEffort}
-              </span>
-            )}
             {!isSubAgent && tool.arguments && (() => {
               const argStr = formatToolArguments(tool.toolName, tool.arguments, workspacePath);
               if (!argStr) return null;
@@ -1974,6 +2021,29 @@ export const RichTranscriptView = React.forwardRef<
               {isSubAgent && description && (
                 <div className="rich-transcript-tool-section mb-1.5">
                   <div className="rich-transcript-tool-description text-sm text-[var(--nim-text)] leading-relaxed mb-2">{description}</div>
+                </div>
+              )}
+
+              {isSubAgent && subagentLaunchParameters.length > 0 && (
+                <div className="rich-transcript-tool-section mb-2">
+                  <div className="rich-transcript-tool-section-label text-[var(--nim-text-faint)] mb-1 text-xs">
+                    Model launch configuration
+                  </div>
+                  <dl className="m-0 grid grid-cols-[minmax(7rem,auto)_minmax(0,1fr)] gap-x-3 gap-y-1 border-y border-[var(--nim-border)] py-1.5 text-xs">
+                    {subagentLaunchParameters.map(parameter => (
+                      <React.Fragment key={parameter.key}>
+                        <dt className="m-0 text-[var(--nim-text-muted)]">{parameter.label}</dt>
+                        <dd className="m-0 min-w-0 break-words text-[var(--nim-text)]">
+                          <span className="font-mono">
+                            {parameter.value === null ? 'not sent' : String(parameter.value)}
+                          </span>
+                          <span className="ml-1.5 text-[var(--nim-text-faint)]">
+                            ({formatSubagentParameterSource(parameter.source)})
+                          </span>
+                        </dd>
+                      </React.Fragment>
+                    ))}
+                  </dl>
                 </div>
               )}
 

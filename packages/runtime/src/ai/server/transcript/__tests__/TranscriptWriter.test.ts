@@ -295,6 +295,45 @@ describe('TranscriptWriter', () => {
       expect((updated!.payload as any).agentType).toBe('Explore');
       expect((updated!.payload as any).prompt).toBe('Find files');
     });
+
+    it('merges launch parameter updates without losing previously captured controls', async () => {
+      const event = await writer.createSubagent('session-1', {
+        subagentId: 'sub-audit',
+        agentType: 'Explore',
+        prompt: 'Audit this',
+        provider: 'claude-code',
+        model: 'sonnet',
+        reasoningEffort: 'max',
+        extendedThinking: 'off',
+        launchParameters: [
+          { key: 'model', label: 'Model', value: 'sonnet', source: 'requested' },
+          { key: 'reasoningEffort', label: 'Reasoning effort', value: 'max', source: 'tool_argument' },
+          { key: 'extendedThinking', label: 'Extended reasoning', value: 'off', source: 'tool_argument' },
+          { key: 'permissionMode', label: 'Permission mode', value: 'auto', source: 'effective_session' },
+        ],
+      });
+
+      await writer.updateSubagent(event.id, {
+        model: 'claude-sonnet-4-6-20260801',
+        launchParameters: [
+          { key: 'model', label: 'Model', value: 'claude-sonnet-4-6-20260801', source: 'observed' },
+          { key: 'reasoningEffort', label: 'Reasoning effort', value: 'high', source: 'effective_session' },
+          { key: 'extendedThinking', label: 'Extended reasoning', value: 'on', source: 'requested' },
+        ],
+      });
+
+      const payload = (await store.getEventById(event.id))!.payload as any;
+      expect(payload.status).toBe('running');
+      expect(payload.model).toBe('claude-sonnet-4-6-20260801');
+      expect(payload.reasoningEffort).toBe('max');
+      expect(payload.extendedThinking).toBe('off');
+      expect(payload.launchParameters).toEqual([
+        { key: 'model', label: 'Model', value: 'claude-sonnet-4-6-20260801', source: 'observed' },
+        { key: 'reasoningEffort', label: 'Reasoning effort', value: 'max', source: 'tool_argument' },
+        { key: 'extendedThinking', label: 'Extended reasoning', value: 'off', source: 'tool_argument' },
+        { key: 'permissionMode', label: 'Permission mode', value: 'auto', source: 'effective_session' },
+      ]);
+    });
   });
 
   describe('recordTurnEnded', () => {

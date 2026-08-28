@@ -331,8 +331,14 @@ describe('CodexAppServerRawParser', () => {
       subagentId: 'spawn-1',
       agentType: 'Session',
       prompt: 'Create a plan',
+      provider: 'openai-codex',
       model: 'gpt-5.4',
       reasoningEffort: 'high',
+      launchParameters: [
+        { key: 'provider', label: 'Provider', value: 'openai-codex', source: 'effective_session' },
+        { key: 'model', label: 'Model', value: 'gpt-5.4', source: 'observed' },
+        { key: 'reasoningEffort', label: 'Reasoning effort', value: 'high', source: 'observed' },
+      ],
       createdAt: startMsg.createdAt,
     }]);
 
@@ -361,8 +367,14 @@ describe('CodexAppServerRawParser', () => {
       subagentId: 'spawn-1',
       status: 'completed',
       resultSummary: 'receiver_thread_ids: thread-child-1',
+      provider: 'openai-codex',
       model: 'gpt-5.4',
       reasoningEffort: 'high',
+      launchParameters: [
+        { key: 'provider', label: 'Provider', value: 'openai-codex', source: 'effective_session' },
+        { key: 'model', label: 'Model', value: 'gpt-5.4', source: 'observed' },
+        { key: 'reasoningEffort', label: 'Reasoning effort', value: 'high', source: 'observed' },
+      ],
     }]);
   });
 
