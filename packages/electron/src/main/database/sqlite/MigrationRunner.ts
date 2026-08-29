@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * SQLite Migration Runner
  *
@@ -30,6 +31,193 @@ export interface Migration {
 export interface MigrationResult {
   applied: number[];
   skipped: number[];
+  /** Ledger rows canonicalized into the fork lane by `repairForkLedger`. */
+  relocated: ForkLaneRepair[];
+  /** Ledger rows whose recorded name disagrees with this build's name for that version. */
+  nameMismatches: Array<{ version: number; recorded: string; expected: string }>;
+}
+
+/**
+ * Fork-lineage ledger relocations.
+ *
+ * This fork mints migrations on top of upstream's. When a later upstream release
+ * claims a version number the fork already used, an existing database's
+ * version->name binding disagrees with this build's, and because the runner keys
+ * on version alone BOTH migrations then misbehave: the fork's re-runs (its new
+ * version looks unapplied) and upstream's silently never runs (its version looks
+ * applied). The second failure is invisible ג€” the ledger claims forever that a
+ * migration ran when it did not.
+ *
+ * Each entry moves a fork-authored ledger row into the reserved fork lane. Keyed
+ * on (version, name) so it cannot misfire on a database where that version
+ * legitimately belongs to upstream, and idempotent: once relocated the name test
+ * no longer matches.
+ *
+ * Fork-authored migrations live at version >= FORK_LANE_BASE so upstream's
+ * contiguous range can never collide with them again.
+ */
+const FORK_LANE_BASE = 1000;
+
+interface ForkLaneRule {
+  /** Canonical fork-lane version this build uses. */
+  canonical: number;
+  name: string;
+  /** Versions an earlier build of this fork may have recorded the migration under. */
+  legacyVersions: number[];
+  /**
+   * Cheap physical-schema probe. The ledger row is a claim, not proof: an adopted
+   * or hand-repaired database can carry the row without the schema. Relocating on
+   * the name alone would record the migration as applied forever and leave the
+   * schema missing ג€” the same silent class of defect this whole repair exists to
+   * undo. Returns false when the claim is not backed by real schema.
+   */
+  schemaPresent: (db: SqliteDatabase) => boolean;
+  /**
+   * The upstream migration that now owns a vacated legacy version, if any. It is
+   * applied inside the SAME transaction as the relocation so no other process can
+   * ever observe that version absent ג€” an older build that snapshotted the ledger
+   * mid-repair would otherwise re-run its own migration and die.
+   */
+  upstreamSuccessor?: { version: number; name: string; file: string };
+}
+
+function hasColumns(db: SqliteDatabase, table: string, required: string[]): boolean {
+  const present = new Set(
+    (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+      (c) => c.name,
+    ),
+  );
+  return required.every((c) => present.has(c));
+}
+
+const FORK_LANE_RULES: ReadonlyArray<ForkLaneRule> = [
+  {
+    canonical: 1001,
+    name: 'queued_prompt_priority_control',
+    // 32: databases built before the v0.74.3 fold, when this carry was numbered 32.
+    // 35: databases built by the first (broken) v0.74.3 fold build, which renumbered
+    //     the carry to 35 ג€” inside upstream's range, where it will collide again.
+    legacyVersions: [32, 35],
+    schemaPresent: (db) =>
+      hasColumns(db, 'queued_prompts', [
+        'delivery_class',
+        'priority_rank',
+        'delivery_ready',
+        'producer',
+        'idempotency_key',
+        'request_digest',
+        'control_operation',
+        'interrupt_target_generation',
+        'interrupt_reservation_owner',
+        'interrupt_receipt',
+      ]),
+    upstreamSuccessor: {
+      version: 32,
+      name: 'feedback_request_cache',
+      file: '0032_feedback_request_cache.sql',
+    },
+  },
+];
+
+export interface ForkLaneRepair {
+  from: number;
+  to: number;
+  name: string;
+  /** Upstream migration applied into the vacated version, in the same transaction. */
+  backfilled?: { version: number; name: string };
+}
+
+/**
+ * Reconcile fork-authored ledger rows into the fork lane.
+ *
+ * MUST run before the applied-set snapshot: that snapshot is taken once and then
+ * consulted in memory, so a repair performed afterwards would leave the loop
+ * reading a stale set ג€” it would skip the upstream migration this repair just
+ * freed up, silently reproducing the exact defect being fixed.
+ */
+export function repairForkLedger(db: SqliteDatabase, schemaDir: string): ForkLaneRepair[] {
+  const repairs: ForkLaneRepair[] = [];
+  const readVersion = db.prepare('SELECT name FROM _migrations WHERE version = ?');
+  const move = db.prepare('UPDATE _migrations SET version = ? WHERE version = ? AND name = ?');
+  const insert = db.prepare('INSERT INTO _migrations (version, name) VALUES (?, ?)');
+
+  for (const rule of FORK_LANE_RULES) {
+    let repair: ForkLaneRepair | null = null;
+    const tx = db.transaction((): void => {
+      // Every read happens under the write lock, so two starting processes cannot
+      // both decide to repair.
+      const legacy = rule.legacyVersions
+        .map((v) => ({ version: v, row: readVersion.get(v) as { name: string } | undefined }))
+        .find((x) => x.row?.name === rule.name);
+      if (!legacy) {
+        return; // nothing recorded under a legacy identity: already canonical, or fresh.
+      }
+      // Never clobber an occupied canonical slot ג€” `version` is the PRIMARY KEY and
+      // the UPDATE would throw, aborting startup.
+      const occupant = readVersion.get(rule.canonical) as { name: string } | undefined;
+      if (occupant) {
+        return;
+      }
+      if (!rule.schemaPresent(db)) {
+        // The ledger claims this ran but the schema disagrees. Leave the row alone
+        // and let the normal loop apply the canonical migration for real.
+        return;
+      }
+
+      const successor = rule.upstreamSuccessor;
+      if (successor && legacy.version === successor.version) {
+        // Vacate and immediately refill the number in one transaction. Readers see
+        // either the old state or the repaired one, never a hole at this version.
+        move.run(rule.canonical, legacy.version, rule.name);
+        db.exec(fs.readFileSync(path.join(schemaDir, successor.file), 'utf-8'));
+        insert.run(successor.version, successor.name);
+        repair = {
+          from: legacy.version,
+          to: rule.canonical,
+          name: rule.name,
+          backfilled: { version: successor.version, name: successor.name },
+        };
+        return;
+      }
+
+      move.run(rule.canonical, legacy.version, rule.name);
+      repair = { from: legacy.version, to: rule.canonical, name: rule.name };
+    });
+    tx.immediate();
+    if (repair) {
+      repairs.push(repair);
+    }
+  }
+  return repairs;
+}
+
+/**
+ * Ledger rows whose recorded name disagrees with this build's name for that
+ * version. A mismatch means the version-keyed skip is about to lie: the runner
+ * will treat a migration as applied that never ran, and the ledger will claim it
+ * did forever after. That is exactly how a broken build reached a user's machine.
+ *
+ * Only versions this build owns are checked. Rows this build does not know about
+ * are left alone, so a database written by a NEWER build still opens here ג€”
+ * downgrade has to keep working, because rolling back is the recovery path.
+ */
+export function findLedgerNameMismatches(
+  db: SqliteDatabase,
+  migrations: Migration[],
+): Array<{ version: number; recorded: string; expected: string }> {
+  const rows = db.prepare('SELECT version, name FROM _migrations').all() as Array<{
+    version: number;
+    name: string;
+  }>;
+  const recordedByVersion = new Map(rows.map((r) => [r.version, r.name]));
+  const mismatches: Array<{ version: number; recorded: string; expected: string }> = [];
+  for (const m of migrations) {
+    const recorded = recordedByVersion.get(m.version);
+    if (recorded !== undefined && recorded !== m.name) {
+      mismatches.push({ version: m.version, recorded, expected: m.name });
+    }
+  }
+  return mismatches;
 }
 
 /**
@@ -243,6 +431,19 @@ export function getMigrations(schemaDir: string): Migration[] {
     },
     { version: 41, name: 'document_feedback_index', sqlFile: path.join(schemaDir, '0041_document_feedback_index.sql') },
     { version: 42, name: 'tracker_creation_receipts', sqlFile: path.join(schemaDir, '0042_tracker_creation_receipts.sql') },
+    // --- fork lane (version >= FORK_LANE_BASE) ---------------------------------
+    // Fork-authored migrations live here, clear of the range upstream mints into.
+    // Databases that recorded this one at 32 (pre-fold) or 35 (the first, broken
+    // fold build) are canonicalized by repairForkLedger() before the loop runs.
+    //
+    // This buys distance, not permanence: upstream could eventually reach 1000.
+    // The durable fix is a separate namespaced local ledger ג€” see
+    // _pending/v15/PLAN-migration-collision-fix.md.
+    {
+      version: 1001,
+      name: 'queued_prompt_priority_control',
+      sqlFile: path.join(schemaDir, '1001_queued_prompt_priority_control.sql'),
+    },
   ];
 }
 
@@ -255,12 +456,6 @@ export function runMigrations(db: SqliteDatabase, schemaDir: string): MigrationR
     );
   `);
 
-  const appliedRows = db
-    .prepare('SELECT version FROM _migrations ORDER BY version ASC')
-    .all() as Array<{ version: number }>;
-  const applied = new Set(appliedRows.map((r) => r.version));
-
-  const result: MigrationResult = { applied: [], skipped: [] };
   const migrations = getMigrations(schemaDir).sort((a, b) => a.version - b.version);
 
   // Verify ordering: no version may equal a previous version.
@@ -272,8 +467,43 @@ export function runMigrations(db: SqliteDatabase, schemaDir: string): MigrationR
     seen.add(m.version);
   }
 
+  // Canonicalize fork-lineage ledger rows BEFORE snapshotting the applied set.
+  // Order matters: the snapshot below is taken once and then consulted in memory,
+  // so a repair performed afterwards would leave the loop reading a stale set and
+  // skipping the very upstream migration the repair just freed up.
+  const relocated = repairForkLedger(db, schemaDir);
+
+  // Any remaining disagreement between a ledger row's name and this build's name
+  // for that version means the version-keyed skip below is about to lie. Refuse
+  // rather than silently apply the wrong schema: a loud failure is recoverable by
+  // reinstalling the previous build, a silent one is not, and the silent variant
+  // is what shipped a broken database to a user.
+  const nameMismatches = findLedgerNameMismatches(db, migrations);
+  if (nameMismatches.length > 0) {
+    const detail = nameMismatches
+      .map((m) => `v${m.version}: ledger has '${m.recorded}', this build expects '${m.expected}'`)
+      .join('; ');
+    throw new Error(
+      `Migration ledger does not match this build (${detail}). ` +
+        `Refusing to migrate: continuing would skip migrations that never ran. ` +
+        `Reinstall the previous version, or file this with the ledger contents.`,
+    );
+  }
+
+  const appliedRows = db
+    .prepare('SELECT version FROM _migrations ORDER BY version ASC')
+    .all() as Array<{ version: number }>;
+  const applied = new Set(appliedRows.map((r) => r.version));
+
+  const result: MigrationResult = {
+    applied: [],
+    skipped: [],
+    relocated,
+    nameMismatches,
+  };
+
   const findAppliedVersion = db.prepare(
-    'SELECT version FROM _migrations WHERE version = ?',
+    'SELECT version, name FROM _migrations WHERE version = ?',
   );
 
   for (const m of migrations) {
@@ -292,7 +522,19 @@ export function runMigrations(db: SqliteDatabase, schemaDir: string): MigrationR
       // Another app process or worker may have initialized the same database
       // after our applied-version snapshot. Re-check while holding the
       // immediate write lock so only one connection can apply this version.
-      if (findAppliedVersion.get(m.version)) {
+      // Compare the name too: a different build racing us could install a
+      // different migration under this number, and treating that as our own
+      // success is how an unapplied migration gets recorded as applied.
+      const existing = findAppliedVersion.get(m.version) as
+        | { version: number; name: string }
+        | undefined;
+      if (existing) {
+        if (existing.name !== m.name) {
+          throw new Error(
+            `Migration ledger v${m.version} was claimed concurrently by '${existing.name}' ` +
+              `but this build expects '${m.name}'.`,
+          );
+        }
         return false;
       }
       if (m.sqlFile) {

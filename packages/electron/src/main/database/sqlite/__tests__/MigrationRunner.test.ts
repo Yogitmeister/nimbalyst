@@ -50,10 +50,34 @@ class FakeDb {
   }
 
   prepare(sql: string) {
+    if (/SELECT version, name FROM _migrations WHERE version/i.test(sql)) {
+      return {
+        get: (version: number) => this.migrations.find((m) => m.version === version),
+      };
+    }
+    if (/SELECT version, name FROM _migrations/i.test(sql)) {
+      return {
+        all: () => this.migrations.map((m) => ({ version: m.version, name: m.name })),
+      };
+    }
     if (/SELECT version FROM _migrations/i.test(sql)) {
       return {
         all: () => this.migrations.map((m) => ({ version: m.version })),
         get: (version: number) => this.migrations.find((m) => m.version === version),
+      };
+    }
+    // Fork-lane ledger relocation reads a row's name by version.
+    if (/SELECT name FROM _migrations WHERE version/i.test(sql)) {
+      return {
+        get: (version: number) => this.migrations.find((m) => m.version === version),
+      };
+    }
+    if (/UPDATE _migrations SET version/i.test(sql)) {
+      return {
+        run: (to: number, from: number, name: string) => {
+          const row = this.migrations.find((m) => m.version === from && m.name === name);
+          if (row) row.version = to;
+        },
       };
     }
     if (/INSERT INTO _migrations/i.test(sql)) {
@@ -249,6 +273,245 @@ describe('runMigrations against the real schema dir', () => {
       );
     } finally {
       await sqlite.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Fork-lineage ledger collision.
+ *
+ * This fork mints migrations on top of upstream's. Before the v0.74.3 fold the
+ * carry `queued_prompt_priority_control` was version 32; upstream then minted
+ * its own 32. Because the runner keys on version alone, an existing database
+ * hit BOTH failure modes: the carry re-ran (hard `duplicate column name` at
+ * startup) and upstream's 32 silently never ran while the ledger claimed it had.
+ *
+ * These tests exist because every gate we had ran against a FRESH database,
+ * where the collision is invisible — upstream folded the same tables into
+ * `0001_initial.sql`, so its migration 32 is a no-op there. The failure only
+ * appears on a database that predates the fold.
+ */
+describe('fork-lane migration numbering', () => {
+  it('keeps upstream versions contiguous and fork versions in the reserved lane', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'migforklane-'));
+    try {
+      const versions = getMigrations(tmpDir).map((m) => m.version);
+      const upstream = versions.filter((v) => v < 1000);
+      const fork = versions.filter((v) => v >= 1000);
+
+      // Upstream's range must stay contiguous from 1. A fork migration minted
+      // inside it is exactly the mistake that shipped a broken build: it looks
+      // fine on a fresh database and corrupts the ledger on an existing one.
+      expect(upstream).toEqual(
+        Array.from({ length: upstream.length }, (_, i) => i + 1),
+      );
+      expect(fork.length).toBeGreaterThan(0);
+      expect([...versions].sort((a, b) => a - b)).toEqual(versions);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('upgrades a pre-fold database without re-running the carry or skipping upstream 32', async () => {
+    const Database = (await import('better-sqlite3')).default;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'migprefold-'));
+    const dbPath = path.join(tmpDir, 'prefold.sqlite');
+    const schemaDir = path.join(__dirname, '..', 'schemas');
+    const db = new Database(dbPath);
+    try {
+      // Build a current database, then rewind its ledger to the pre-fold shape:
+      // the carry recorded as 32, and none of upstream's 32-34 present. The
+      // carry's COLUMNS stay in place — that is what makes the re-run fatal.
+      runMigrations(db, schemaDir);
+      // Undo everything upstream 32-34 created, so the fixture is a faithful
+      // pre-fold database rather than a current one with a doctored ledger.
+      db.exec('DROP TABLE IF EXISTS feedback_request_cache');
+      db.exec('DROP TABLE IF EXISTS feedback_request_index');
+      db.exec('DROP TABLE IF EXISTS feedback_request_index_backfill');
+      db.exec('DROP INDEX IF EXISTS idx_tracker_workspace_local_key');
+      db.exec('ALTER TABLE tracker_items DROP COLUMN local_key');
+      db.exec('DELETE FROM _migrations WHERE version IN (32, 33, 34, 1001)');
+      db.prepare("INSERT INTO _migrations (version, name) VALUES (32, 'queued_prompt_priority_control')").run();
+
+      const before = db.prepare('PRAGMA table_info(queued_prompts)').all() as Array<{ name: string }>;
+      expect(before.map((c) => c.name)).toContain('delivery_class');
+
+      // Without the relocation this throws `duplicate column name: delivery_class`.
+      const result = runMigrations(db, schemaDir);
+
+      // Upstream's 32 is applied inside the SAME transaction as the relocation,
+      // so no concurrently-starting older build can ever observe version 32
+      // absent and re-run its own carry migration into a duplicate-column crash.
+      expect(result.relocated).toEqual([
+        {
+          from: 32,
+          to: 1001,
+          name: 'queued_prompt_priority_control',
+          backfilled: { version: 32, name: 'feedback_request_cache' },
+        },
+      ]);
+      // The silent half of the defect: upstream 32 must really have run.
+      expect(result.applied).not.toContain(32);
+      const ledger = db.prepare('SELECT version, name FROM _migrations WHERE version IN (32, 1001)').all() as Array<{ version: number; name: string }>;
+      expect(ledger).toEqual(
+        expect.arrayContaining([
+          { version: 32, name: 'feedback_request_cache' },
+          { version: 1001, name: 'queued_prompt_priority_control' },
+        ]),
+      );
+      const tables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='feedback_request_cache'")
+        .all();
+      expect(tables).toHaveLength(1);
+
+      // The carry's columns must be untouched, not duplicated.
+      const after = db.prepare('PRAGMA table_info(queued_prompts)').all() as Array<{ name: string }>;
+      expect(after.map((c) => c.name)).toEqual(before.map((c) => c.name));
+
+      // Idempotent: a second run relocates nothing and applies nothing.
+      const second = runMigrations(db, schemaDir);
+      expect(second.relocated).toEqual([]);
+      expect(second.applied).toEqual([]);
+      expect(second.nameMismatches).toEqual([]);
+    } finally {
+      db.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('upgrades a database left by the first broken fold build, which recorded the carry as 35', async () => {
+    const Database = (await import('better-sqlite3')).default;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'migcarry35-'));
+    const dbPath = path.join(tmpDir, 'carry35.sqlite');
+    const schemaDir = path.join(__dirname, '..', 'schemas');
+    const db = new Database(dbPath);
+    try {
+      // The state any database reaches when the first v0.74.3 fold build — which
+      // numbered the carry 35 — migrated successfully. Upstream 32-34 are intact;
+      // only the carry sits at the wrong number.
+      runMigrations(db, schemaDir);
+      db.exec('DELETE FROM _migrations WHERE version = 1001');
+      db.prepare("INSERT INTO _migrations (version, name) VALUES (35, 'queued_prompt_priority_control')").run();
+
+      const before = db.prepare('PRAGMA table_info(queued_prompts)').all() as Array<{ name: string }>;
+
+      // Without the 35 alias this reruns the carry and dies on ADD COLUMN.
+      const result = runMigrations(db, schemaDir);
+
+      expect(result.relocated).toEqual([
+        { from: 35, to: 1001, name: 'queued_prompt_priority_control' },
+      ]);
+      expect(result.applied).toEqual([]);
+      const after = db.prepare('PRAGMA table_info(queued_prompts)').all() as Array<{ name: string }>;
+      expect(after.map((c) => c.name)).toEqual(before.map((c) => c.name));
+      expect(db.prepare('SELECT name FROM _migrations WHERE version = 35').get()).toBeUndefined();
+    } finally {
+      db.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves the ledger alone when the row is not backed by real schema', async () => {
+    const Database = (await import('better-sqlite3')).default;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mignoschema-'));
+    const dbPath = path.join(tmpDir, 'noschema.sqlite');
+    const schemaDir = path.join(__dirname, '..', 'schemas');
+    const db = new Database(dbPath);
+    try {
+      runMigrations(db, schemaDir);
+      // A ledger row claiming the carry ran, on a database whose queued_prompts
+      // never got the columns — reachable through adoption or hand repair.
+      // Canonicalizing on the name alone would record it applied forever and
+      // leave the schema missing: the silent defect, recreated.
+      db.exec('DELETE FROM _migrations WHERE version = 1001');
+      db.exec('DROP INDEX IF EXISTS idx_queued_prompts_control_idempotency');
+      db.exec('DROP INDEX IF EXISTS idx_queued_prompts_priority_pending');
+      for (const col of [
+        'delivery_class', 'priority_rank', 'delivery_ready', 'producer',
+        'idempotency_key', 'request_digest', 'control_operation',
+        'interrupt_target_generation', 'interrupt_reservation_owner', 'interrupt_receipt',
+      ]) {
+        db.exec(`ALTER TABLE queued_prompts DROP COLUMN ${col}`);
+      }
+      db.prepare("INSERT INTO _migrations (version, name) VALUES (35, 'queued_prompt_priority_control')").run();
+
+      // The row is not trusted, so the canonical migration runs for real instead
+      // of being recorded as already-applied.
+      const result = runMigrations(db, schemaDir);
+      expect(result.relocated).toEqual([]);
+      expect(result.applied).toContain(1001);
+      const cols = (db.prepare('PRAGMA table_info(queued_prompts)').all() as Array<{ name: string }>)
+        .map((c) => c.name);
+      expect(cols).toContain('delivery_class');
+    } finally {
+      db.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails loudly rather than recording success when the carry schema is only partly present', async () => {
+    const Database = (await import('better-sqlite3')).default;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'migpartial-'));
+    const dbPath = path.join(tmpDir, 'partial.sqlite');
+    const schemaDir = path.join(__dirname, '..', 'schemas');
+    const db = new Database(dbPath);
+    try {
+      runMigrations(db, schemaDir);
+      db.exec('DELETE FROM _migrations WHERE version = 1001');
+      db.exec('ALTER TABLE queued_prompts DROP COLUMN delivery_class');
+      db.prepare("INSERT INTO _migrations (version, name) VALUES (35, 'queued_prompt_priority_control')").run();
+
+      // A half-applied carry cannot be repaired by rerunning unguarded ADD COLUMN
+      // statements. The important property is that it does not get canonicalized
+      // into "applied" — a loud failure is recoverable by reinstalling the older
+      // build, a ledger that lies about the schema is not.
+      expect(() => runMigrations(db, schemaDir)).toThrow(/duplicate column name/);
+      expect(db.prepare('SELECT name FROM _migrations WHERE version = 1001').get()).toBeUndefined();
+    } finally {
+      db.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to migrate when a ledger name disagrees with this build', async () => {
+    const Database = (await import('better-sqlite3')).default;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'migmismatch-'));
+    const dbPath = path.join(tmpDir, 'mismatch.sqlite');
+    const schemaDir = path.join(__dirname, '..', 'schemas');
+    const db = new Database(dbPath);
+    try {
+      runMigrations(db, schemaDir);
+      // A version recorded under a name this build does not use for it: the
+      // version-keyed skip is about to lie about migration 30 having run.
+      db.prepare("UPDATE _migrations SET name = 'something_else' WHERE version = 30").run();
+
+      // Fail closed. A loud refusal is recoverable by reinstalling the previous
+      // build; a silent wrong schema is not, and that is what shipped.
+      expect(() => runMigrations(db, schemaDir)).toThrow(/does not match this build/);
+    } finally {
+      db.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('still opens a database written by a newer build (downgrade stays possible)', async () => {
+    const Database = (await import('better-sqlite3')).default;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mignewer-'));
+    const dbPath = path.join(tmpDir, 'newer.sqlite');
+    const schemaDir = path.join(__dirname, '..', 'schemas');
+    const db = new Database(dbPath);
+    try {
+      runMigrations(db, schemaDir);
+      // Rows this build has never heard of must be ignored, not rejected —
+      // rolling back to an older build is the recovery path when a release
+      // misbehaves, so an older build has to tolerate a newer ledger.
+      db.prepare("INSERT INTO _migrations (version, name) VALUES (9999, 'from_the_future')").run();
+      const result = runMigrations(db, schemaDir);
+      expect(result.nameMismatches).toEqual([]);
+      expect(result.applied).toEqual([]);
+    } finally {
+      db.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

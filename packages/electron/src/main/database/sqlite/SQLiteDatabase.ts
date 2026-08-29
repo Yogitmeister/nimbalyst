@@ -128,6 +128,22 @@ export class SQLiteDatabase {
       'info',
       `[SQLite] migrations: applied=${migrationResult.applied.join(',') || 'none'}, skipped=${migrationResult.skipped.join(',') || 'none'}`,
     );
+    for (const r of migrationResult.relocated) {
+      this.opts.log?.(
+        'info',
+        `[SQLite] migrations: relocated fork ledger row '${r.name}' from v${r.from} to v${r.to}`,
+      );
+    }
+    // A name mismatch means the version-keyed skip is lying: some migration will
+    // be treated as applied that never ran. Loud by design — the same condition
+    // went unnoticed until it reached a user's machine.
+    for (const m of migrationResult.nameMismatches) {
+      this.opts.log?.(
+        'error',
+        `[SQLite] migrations: ledger v${m.version} records '${m.recorded}' but this build expects ` +
+          `'${m.expected}'. Migration v${m.version} will be SKIPPED without having run.`,
+      );
+    }
 
     this.instrumentation.bind(handle);
 
