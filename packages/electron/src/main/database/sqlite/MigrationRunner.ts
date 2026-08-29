@@ -90,6 +90,13 @@ function hasColumns(db: SqliteDatabase, table: string, required: string[]): bool
   return required.every((c) => present.has(c));
 }
 
+function hasIndexes(db: SqliteDatabase, required: string[]): boolean {
+  const stmt = db.prepare(
+    "SELECT 1 AS ok FROM sqlite_master WHERE type = 'index' AND name = ?",
+  );
+  return required.every((name) => stmt.get(name) !== undefined);
+}
+
 const FORK_LANE_RULES: ReadonlyArray<ForkLaneRule> = [
   {
     canonical: 1001,
@@ -98,6 +105,10 @@ const FORK_LANE_RULES: ReadonlyArray<ForkLaneRule> = [
     // 35: databases built by the first (broken) v0.74.3 fold build, which renumbered
     //     the carry to 35 ג€” inside upstream's range, where it will collide again.
     legacyVersions: [32, 35],
+    // Every object 1001_queued_prompt_priority_control.sql creates: ten columns
+    // AND both indexes. Columns alone are not enough — a database with the
+    // columns but not the indexes would be canonicalized as applied and never
+    // get them, which is the same silent defect in a smaller costume.
     schemaPresent: (db) =>
       hasColumns(db, 'queued_prompts', [
         'delivery_class',
@@ -110,6 +121,10 @@ const FORK_LANE_RULES: ReadonlyArray<ForkLaneRule> = [
         'interrupt_target_generation',
         'interrupt_reservation_owner',
         'interrupt_receipt',
+      ]) &&
+      hasIndexes(db, [
+        'idx_queued_prompts_control_idempotency',
+        'idx_queued_prompts_priority_pending',
       ]),
     upstreamSuccessor: {
       version: 32,
