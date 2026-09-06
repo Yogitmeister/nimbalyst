@@ -183,6 +183,18 @@ export interface EnsureClaudeCliSessionResult {
 const launchInFlight = new Map<string, Promise<EnsureClaudeCliSessionResult>>();
 
 /**
+ * True while a `claude` CLI PTY launch is committed but has not yet
+ * registered with `TerminalSessionManager`. Native-owner census cannot see
+ * this window (there is no terminal or in-process provider yet), so
+ * cancellation logic must treat it the same as any other admitted-but-not-
+ * yet-visible turn rather than proving the session has zero owners. See
+ * NIM-590 batch item 2.
+ */
+export function isClaudeCliLaunchInFlight(sessionId: string): boolean {
+  return launchInFlight.has(sessionId);
+}
+
+/**
  * Dedicated hookless file watcher for the CLI path. The SDK path runs its own
  * instance from AIService during the streaming loop the CLI bypasses; sessions
  * are provider-exclusive, so a separate instance keyed by sessionId is safe and

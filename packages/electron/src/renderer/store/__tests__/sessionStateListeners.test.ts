@@ -16,6 +16,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { store } from '@nimbalyst/runtime/store';
 import {
+  sessionCancelIncompleteAtom,
   sessionHasPendingInteractivePromptAtom,
   sessionProcessingAtom,
   sessionPendingPromptsAtom,
@@ -964,5 +965,56 @@ describe('processing reconcile on terminal events', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('session cancellation renderer wiring (NIM-590 batch item 6)', () => {
+  it('surfaces an incomplete cancellation for the exact session with the default retry message', () => {
+    const sessionId = uniqueSessionId('cancel-incomplete');
+
+    handlers.get('ai:sessionCancelIncomplete')!({ sessionId });
+
+    expect(store.get(sessionCancelIncompleteAtom(sessionId))).toEqual({
+      error: 'The desktop could not prove every agent process stopped. Retry cancellation before sending another prompt.',
+      retryRequired: true,
+    });
+  });
+
+  it('preserves the server-supplied error and an explicit retryRequired:false', () => {
+    const sessionId = uniqueSessionId('cancel-incomplete-explicit');
+
+    handlers.get('ai:sessionCancelIncomplete')!({
+      sessionId,
+      error: 'native provider unreachable',
+      retryRequired: false,
+    });
+
+    expect(store.get(sessionCancelIncompleteAtom(sessionId))).toEqual({
+      error: 'native provider unreachable',
+      retryRequired: false,
+    });
+  });
+
+  it('ignores an incomplete-cancellation broadcast with no sessionId instead of throwing', () => {
+    expect(() => handlers.get('ai:sessionCancelIncomplete')!({})).not.toThrow();
+  });
+
+  it('a completed cancellation clears a prior incomplete-cancellation flag for that session', () => {
+    const sessionId = uniqueSessionId('cancel-then-cleared');
+    handlers.get('ai:sessionCancelIncomplete')!({ sessionId, error: 'still live', retryRequired: true });
+    expect(store.get(sessionCancelIncompleteAtom(sessionId))).not.toBeNull();
+
+    handlers.get('ai:sessionCancelled')!({ sessionId });
+
+    expect(store.get(sessionCancelIncompleteAtom(sessionId))).toBeNull();
+  });
+
+  it('does not leak an incomplete-cancellation flag onto an unrelated session', () => {
+    const flagged = uniqueSessionId('cancel-incomplete-isolated');
+    const other = uniqueSessionId('cancel-incomplete-bystander');
+
+    handlers.get('ai:sessionCancelIncomplete')!({ sessionId: flagged, error: 'x', retryRequired: true });
+
+    expect(store.get(sessionCancelIncompleteAtom(other))).toBeNull();
   });
 });

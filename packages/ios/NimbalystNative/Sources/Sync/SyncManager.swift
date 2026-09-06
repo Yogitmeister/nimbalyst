@@ -2,6 +2,14 @@ import Foundation
 import Combine
 import os
 
+public struct SessionCancellationResult: Equatable {
+    public let sessionId: String
+    public let success: Bool
+    public let quarantined: Bool
+    public let error: String?
+    public let timestamp: Int
+}
+
 /// Manages synchronization between the native app and the desktop via WebSocket.
 /// Handles index room sync (projects + sessions) and session room sync (messages).
 ///
@@ -29,6 +37,14 @@ public final class SyncManager: ObservableObject {
 
     /// The session ID currently connected to the session room, if any.
     @Published public var activeSessionId: String?
+
+    /// Latest desktop acknowledgement for a mobile cancellation request, keyed
+    /// by session ID. A quarantined result is intentionally visible so the UI
+    /// never presents an incomplete native cancellation as successful. Keyed
+    /// per session (rather than one global slot) so a later broadcast for a
+    /// DIFFERENT session can never overwrite -- and silently lose -- this
+    /// session's own outcome. See NIM-590 batch item 7.
+    @Published public private(set) var cancellationResultsBySession: [String: SessionCancellationResult] = [:]
 
     /// Available AI models synced from the desktop, for the model picker.
     @Published public var availableModels: [SyncedAvailableModel] = []
@@ -327,11 +343,32 @@ public final class SyncManager: ObservableObject {
             break
         case "voiceToolResponseBroadcast":
             handleVoiceToolResponse(data)
+        case "sessionControlBroadcast":
+            handleSessionControlBroadcast(data)
         case "error":
             handleServerError(data)
         default:
             logger.info("Unhandled message type: \(envelope.type)")
         }
+    }
+
+    private func handleSessionControlBroadcast(_ data: Data) {
+        guard let broadcast = try? decoder.decode(SessionControlBroadcast.self, from: data),
+              broadcast.message.messageType == "cancel_result",
+              broadcast.message.sentBy == "desktop" else {
+            return
+        }
+        let payload = broadcast.message.payload
+        let success = payload?["success"]?.value as? Bool ?? false
+        let quarantined = payload?["quarantined"]?.value as? Bool ?? !success
+        let error = payload?["error"]?.value as? String
+        cancellationResultsBySession[broadcast.message.sessionId] = SessionCancellationResult(
+            sessionId: broadcast.message.sessionId,
+            success: success,
+            quarantined: quarantined,
+            error: error,
+            timestamp: broadcast.message.timestamp
+        )
     }
 
     // MARK: - Index Sync Response

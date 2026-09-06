@@ -19,6 +19,7 @@
 
 import { ipcMain } from 'electron';
 import {
+  AI_PROVIDER_TYPES,
   ProviderFactory,
   type AIProvider,
   type AIProviderType,
@@ -30,28 +31,73 @@ import { logger } from '../../utils/logger';
 const log = logger.ai;
 
 export interface ResolvedSessionProvider {
-  providerType: AIProviderType;
+  candidateCount: number;
+  status: 'resolved' | 'unknown';
+  providerType: AIProviderType | null;
   provider: AIProvider | null;
+  error?: string;
+}
+
+function listExistingSessionProviders(
+  sessionId: string,
+): Array<{ providerType: AIProviderType; provider: AIProvider }> {
+  const found: Array<{ providerType: AIProviderType; provider: AIProvider }> = [];
+  for (const providerType of AI_PROVIDER_TYPES) {
+    const provider = ProviderFactory.getProvider(providerType, sessionId);
+    if (provider) found.push({ providerType, provider });
+  }
+  return found;
 }
 
 /**
  * Resolve a session's real provider once. Replaces the hardcoded
  * `getProvider('claude-code', …)` copies scattered across the mobile handlers.
- * Falls back to `claude-code` only when the session row can't be read.
+ * Repository failure never guesses a provider type. It may recover one exact
+ * existing in-process owner from ProviderFactory; zero or multiple candidates
+ * remain explicitly unknown for the cancellation caller to quarantine.
  */
 export async function resolveSessionProvider(
   sessionId: string,
 ): Promise<ResolvedSessionProvider> {
-  let providerType: AIProviderType = 'claude-code';
   try {
     const session = await AISessionsRepository.get(sessionId);
-    providerType = (session?.provider as AIProviderType) ?? providerType;
+    if (session?.provider) {
+      const providerType = session.provider as AIProviderType;
+      const provider = ProviderFactory.getProvider(providerType, sessionId);
+      if (provider || providerType === 'claude-code-cli') {
+        return { candidateCount: provider ? 1 : 0, status: 'resolved', providerType, provider };
+      }
+      const candidates = listExistingSessionProviders(sessionId);
+      if (candidates.length === 0) {
+        return { candidateCount: 0, status: 'resolved', providerType, provider: null };
+      }
+      return {
+        status: 'unknown',
+        candidateCount: candidates.length,
+        providerType: null,
+        provider: null,
+        error: `session provider ${providerType} disagrees with ${candidates.length} live provider candidate(s)`,
+      };
+    }
   } catch (err) {
-    log.warn(`[Mobile] provider resolution failed for ${sessionId}: ${err}`);
+    const candidates = listExistingSessionProviders(sessionId);
+    if (candidates.length === 1) {
+      return { candidateCount: 1, status: 'resolved', ...candidates[0] };
+    }
+    const error = `provider repository lookup failed: ${err}; live candidates=${candidates.length}`;
+    log.warn(`[Mobile] provider resolution failed for ${sessionId}: ${error}`);
+    return { candidateCount: candidates.length, status: 'unknown', providerType: null, provider: null, error };
+  }
+  const candidates = listExistingSessionProviders(sessionId);
+  if (candidates.length === 1) {
+    return { candidateCount: 1, status: 'resolved', ...candidates[0] };
   }
   return {
-    providerType,
-    provider: ProviderFactory.getProvider(providerType, sessionId),
+    status: 'unknown',
+    candidateCount: candidates.length,
+    providerType: null,
+    provider: null,
+    error: `session row missing; live provider candidates=${candidates.length}`,
   };
 }
 
@@ -111,7 +157,8 @@ export async function deliverMobilePromptResponse(
   // could make this response look like it belongs to a later prompt that
   // reuses the same raw provider id.
   const receivedAt = new Date();
-  const { providerType, provider } = await resolveSessionProvider(sessionId);
+  const resolution = await resolveSessionProvider(sessionId);
+  const { providerType, provider } = resolution;
 
   // Stage 1 — durable DB record. Persist before waking any consumer so a
   // resumed provider/waiter cannot register a later same-id prompt before this
@@ -121,7 +168,7 @@ export async function deliverMobilePromptResponse(
     try {
       await AgentMessagesRepository.create({
         sessionId,
-        source: providerType,
+        source: providerType ?? 'nimbalyst',
         direction: 'output',
         createdAt: receivedAt,
         content: JSON.stringify(descriptor.dbRecord),
@@ -133,7 +180,7 @@ export async function deliverMobilePromptResponse(
 
   // Stage 2 — in-process provider (guarded; never gates the rest).
   let providerConsumed = false;
-  if (descriptor.deliverToProvider) {
+  if (descriptor.deliverToProvider && resolution.status === 'resolved' && providerType) {
     try {
       providerConsumed = descriptor.deliverToProvider(provider, providerType);
     } catch (err) {

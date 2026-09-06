@@ -120,6 +120,36 @@ describe('claudeCliLauncherSingleton', () => {
     ]);
   }, 20000);
 
+  it('exposes launch-in-flight visibility for census while the launch is gated (NIM-590 batch item 2)', async () => {
+    // A PTY launch commits before any provider/session-owner registry can see
+    // it. isClaudeCliLaunchInFlight is the only signal hasUncensusableAdmission
+    // has for this rail -- a concurrent cancellation whose native census scans
+    // built-in providers/extensions/terminals (none of which know about a CLI
+    // launch still in flight) must not read that as proof the session is idle.
+    const h = await loadHarness();
+    let releaseLaunch: (() => void) | undefined;
+    h.launch.mockImplementationOnce(
+      () => new Promise<void>((resolve) => {
+        releaseLaunch = resolve;
+      }),
+    );
+
+    const sessionId = 'session-census';
+    expect(h.isClaudeCliLaunchInFlight(sessionId)).toBe(false);
+
+    const ensure = h.ensureClaudeCliSession({ sessionId, workspacePath: '/work' });
+    for (let i = 0; i < 20 && h.launch.mock.calls.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    expect(h.isClaudeCliLaunchInFlight(sessionId)).toBe(true);
+    // A different session must never see this one's in-flight launch.
+    expect(h.isClaudeCliLaunchInFlight('session-unrelated')).toBe(false);
+
+    releaseLaunch?.();
+    await ensure;
+    expect(h.isClaudeCliLaunchInFlight(sessionId)).toBe(false);
+  }, 20000);
+
   it('ends session state when the launched CLI terminal exits', async () => {
     const h = await loadHarness();
     let onExit: ((exitCode: number) => void) | undefined;

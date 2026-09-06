@@ -149,6 +149,35 @@ export class ProviderFactory {
   }
 
   /**
+   * Enumerate every cached extension-agent provider instance for a session,
+   * read directly from the live cache rather than the current
+   * AgentProviderRegistry catalog. A provider created while its contribution
+   * was registered can outlive that registry entry (extension disabled or
+   * uninstalled mid-turn); a catalog walk would silently miss it, so native-
+   * owner census must use this ground truth instead of `getExtensionAgentProvider`
+   * per known contribution.
+   */
+  static listExtensionAgentProvidersForSession(
+    sessionId: string,
+  ): Array<{ extensionId: string; contributionId: string; provider: ExtensionAgentProvider }> {
+    const suffix = `-${sessionId}`;
+    const result: Array<{ extensionId: string; contributionId: string; provider: ExtensionAgentProvider }> = [];
+    for (const [key, provider] of this.providers.entries()) {
+      if (!key.startsWith('extension-agent:') || !key.endsWith(suffix)) continue;
+      if (this.providerOwners.get(key) !== sessionId) continue;
+      const withoutPrefix = key.slice('extension-agent:'.length, key.length - suffix.length);
+      const separatorIndex = withoutPrefix.indexOf('/');
+      if (separatorIndex === -1) continue;
+      result.push({
+        extensionId: withoutPrefix.slice(0, separatorIndex),
+        contributionId: withoutPrefix.slice(separatorIndex + 1),
+        provider: provider as ExtensionAgentProvider,
+      });
+    }
+    return result;
+  }
+
+  /**
    * Clean up a provider instance
    */
   static destroyProvider(sessionId: string, type?: AIProviderType): void {

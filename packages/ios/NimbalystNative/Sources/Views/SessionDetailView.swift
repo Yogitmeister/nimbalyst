@@ -97,6 +97,8 @@ public struct SessionDetailView: View {
     @State private var sendError: String?
     /// Warning shown when prompt was sent but desktop hasn't picked it up.
     @State private var deliveryWarning: String?
+    /// Desktop acknowledgement when native cancellation could not be proven.
+    @State private var cancellationError: String?
     /// Timer that fires if desktop doesn't start executing after a prompt send.
     @State private var deliveryTimeoutItem: DispatchWorkItem?
     /// Monotonic acknowledgement for the active mobile submission.
@@ -394,6 +396,32 @@ public struct SessionDetailView: View {
             Button("OK") { deliveryWarning = nil }
         } message: {
             Text(deliveryWarning ?? "")
+        }
+        .alert("Cancellation Incomplete", isPresented: Binding(
+            get: { cancellationError != nil },
+            set: { if !$0 { cancellationError = nil } }
+        )) {
+            Button("OK") { cancellationError = nil }
+        } message: {
+            Text(cancellationError ?? "")
+        }
+        .onAppear {
+            // Keyed by this session's own ID -- a different session's later
+            // cancellation broadcast can never overwrite or hide this one's
+            // outcome. See NIM-590 batch item 7.
+            guard let result = appState.syncManager?.cancellationResultsBySession[session.id],
+                  !result.success || result.quarantined else { return }
+            cancellationError = result.error
+                ?? "The desktop could not prove that every agent process stopped. Retry cancellation before sending another prompt."
+        }
+        .onChange(of: appState.syncManager?.cancellationResultsBySession[session.id]) { _, result in
+            guard let result else { return }
+            if !result.success || result.quarantined {
+                cancellationError = result.error
+                    ?? "The desktop could not prove that every agent process stopped. Retry cancellation before sending another prompt."
+            } else {
+                cancellationError = nil
+            }
         }
         .onChange(of: liveSession?.isExecuting) { _, isExec in
             reduceDeliveryAcknowledgement(.observedExecution(isExec == true))

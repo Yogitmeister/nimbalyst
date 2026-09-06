@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => {
   const provider = {
+    abort: vi.fn(),
     resolveAskUserQuestion: vi.fn(() => true),
     rejectAskUserQuestion: vi.fn(),
     resolveExitPlanModeConfirmation: vi.fn(),
@@ -18,6 +19,9 @@ const mocks = vi.hoisted(() => {
     onPromptResolved: vi.fn(),
     getDatabase: vi.fn(() => null),
     createWorktreeStore: vi.fn(),
+    terminalIsActive: vi.fn(),
+    terminalWrite: vi.fn(),
+    sendSessionControlMessage: vi.fn(),
   };
 });
 
@@ -32,8 +36,24 @@ vi.mock('electron', () => ({
 }));
 
 vi.mock('@nimbalyst/runtime/ai/server', () => ({
+  AI_PROVIDER_TYPES: [
+    'claude',
+    'claude-code',
+    'claude-code-cli',
+    'openai',
+    'openai-codex',
+    'openai-codex-acp',
+    'lmstudio',
+    'opencode',
+    'copilot-cli',
+  ],
   ProviderFactory: {
     getProvider: mocks.getProvider,
+    // No test in this file exercises extension-agent owners; native census
+    // (nativeSessionOwnerCensus.ts) calls this unconditionally, so it must
+    // exist on the mock or every cancellation census here would fail closed
+    // to 'unknown' via a thrown "not a function". See NIM-590 batch item 5.
+    listExtensionAgentProvidersForSession: () => [],
   },
   isAskUserQuestionProvider: (candidate: unknown) =>
     !!candidate &&
@@ -99,15 +119,29 @@ vi.mock('../../WorktreeStore', () => ({
   createWorktreeStore: mocks.createWorktreeStore,
 }));
 
-import { resolveGitCommitWorkspacePath, resolveVoicePromptResponse } from '../MobileSessionControlHandler';
+vi.mock('../../TerminalSessionManager', () => ({
+  getTerminalSessionManager: () => ({
+    isTerminalActive: mocks.terminalIsActive,
+    writeToTerminal: mocks.terminalWrite,
+  }),
+}));
+
+import {
+  initMobileSessionControlHandler,
+  resolveGitCommitWorkspacePath,
+  resolveVoicePromptResponse,
+} from '../MobileSessionControlHandler';
 
 describe('MobileSessionControlHandler', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.provider.abort.mockReset();
     mocks.provider.resolveAskUserQuestion.mockReturnValue(true);
     mocks.ipcListenerCount.mockReturnValue(0);
     mocks.getSession.mockResolvedValue({ provider: 'openai-codex' });
     mocks.createMessage.mockResolvedValue(undefined);
+    mocks.terminalIsActive.mockReturnValue(false);
+    mocks.sendSessionControlMessage.mockResolvedValue(undefined);
     mocks.getProvider.mockImplementation((providerType: string, sessionId: string) =>
       providerType === 'openai-codex' && sessionId === 'session-1' ? mocks.provider : null,
     );
@@ -133,6 +167,269 @@ describe('MobileSessionControlHandler', () => {
       workspacePath: 'D:/project',
       worktreePath: 'D:/project_worktrees/task',
     })).toBeNull();
+  });
+
+  it('routes mobile cancel cleanup before abort and keeps the rolled-back count contract', async () => {
+    let deliver!: (message: { type: string; sessionId: string; payload: unknown }) => void;
+    const onSessionControlMessage = vi.fn((listener: (message: any) => void) => {
+      deliver = listener;
+      return vi.fn();
+    });
+    const cancelQueuedPromptTurn = vi.fn(async (
+      _sessionId: string,
+      cancelNativeTurn: (target: { generation: string; isCurrent(): boolean }) => Promise<any>,
+    ) => {
+      const nativeOutcome = await cancelNativeTurn({ generation: 'cancel-1', isCurrent: () => true });
+      return { nativeOutcome, quarantined: false, rolledBack: 3, lifecycleSettled: true };
+    });
+    initMobileSessionControlHandler(
+      { onSessionControlMessage, sendSessionControlMessage: mocks.sendSessionControlMessage } as any,
+      () => null,
+      {
+        cancelQueuedPromptTurn,
+        triggerQueuedPromptProcessing: vi.fn(async () => false),
+      },
+    );
+
+    deliver({ type: 'cancel', sessionId: 'session-1', payload: {} });
+    await vi.waitFor(() => expect(mocks.provider.abort).toHaveBeenCalledTimes(1));
+
+    expect(cancelQueuedPromptTurn).toHaveBeenCalledWith('session-1', expect.any(Function));
+    expect(cancelQueuedPromptTurn.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.getProvider.mock.invocationCallOrder[0]);
+    await expect(cancelQueuedPromptTurn.mock.results[0].value).resolves.toMatchObject({
+      rolledBack: 3,
+      nativeOutcome: { state: 'native-entered', method: 'built-in:openai-codex:abort' },
+    });
+    await vi.waitFor(() => expect(mocks.sendSessionControlMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: 'session-1',
+        type: 'cancel_result',
+        payload: expect.objectContaining({ success: true, quarantined: false }),
+        sentBy: 'desktop',
+      }),
+    ));
+  });
+
+  it('surfaces incomplete mobile cancellation as a retry-required result', async () => {
+    let deliver!: (message: { type: string; sessionId: string; payload: unknown }) => void;
+    const onSessionControlMessage = vi.fn((listener: (message: any) => void) => {
+      deliver = listener;
+      return vi.fn();
+    });
+    const cancelQueuedPromptTurn = vi.fn(async () => ({
+      nativeOutcome: { state: 'unknown' as const, error: 'owner did not acknowledge abort' },
+      quarantined: true,
+      rolledBack: 0,
+      lifecycleSettled: false,
+    }));
+    initMobileSessionControlHandler(
+      { onSessionControlMessage, sendSessionControlMessage: mocks.sendSessionControlMessage } as any,
+      () => null,
+      {
+        cancelQueuedPromptTurn,
+        triggerQueuedPromptProcessing: vi.fn(async () => false),
+      },
+    );
+
+    deliver({ type: 'cancel', sessionId: 'session-1', payload: {} });
+
+    await vi.waitFor(() => expect(mocks.sendSessionControlMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: 'session-1',
+        type: 'cancel_result',
+        payload: expect.objectContaining({
+          success: false,
+          quarantined: true,
+          retryRequired: true,
+          error: 'owner did not acknowledge abort',
+        }),
+        sentBy: 'desktop',
+      }),
+    ));
+  });
+
+  it('reports callback failure as quarantined instead of silently dropping mobile truth', async () => {
+    let deliver!: (message: { type: string; sessionId: string; payload: unknown }) => void;
+    const onSessionControlMessage = vi.fn((listener: (message: any) => void) => {
+      deliver = listener;
+      return vi.fn();
+    });
+    const cancelQueuedPromptTurn = vi.fn(async () => {
+      throw new Error('cancellation owner failed');
+    });
+    initMobileSessionControlHandler(
+      { onSessionControlMessage, sendSessionControlMessage: mocks.sendSessionControlMessage } as any,
+      () => null,
+      {
+        cancelQueuedPromptTurn,
+        triggerQueuedPromptProcessing: vi.fn(async () => false),
+      },
+    );
+
+    deliver({ type: 'cancel', sessionId: 'session-1', payload: {} });
+
+    await vi.waitFor(() => expect(mocks.sendSessionControlMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: 'session-1',
+        type: 'cancel_result',
+        payload: expect.objectContaining({
+          success: false,
+          quarantined: true,
+          retryRequired: true,
+          error: 'cancellation owner failed',
+        }),
+        sentBy: 'desktop',
+      }),
+    ));
+  });
+
+  it('runs mobile cancel cleanup even when no provider remains', async () => {
+    let deliver!: (message: { type: string; sessionId: string; payload: unknown }) => void;
+    const onSessionControlMessage = vi.fn((listener: (message: any) => void) => {
+      deliver = listener;
+      return vi.fn();
+    });
+    const cancelQueuedPromptTurn = vi.fn(async (
+      _sessionId: string,
+      cancelNativeTurn: (target: { generation: string; isCurrent(): boolean }) => Promise<any>,
+    ) => {
+      const nativeOutcome = await cancelNativeTurn({ generation: 'cancel-1', isCurrent: () => true });
+      return { nativeOutcome, quarantined: false, rolledBack: 0, lifecycleSettled: true };
+    });
+    mocks.getProvider.mockReturnValue(null);
+    initMobileSessionControlHandler(
+      { onSessionControlMessage } as any,
+      () => null,
+      {
+        cancelQueuedPromptTurn,
+        triggerQueuedPromptProcessing: vi.fn(async () => false),
+      },
+    );
+
+    deliver({ type: 'cancel', sessionId: 'session-1', payload: {} });
+    await vi.waitFor(() => expect(cancelQueuedPromptTurn).toHaveBeenCalledWith('session-1', expect.any(Function)));
+    await vi.waitFor(() => expect(mocks.getProvider).toHaveBeenCalledWith('openai-codex', 'session-1'));
+    expect(mocks.provider.abort).not.toHaveBeenCalled();
+  });
+
+  it('keeps CLI provider resolution and Ctrl-C inside the mobile cancellation owner', async () => {
+    let deliver!: (message: { type: string; sessionId: string; payload: unknown }) => void;
+    const onSessionControlMessage = vi.fn((listener: (message: any) => void) => {
+      deliver = listener;
+      return vi.fn();
+    });
+    const cancelQueuedPromptTurn = vi.fn(async (
+      _sessionId: string,
+      cancelNativeTurn: (target: { generation: string; isCurrent(): boolean }) => Promise<any>,
+    ) => {
+      const nativeOutcome = await cancelNativeTurn({ generation: 'cancel-1', isCurrent: () => true });
+      return { nativeOutcome, quarantined: false, rolledBack: 1, lifecycleSettled: true };
+    });
+    mocks.getSession.mockResolvedValue({ provider: 'claude-code-cli' });
+    mocks.getProvider.mockReturnValue(null);
+    mocks.terminalIsActive.mockReturnValue(true);
+    initMobileSessionControlHandler(
+      { onSessionControlMessage } as any,
+      () => null,
+      {
+        cancelQueuedPromptTurn,
+        triggerQueuedPromptProcessing: vi.fn(async () => false),
+      },
+    );
+
+    deliver({ type: 'cancel', sessionId: 'session-1', payload: {} });
+    await vi.waitFor(() => expect(mocks.terminalWrite).toHaveBeenCalledWith('session-1', '\x03'));
+
+    expect(cancelQueuedPromptTurn).toHaveBeenCalledWith('session-1', expect.any(Function));
+    expect(mocks.provider.abort).not.toHaveBeenCalled();
+  });
+
+  it('does not let a CLI repository row hide another live built-in provider', async () => {
+    let deliver!: (message: { type: string; sessionId: string; payload: unknown }) => void;
+    const onSessionControlMessage = vi.fn((listener: (message: any) => void) => {
+      deliver = listener;
+      return vi.fn();
+    });
+    const cancelQueuedPromptTurn = vi.fn(async (
+      _sessionId: string,
+      cancelNativeTurn: (target: { generation: string; isCurrent(): boolean }) => Promise<any>,
+    ) => {
+      const nativeOutcome = await cancelNativeTurn({ generation: 'cancel-1', isCurrent: () => true });
+      return {
+        nativeOutcome,
+        quarantined: nativeOutcome.state === 'unknown',
+        rolledBack: 0,
+        lifecycleSettled: nativeOutcome.state !== 'unknown',
+      };
+    });
+    mocks.getSession.mockResolvedValue({ provider: 'claude-code-cli' });
+    mocks.getProvider.mockImplementation((providerType: string, sessionId: string) =>
+      providerType === 'opencode' && sessionId === 'session-1' ? mocks.provider : null,
+    );
+    initMobileSessionControlHandler(
+      { onSessionControlMessage } as any,
+      () => null,
+      {
+        cancelQueuedPromptTurn,
+        triggerQueuedPromptProcessing: vi.fn(async () => false),
+      },
+    );
+
+    deliver({ type: 'cancel', sessionId: 'session-1', payload: {} });
+    await vi.waitFor(() => expect(mocks.provider.abort).toHaveBeenCalledTimes(1));
+
+    expect(mocks.getProvider).toHaveBeenCalledWith('opencode', 'session-1');
+    await expect(cancelQueuedPromptTurn.mock.results[0].value).resolves.toMatchObject({
+      nativeOutcome: { state: 'native-entered', method: 'built-in:opencode:abort' },
+    });
+  });
+
+  it('cancels every live built-in owner instead of choosing one from an ambiguous row', async () => {
+    let deliver!: (message: { type: string; sessionId: string; payload: unknown }) => void;
+    const onSessionControlMessage = vi.fn((listener: (message: any) => void) => {
+      deliver = listener;
+      return vi.fn();
+    });
+    const secondProvider = { abort: vi.fn() };
+    const cancelQueuedPromptTurn = vi.fn(async (
+      _sessionId: string,
+      cancelNativeTurn: (target: { generation: string; isCurrent(): boolean }) => Promise<any>,
+    ) => {
+      const nativeOutcome = await cancelNativeTurn({ generation: 'cancel-1', isCurrent: () => true });
+      return {
+        nativeOutcome,
+        quarantined: nativeOutcome.state === 'unknown',
+        rolledBack: 0,
+        lifecycleSettled: nativeOutcome.state !== 'unknown',
+      };
+    });
+    mocks.getSession.mockRejectedValue(new Error('repository unavailable'));
+    mocks.getProvider.mockImplementation((providerType: string, sessionId: string) => {
+      if (sessionId !== 'session-1') return null;
+      if (providerType === 'opencode') return mocks.provider;
+      if (providerType === 'openai-codex') return secondProvider;
+      return null;
+    });
+    initMobileSessionControlHandler(
+      { onSessionControlMessage } as any,
+      () => null,
+      {
+        cancelQueuedPromptTurn,
+        triggerQueuedPromptProcessing: vi.fn(async () => false),
+      },
+    );
+
+    deliver({ type: 'cancel', sessionId: 'session-1', payload: {} });
+    await vi.waitFor(() => expect(cancelQueuedPromptTurn).toHaveBeenCalledTimes(1));
+
+    await expect(cancelQueuedPromptTurn.mock.results[0].value).resolves.toMatchObject({
+      quarantined: false,
+      nativeOutcome: { state: 'native-entered' },
+    });
+    expect(mocks.provider.abort).toHaveBeenCalledTimes(1);
+    expect(secondProvider.abort).toHaveBeenCalledTimes(1);
+    expect(mocks.terminalWrite).not.toHaveBeenCalled();
   });
 
   it('uses the session provider and always persists the mobile response', async () => {
