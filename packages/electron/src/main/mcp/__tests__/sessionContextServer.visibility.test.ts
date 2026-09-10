@@ -1,6 +1,7 @@
 // [ASTRA-ORCH]
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import path from 'path';
+import * as workspaceDetection from '../../utils/workspaceDetection';
 
 // session_get_visibility / session_set_visibility (NIM-366): the smallest
 // real slice of "agent session visibility controls" — an MCP-exposed
@@ -40,6 +41,7 @@ function sessionIn(workspacePath: string, overrides: Record<string, unknown> = {
 }
 
 beforeEach(() => {
+  vi.restoreAllMocks();
   getMock.mockReset();
   updateMetadataMock.mockReset();
 });
@@ -181,4 +183,49 @@ describe('session_set_visibility', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('pinned is required');
   });
+});
+
+describe('visibility project path binding', () => {
+  it.each(['session_get_visibility', 'session_set_visibility'])(
+    '%s resolves the stored worktree path with the same rule as the requested path',
+    async (tool) => {
+      const stored = '/worktrees/owned-session';
+      const foreign = '/worktrees/foreign-session';
+      vi.spyOn(workspaceDetection, 'resolveProjectPath').mockImplementation((value) =>
+        value === stored ? OWN_WS : value === foreign ? FOREIGN_WS : path.normalize(value),
+      );
+      getMock.mockResolvedValue(sessionIn(stored));
+      const args = { sessionId: 'target-1', pinned: true, targetWorkspacePath: stored };
+      const result = await dispatchSessionContextTool(tool, args, 'caller-1', OWN_WS);
+      expect(result.isError).toBe(false);
+      if (tool === 'session_set_visibility') {
+        expect(updateMetadataMock).toHaveBeenCalledWith('target-1', { isPinned: true });
+      }
+
+      updateMetadataMock.mockClear();
+      getMock.mockResolvedValue(sessionIn(foreign));
+      const rejected = await dispatchSessionContextTool(tool, args, 'caller-1', OWN_WS);
+      expect(rejected.isError).toBe(true);
+      expect(rejected.content[0].text).toContain('not found');
+      expect(updateMetadataMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('normalizes a persisted equivalent path without changing the stored session', async () => {
+    const stored = OWN_WS + path.sep + 'child' + path.sep + '..';
+    const session = sessionIn(stored);
+    getMock.mockResolvedValue(session);
+    const result = await dispatchSessionContextTool('session_get_visibility', {}, 'target-1', OWN_WS);
+    expect(result.isError).toBe(false);
+    expect(session.workspacePath).toBe(stored);
+    expect(updateMetadataMock).not.toHaveBeenCalled();
+  });
+});
+
+
+it.each(['session_get_visibility', 'session_set_visibility'])('%s rejects a session without a workspace', async (tool) => {
+  getMock.mockResolvedValue(sessionIn(OWN_WS, { workspacePath: undefined }));
+  const result = await dispatchSessionContextTool(tool, { sessionId: 'target-1', pinned: true }, 'caller-1', OWN_WS);
+  expect(result.isError).toBe(true);
+  expect(updateMetadataMock).not.toHaveBeenCalled();
 });

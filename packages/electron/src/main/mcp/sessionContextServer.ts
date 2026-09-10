@@ -675,8 +675,9 @@ async function handleGetSessionVisibility(
 
   const session = await AISessionsRepository.get(sessionId);
   // Workspace binding: a session belonging to another workspace is reported as
-  // not-found rather than leaked, matching get_session_summary.
-  if (!session || session.workspacePath !== workspaceId) {
+  // not-found rather than leaked. Resolve the stored path too: sessions retain
+  // their worktree path while the requested binding names the parent project.
+  if (!session?.workspacePath || resolveTargetWorkspaceBinding(session.workspacePath) !== workspaceId) {
     return `Error: Session ${sessionId} not found`;
   }
 
@@ -702,7 +703,7 @@ async function handleSetSessionVisibility(
   // This authorization boundary mirrors update_session_board and must never be
   // weakened to make the tool easier to call.
   const target = await AISessionsRepository.get(sessionId);
-  if (!target || target.workspacePath !== workspaceId) {
+  if (!target?.workspacePath || resolveTargetWorkspaceBinding(target.workspacePath) !== workspaceId) {
     return `Error: Session ${sessionId} not found`;
   }
 
