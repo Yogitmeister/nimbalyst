@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Mirrors the mock surface of MetaAgentService.providerInheritance.test.ts so we
@@ -24,6 +25,9 @@ vi.mock('@nimbalyst/runtime/ai/server', () => ({
   SessionManager: class {
     async initialize() {}
   },
+  // Reached transitively through ClaudeCodeTurnLifecycle / ClaudeCodeSessionRoute. This suite
+  // covers parent agent_role promotion, not catalog routing, so the non-catalog answer is right.
+  isCatalogPersistedModelId: vi.fn(() => false),
 }));
 
 vi.mock('@nimbalyst/runtime/ai/server/types', () => ({
