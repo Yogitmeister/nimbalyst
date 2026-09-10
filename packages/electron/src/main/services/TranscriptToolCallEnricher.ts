@@ -1,5 +1,6 @@
+// [ASTRA-ORCH]
 import type { TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/transcript';
-import { toolCallMatcher } from './ToolCallMatcher';
+import { isToolCallMatcherCancelled, toolCallMatcher } from './ToolCallMatcher';
 
 const DIRECT_DIFF_TOOL_NAMES = new Set(['file_change']);
 
@@ -7,6 +8,10 @@ interface ToolCallMessageRef {
   message: TranscriptViewMessage;
   toolCallItemId: string;
   toolCallTimestamp?: number;
+}
+
+export interface TranscriptToolCallEnricherOptions {
+  signal?: AbortSignal;
 }
 
 function cloneTranscriptMessages(
@@ -57,42 +62,48 @@ function refKey(toolCallItemId: string, toolCallTimestamp?: number): string {
 export async function enrichTranscriptMessagesWithToolCallDiffs(
   sessionId: string,
   messages: TranscriptViewMessage[],
+  options: TranscriptToolCallEnricherOptions = {},
 ): Promise<TranscriptViewMessage[]> {
-  if (messages.length === 0) return messages;
-
   const clonedRefs: ToolCallMessageRef[] = [];
   const clonedMessages = cloneTranscriptMessages(messages, clonedRefs);
-  if (clonedRefs.length === 0) return clonedMessages;
+  try {
+    if (options.signal?.aborted || clonedRefs.length === 0) return clonedMessages;
 
-  const matches = await toolCallMatcher.getMatchesForSession(sessionId);
-  const matchedToolCallIds = new Set(
-    matches
-      .map((match) => match.toolCallItemId)
-      .filter((value): value is string => typeof value === 'string' && value.length > 0),
-  );
+    const matches = await toolCallMatcher.getMatchesForSession(sessionId, options);
+    if (options.signal?.aborted) return clonedMessages;
+    const matchedToolCallIds = new Set(
+      matches
+        .map((match) => match.toolCallItemId)
+        .filter((value): value is string => typeof value === 'string' && value.length > 0),
+    );
 
-  const candidates = clonedRefs.filter(({ message }) => shouldHydrateDiffs(message, matchedToolCallIds));
-  if (candidates.length === 0) return clonedMessages;
+    const candidates = clonedRefs.filter(({ message }) => shouldHydrateDiffs(message, matchedToolCallIds));
+    if (candidates.length === 0) return clonedMessages;
 
-  // Resolve all tool-call diffs in one batched pass. getDiffsForSession loads
-  // the session's invariant data (workspace, session_files, history snapshots)
-  // ONCE and reuses it across every tool call -- without this, a session with
-  // thousands of tool calls re-runs the same per-file queries per call (an N+1
-  // that made large sessions take 60s+ to load).
-  const uniqueRefs = new Map<string, { toolCallItemId: string; toolCallTimestamp?: number }>();
-  for (const { toolCallItemId, toolCallTimestamp } of candidates) {
-    const key = refKey(toolCallItemId, toolCallTimestamp);
-    if (!uniqueRefs.has(key)) uniqueRefs.set(key, { toolCallItemId, toolCallTimestamp });
-  }
-
-  const diffsByKey = await toolCallMatcher.getDiffsForSession(sessionId, [...uniqueRefs.values()]);
-
-  for (const { message, toolCallItemId, toolCallTimestamp } of candidates) {
-    const diffs = diffsByKey.get(refKey(toolCallItemId, toolCallTimestamp));
-    if (diffs && diffs.length > 0 && message.toolCall) {
-      message.toolCall.fileDiffs = diffs;
+    // Resolve all tool-call diffs in one batched pass. getDiffsForSession loads
+    // the session's invariant data (workspace, session_files, history snapshots)
+    // ONCE and reuses it across every tool call -- without this, a session with
+    // thousands of tool calls re-runs the same per-file queries per call (an N+1
+    // that made large sessions take 60s+ to load).
+    const uniqueRefs = new Map<string, { toolCallItemId: string; toolCallTimestamp?: number }>();
+    for (const { toolCallItemId, toolCallTimestamp } of candidates) {
+      const key = refKey(toolCallItemId, toolCallTimestamp);
+      if (!uniqueRefs.has(key)) uniqueRefs.set(key, { toolCallItemId, toolCallTimestamp });
     }
-  }
 
-  return clonedMessages;
+    const diffsByKey = await toolCallMatcher.getDiffsForSession(sessionId, [...uniqueRefs.values()], options);
+    if (options.signal?.aborted) return clonedMessages;
+
+    for (const { message, toolCallItemId, toolCallTimestamp } of candidates) {
+      const diffs = diffsByKey.get(refKey(toolCallItemId, toolCallTimestamp));
+      if (diffs && diffs.length > 0 && message.toolCall) {
+        message.toolCall.fileDiffs = diffs;
+      }
+    }
+
+    return clonedMessages;
+  } catch (error) {
+    if (isToolCallMatcherCancelled(error)) return clonedMessages;
+    throw error;
+  }
 }

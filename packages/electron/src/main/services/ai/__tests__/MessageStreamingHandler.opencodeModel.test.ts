@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 // @vitest-environment node
 
 import { EventEmitter } from "events";
@@ -267,6 +268,7 @@ async function runTurn(options: {
     getSettingsStore: vi.fn(),
     getApiKeyForProvider: vi.fn(() => undefined),
     buildClaudeCodeRuntimeConfig: vi.fn(),
+    buildProviderControlRuntimeConfig: vi.fn(async () => ({})),
     tryDispatchNextQueuedPrompt: vi.fn(async () => false),
     requestQueueDrive: vi.fn(),
     createToolHandler: vi.fn(() => vi.fn()),

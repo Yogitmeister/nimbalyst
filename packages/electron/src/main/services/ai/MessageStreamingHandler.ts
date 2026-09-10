@@ -112,7 +112,7 @@ import { logger } from '../../utils/logger';
 import { windowStates, findWindowByWorkspace } from '../../window/WindowManager';
 import { sessionFileTracker } from '../SessionFileTracker';
 import { codexEditWindowRegistry, shouldOpenCodexEditWindow } from '../CodexEditWindowRegistry';
-import { toolCallMatcher, unwrapShellCommand } from '../ToolCallMatcher';
+import { isToolCallMatcherCancelled, toolCallMatcher, unwrapShellCommand } from '../ToolCallMatcher';
 import { getGitOperationLogService } from '../GitOperationLogService';
 import { GitActivityBridge, bashCommandObservation } from './GitActivityBridge';
 import { FeatureUsageService, FEATURES } from '../FeatureUsageService.ts';
@@ -202,6 +202,31 @@ function resolveWorkspaceFileAttributionMode(
   }
 
   return attributionModeForFileChangeFidelity(fileChangeFidelityForProviderType(providerName));
+}
+
+/** Owns the single cooperative matcher run allowed for each streaming session. */
+export class SessionMatchRunCoordinator {
+  private readonly controllers = new Map<string, AbortController>();
+
+  replace(sessionId: string): AbortController {
+    this.abort(sessionId);
+    const controller = new AbortController();
+    this.controllers.set(sessionId, controller);
+    return controller;
+  }
+
+  abort(sessionId: string): void {
+    const controller = this.controllers.get(sessionId);
+    if (!controller) return;
+    this.controllers.delete(sessionId);
+    controller.abort();
+  }
+
+  release(sessionId: string, controller: AbortController): void {
+    if (this.controllers.get(sessionId) === controller) {
+      this.controllers.delete(sessionId);
+    }
+  }
 }
 
 export type SendMessageHandler = (
@@ -321,6 +346,7 @@ async function getWorkspacePathForSession(sessionId: string): Promise<string | n
 export class MessageStreamingHandler {
   private readonly svc: AIServiceInternal;
   private readonly unsubscribeBatchListener: () => void;
+  private readonly sessionMatchRuns = new SessionMatchRunCoordinator();
   // Per-provider map of event -> currently-installed listener. Used by
   // installListener so handle() can re-wire its own subscriptions on every
   // ai:sendMessage call without nuking listeners owned by other modules.
@@ -365,6 +391,34 @@ export class MessageStreamingHandler {
         }
       });
     });
+  }
+
+  private scheduleToolCallMatch(
+    sessionId: string,
+    event: Electron.IpcMainInvokeEvent,
+    delayMs: number,
+    logFailure: boolean,
+  ): void {
+    const existingTimer = this.svc.matchDebounceTimers.get(sessionId);
+    if (existingTimer) clearTimeout(existingTimer);
+
+    // Replacing this controller also aborts a currently-running incremental
+    // pass. PGLite queries are not interruptible, but the matcher observes the
+    // signal before its next page/accumulation/write boundary.
+    const controller = this.sessionMatchRuns.replace(sessionId);
+    this.svc.matchDebounceTimers.set(sessionId, setTimeout(() => {
+      this.svc.matchDebounceTimers.delete(sessionId);
+      toolCallMatcher.matchSession(sessionId, { signal: controller.signal })
+        .then(count => {
+          if (count > 0) safeSend(event, 'session-files:updated', sessionId);
+        })
+        .catch(error => {
+          if (logFailure && !isToolCallMatcherCancelled(error)) {
+            logger.main.error(`[AIService] Tool call matching failed for session ${sessionId}:`, error);
+          }
+        })
+        .finally(() => this.sessionMatchRuns.release(sessionId, controller));
+    }, delayMs));
   }
 
   /** Used by AIService teardown to unwire the singleton batch listener. */
@@ -2086,18 +2140,7 @@ export class MessageStreamingHandler {
 
                   // Schedule debounced tool call matching so file edits are linked
                   // to tool calls promptly during the session, not just at the end.
-                  const existingTimer = this.svc.matchDebounceTimers.get(session.id);
-                  if (existingTimer) clearTimeout(existingTimer);
-                  this.svc.matchDebounceTimers.set(session.id, setTimeout(() => {
-                    this.svc.matchDebounceTimers.delete(session.id);
-                    toolCallMatcher.matchSession(session.id).then(count => {
-                      if (count > 0) {
-                        safeSend(event, 'session-files:updated', session.id);
-                      }
-                    }).catch(() => {
-                      // Non-critical - end-of-session matching will retry
-                    });
-                  }, 1000));
+                  this.scheduleToolCallMatch(session.id, event, 1000, false);
                 } catch (trackError) {
                   console.error('[AIService] Failed to track tool call:', trackError);
                 }
@@ -2940,24 +2983,10 @@ export class MessageStreamingHandler {
             }
 
             // Match file edits to tool calls now that all messages are flushed.
-            // Cancel any pending incremental match timer - we'll do a final pass now.
-            const pendingMatchTimer = this.svc.matchDebounceTimers.get(session.id);
-            if (pendingMatchTimer) {
-              clearTimeout(pendingMatchTimer);
-              this.svc.matchDebounceTimers.delete(session.id);
-            }
+            // The final pass supersedes any pending or running incremental pass.
             // Delay briefly to let non-blocking message writes complete.
             if (effectiveWorkspacePath) {
-              const matchSessionId = session.id;
-              setTimeout(() => {
-                toolCallMatcher.matchSession(matchSessionId).then(count => {
-                  if (count > 0) {
-                    safeSend(event, 'session-files:updated', matchSessionId);
-                  }
-                }).catch(err =>
-                  logger.main.error(`[AIService] Tool call matching failed for session ${matchSessionId}:`, err)
-                );
-              }, 2000);
+              this.scheduleToolCallMatch(session.id, event, 2000, true);
             }
 
             break;

@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('jotai-family', () => ({ atomFamily: vi.fn() }));
@@ -7,6 +8,7 @@ vi.mock('../../database/PGLiteDatabaseWorker', () => ({
     isInitialized: () => true,
     initialize: vi.fn(),
     query: vi.fn(),
+    runTransaction: vi.fn(),
   },
 }));
 
@@ -33,11 +35,21 @@ vi.mock('@nimbalyst/runtime/storage/repositories/TranscriptMigrationRepository',
 }));
 
 import { database } from '../../database/PGLiteDatabaseWorker';
-import { parseToolCallWindows, scoreMatch, scoreWorkspaceFileEdit, toolCallMatcher, type ToolCallWindow } from '../ToolCallMatcher';
+import {
+  getRawToolCallWindows,
+  parseToolCallWindows,
+  RAW_TOOL_CALL_PAGE_SIZE,
+  scoreMatch,
+  scoreWorkspaceFileEdit,
+  ToolCallMatcherCancelledError,
+  toolCallMatcher,
+  type ToolCallWindow,
+} from '../ToolCallMatcher';
 
 describe('ToolCallMatcher', () => {
   beforeEach(() => {
     (database.query as ReturnType<typeof vi.fn>).mockReset();
+    (database.runTransaction as ReturnType<typeof vi.fn>).mockReset();
     mockGetMultiSessionEvents.mockReset();
   });
 
@@ -946,35 +958,30 @@ describe('ToolCallMatcher', () => {
         return { rows: [] };
       });
 
+      // Matches are committed via database.runTransaction(statements), not a
+      // bare database.query INSERT -- find the insert statement in the batch.
+      (database.runTransaction as ReturnType<typeof vi.fn>).mockImplementation(
+        async (statements: Array<{ sql: string; params?: unknown[] }>) => {
+          const insert = statements.find((s) => /^\s*INSERT/i.test(s.sql));
+          if (insert) captured.insertParams = insert.params;
+        },
+      );
+
       return captured;
     }
 
     const BOUND_LOWER = '(EXTRACT(EPOCH FROM created_at) * 1000) >= $2';
     const BOUND_UPPER = '(EXTRACT(EPOCH FROM created_at) * 1000) <= $3';
 
-    it('bounds sessions without definitive tool IDs to the editable file window', async () => {
-      const sessionId = 'bounded-session';
-      const earliestTimestamp = 1_700_000_000_000;
-      const latestTimestamp = earliestTimestamp + 45_000;
-
-      const captured = stubSession({
-        files: [
-          { id: 'early-file', file_path: '/workspace/src/early.ts', timestamp_ms: earliestTimestamp, metadata: {} },
-          { id: 'late-file', file_path: '/workspace/src/late.ts', timestamp_ms: latestTimestamp, metadata: {} },
-        ],
-      });
-
-      await expect(toolCallMatcher.matchSession(sessionId)).resolves.toBe(0);
-
-      expect(captured.sawMessagesQuery).toBe(true);
-      expect(captured.messagesSql).toContain(BOUND_LOWER);
-      expect(captured.messagesSql).toContain(BOUND_UPPER);
-      expect(captured.messagesParams).toEqual([
-        sessionId,
-        earliestTimestamp - 10_000,
-        latestTimestamp + 10_000,
-      ]);
-    });
+    // 'bounds sessions without definitive tool IDs to the editable file window'
+    // moved to the 'bounded cancellable matchSession replay' suite below as
+    // 'preserves the source carry bounds at earliest/latest edit timestamps' —
+    // same scenario, updated for the keyset-paginated query shape
+    // (id > $N / LIMIT $N+1 are now always present, so the params array grew
+    // from 3 to 5 elements). Kept here: the two scenarios pagination didn't
+    // touch — unbounded-for-definitive-toolUseId, and invalid-timestamp
+    // fallback — ported to the same paginated params shape so they still
+    // assert real behavior instead of the pre-pagination call signature.
 
     it('preserves out-of-window exact toolUseId matches with an unbounded lookup', async () => {
       const sessionId = 'definitive-id-session';
@@ -1012,7 +1019,8 @@ describe('ToolCallMatcher', () => {
       // it is only reachable because the lookup stayed unbounded.
       expect(captured.messagesSql).not.toContain(BOUND_LOWER);
       expect(captured.messagesSql).not.toContain(BOUND_UPPER);
-      expect(captured.messagesParams).toEqual([sessionId]);
+      // Unbounded lookup still paginates: id > $2 (cursor) / LIMIT $3 (page size).
+      expect(captured.messagesParams).toEqual([sessionId, 0, RAW_TOOL_CALL_PAGE_SIZE]);
       expect(captured.insertParams).toEqual(expect.arrayContaining([
         sessionId,
         'file-1',
@@ -1038,7 +1046,7 @@ describe('ToolCallMatcher', () => {
       expect(captured.sawMessagesQuery).toBe(true);
       expect(captured.messagesSql).not.toContain(BOUND_LOWER);
       expect(captured.messagesSql).not.toContain(BOUND_UPPER);
-      expect(captured.messagesParams).toEqual([sessionId]);
+      expect(captured.messagesParams).toEqual([sessionId, 0, RAW_TOOL_CALL_PAGE_SIZE]);
     });
   });
 
@@ -1112,6 +1120,198 @@ describe('ToolCallMatcher', () => {
       await toolCallMatcher.matchSession('improvable-session');
 
       expect(probe.scannedMessages()).toBe(true);
+    });
+  });
+
+  describe('bounded cancellable matchSession replay', () => {
+    const sessionId = 'bounded-session';
+    const baseTimestamp = 1_700_000_000_000;
+    const queryMock = database.query as ReturnType<typeof vi.fn>;
+    const transactionMock = database.runTransaction as ReturnType<typeof vi.fn>;
+
+    const file = (id: string, timestampMs = baseTimestamp, metadata: Record<string, unknown> = {}) => ({
+      id,
+      file_path: `/workspace/src/${id}.ts`,
+      timestamp_ms: timestampMs,
+      metadata,
+    });
+    const rawFileChange = (id: number, timestampMs: number, filePath: string) => ({
+      id,
+      created_at_ms: timestampMs,
+      content: JSON.stringify({
+        type: 'item.completed',
+        item: {
+          type: 'file_change',
+          id: `call-${id}`,
+          changes: [{ path: filePath, kind: 'update' }],
+        },
+      }),
+    });
+
+    it('preserves the source carry bounds at the earliest/latest edit timestamps', async () => {
+      const earliestTimestamp = baseTimestamp;
+      const latestTimestamp = baseTimestamp + 45_000;
+      queryMock.mockImplementation(async (sql: string, params: unknown[]) => {
+        if (sql.includes('FROM ai_sessions')) return { rows: [{ workspace_id: '/workspace' }] };
+        if (sql.includes('FROM session_files')) {
+          return { rows: [file('early', earliestTimestamp), file('late', latestTimestamp)] };
+        }
+        if (sql.includes('FROM ai_agent_messages')) {
+          expect(sql).toContain('id > $4');
+          expect(sql).toContain('ORDER BY id ASC');
+          expect(sql).toContain('LIMIT $5');
+          expect(params).toEqual([
+            sessionId,
+            earliestTimestamp - 10_000,
+            latestTimestamp + 10_000,
+            0,
+            RAW_TOOL_CALL_PAGE_SIZE,
+          ]);
+          return { rows: [] };
+        }
+        throw new Error(`unexpected query: ${sql}`);
+      });
+
+      await expect(toolCallMatcher.matchSession(sessionId)).resolves.toBe(0);
+      expect(transactionMock).not.toHaveBeenCalled();
+    });
+
+    it('uses deterministic keyset pages and preserves normal matching output', async () => {
+      const sessionFile = file('matched-file');
+      const rawRows = Array.from(
+        { length: RAW_TOOL_CALL_PAGE_SIZE + 1 },
+        (_, index) => rawFileChange(index + 1, baseTimestamp + 100, sessionFile.file_path),
+      );
+      const cursors: number[] = [];
+      queryMock.mockImplementation(async (sql: string, params: unknown[]) => {
+        if (sql.includes('FROM ai_sessions')) return { rows: [{ workspace_id: '/workspace' }] };
+        if (sql.includes('FROM session_files')) return { rows: [sessionFile] };
+        if (sql.includes('FROM ai_agent_messages')) {
+          const cursor = Number(params[3]);
+          cursors.push(cursor);
+          return { rows: rawRows.filter((row) => row.id > cursor).slice(0, Number(params[4])) };
+        }
+        if (sql.includes('FROM ai_tool_call_file_edits')) return { rows: [] };
+        throw new Error(`unexpected query: ${sql}`);
+      });
+
+      await expect(toolCallMatcher.matchSession(sessionId)).resolves.toBe(1);
+      expect(cursors).toEqual([0, RAW_TOOL_CALL_PAGE_SIZE]);
+      expect(transactionMock).toHaveBeenCalledTimes(1);
+      const statements = transactionMock.mock.calls[0][0] as Array<{ sql: string; params?: unknown[] }>;
+      expect(statements).toHaveLength(1);
+      expect(statements[0]?.sql).toContain('INSERT INTO ai_tool_call_file_edits');
+      expect(statements[0]?.params).toEqual(expect.arrayContaining([sessionId, 'matched-file', 1, 'call-1']));
+    });
+
+    it('stops after the completed page when cancellation arrives between pages', async () => {
+      const pageRows = Array.from(
+        { length: RAW_TOOL_CALL_PAGE_SIZE },
+        (_, index) => rawFileChange(index + 1, baseTimestamp, '/workspace/src/a.ts'),
+      );
+      let abortedChecks = 0;
+      const signal = {
+        get aborted() {
+          abortedChecks += 1;
+          return abortedChecks >= 3;
+        },
+      } as AbortSignal;
+      queryMock.mockResolvedValue({ rows: pageRows });
+
+      await expect(getRawToolCallWindows(sessionId, '/workspace', { signal }))
+        .rejects.toBeInstanceOf(ToolCallMatcherCancelledError);
+      expect(queryMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws before writes on cancellation and leaves the existing linkage untouched', async () => {
+      const sessionFile = file('existing-file');
+      const existingLinkage = [{ session_file_id: 'existing-file', match_score: 10, tool_use_id: null }];
+      let abortedChecks = 0;
+      const signal = {
+        get aborted() {
+          abortedChecks += 1;
+          return abortedChecks >= 4;
+        },
+      } as AbortSignal;
+      queryMock.mockImplementation(async (sql: string) => {
+        if (sql.includes('FROM ai_sessions')) return { rows: [{ workspace_id: '/workspace' }] };
+        if (sql.includes('FROM session_files')) return { rows: [sessionFile] };
+        if (sql.includes('FROM ai_agent_messages')) {
+          return { rows: [rawFileChange(1, baseTimestamp + 100, sessionFile.file_path)] };
+        }
+        if (sql.includes('FROM ai_tool_call_file_edits')) return { rows: existingLinkage };
+        throw new Error(`unexpected query: ${sql}`);
+      });
+
+      await expect(toolCallMatcher.matchSession(sessionId, { signal }))
+        .rejects.toBeInstanceOf(ToolCallMatcherCancelledError);
+      expect(transactionMock).not.toHaveBeenCalled();
+      expect(existingLinkage).toEqual([{ session_file_id: 'existing-file', match_score: 10, tool_use_id: null }]);
+    });
+
+    it('commits replacement, insertion, and orphan cleanup in one transaction', async () => {
+      const replacementFile = file('replacement-file');
+      const orphanFile = file('orphan-file', baseTimestamp, { bashSideEffect: true });
+      queryMock.mockImplementation(async (sql: string) => {
+        if (sql.includes('FROM ai_sessions')) return { rows: [{ workspace_id: '/workspace' }] };
+        if (sql.includes('FROM session_files')) return { rows: [replacementFile, orphanFile] };
+        if (sql.includes('FROM ai_agent_messages')) {
+          return { rows: [rawFileChange(9, baseTimestamp + 100, replacementFile.file_path)] };
+        }
+        if (sql.includes('FROM ai_tool_call_file_edits')) {
+          return { rows: [{ session_file_id: 'replacement-file', match_score: 30, tool_use_id: null }] };
+        }
+        throw new Error(`unexpected query: ${sql}`);
+      });
+
+      await expect(toolCallMatcher.matchSession(sessionId)).resolves.toBe(1);
+      expect(transactionMock).toHaveBeenCalledTimes(1);
+      const statements = transactionMock.mock.calls[0][0] as Array<{ sql: string; params?: unknown[] }>;
+      expect(statements.map((statement) => statement.sql)).toEqual([
+        expect.stringContaining('DELETE FROM ai_tool_call_file_edits'),
+        expect.stringContaining('INSERT INTO ai_tool_call_file_edits'),
+        expect.stringContaining('DELETE FROM session_files'),
+      ]);
+      expect(statements[0]?.params).toEqual([sessionId, ['replacement-file']]);
+      expect(statements[2]?.params).toEqual([['orphan-file']]);
+    });
+
+    it('retains ascending linkage-id ordering for deterministic consumers', async () => {
+      queryMock.mockImplementation(async (sql: string) => {
+        expect(sql).toContain('ORDER BY id ASC');
+        return {
+          rows: [
+            {
+              id: 4,
+              session_id: sessionId,
+              session_file_id: 'file-4',
+              message_id: 40,
+              tool_call_item_id: 'call-4',
+              tool_use_id: null,
+              match_score: 40,
+              match_reason: 'path_in_changes',
+              file_timestamp: new Date(baseTimestamp),
+              created_at: new Date(baseTimestamp),
+            },
+            {
+              id: 9,
+              session_id: sessionId,
+              session_file_id: 'file-9',
+              message_id: 90,
+              tool_call_item_id: 'call-9',
+              tool_use_id: null,
+              match_score: 40,
+              match_reason: 'path_in_changes',
+              file_timestamp: new Date(baseTimestamp),
+              created_at: new Date(baseTimestamp),
+            },
+          ],
+        };
+      });
+
+      const matches = await toolCallMatcher.getMatchesForSession(sessionId);
+
+      expect(matches.map((match) => match.id)).toEqual([4, 9]);
     });
   });
 });

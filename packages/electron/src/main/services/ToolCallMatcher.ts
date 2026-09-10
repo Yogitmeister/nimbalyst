@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * ToolCallMatcher - Correlates file edits in session_files with tool calls in ai_agent_messages.
  *
@@ -187,6 +188,7 @@ export interface SessionEnrichmentContext {
 // ---------------------------------------------------------------------------
 
 const TIME_CUTOFF_MS = 10_000; // 10 second hard cutoff around tool call
+export const RAW_TOOL_CALL_PAGE_SIZE = 250;
 const MIN_MATCH_SCORE = 30; // Must have at least a filename match
 
 /**
@@ -199,6 +201,25 @@ const MIN_MATCH_SCORE = 30; // Must have at least a filename match
 const MAX_MATCH_SCORE = 100;
 const WORKSPACE_CLEAR_WINNER_MARGIN = 12;
 const WORKSPACE_MIN_CONFIDENCE_SCORE = 55;
+
+export class ToolCallMatcherCancelledError extends Error {
+  constructor() {
+    super('Tool call matching was cancelled');
+    this.name = 'ToolCallMatcherCancelledError';
+  }
+}
+
+export function isToolCallMatcherCancelled(error: unknown): error is ToolCallMatcherCancelledError {
+  return error instanceof ToolCallMatcherCancelledError;
+}
+
+export interface ToolCallMatcherOptions {
+  signal?: AbortSignal;
+}
+
+function throwIfToolCallMatcherCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new ToolCallMatcherCancelledError();
+}
 
 /** Shell wrapper: /bin/zsh -lc 'cmd' or bare bash -lc 'cmd' (Windows inner layer) */
 const SHELL_WRAPPER_REGEX = /^(?:\/(?:bin|usr\/bin)\/)?(?:bash|zsh|sh)\s+-l?c\s+([\s\S]+)$/;
@@ -543,50 +564,69 @@ interface MatchCandidate {
 export async function getRawToolCallWindows(
   sessionId: string,
   workspacePath?: string,
-  options?: { afterDate?: Date; beforeDate?: Date },
+  options?: { afterDate?: Date; beforeDate?: Date; signal?: AbortSignal },
 ): Promise<ToolCallWindow[]> {
   try {
-    const conditions = [
-      'session_id = $1',
-      "direction = 'output'",
-      'hidden = FALSE',
-    ];
-    const params: any[] = [sessionId];
-    let paramIdx = 2;
-
-    if (options?.afterDate) {
-      conditions.push(`(EXTRACT(EPOCH FROM created_at) * 1000) >= $${paramIdx}`);
-      params.push(options.afterDate.getTime());
-      paramIdx++;
-    }
-    if (options?.beforeDate) {
-      conditions.push(`(EXTRACT(EPOCH FROM created_at) * 1000) <= $${paramIdx}`);
-      params.push(options.beforeDate.getTime());
-      paramIdx++;
-    }
-
-    const messagesResult = await database.query<AgentMessageRow>(
-      `SELECT id, content, metadata, EXTRACT(EPOCH FROM created_at) * 1000 AS created_at_ms
-       FROM ai_agent_messages
-       WHERE ${conditions.join(' AND ')}
-       ORDER BY id ASC`,
-      params,
-    );
-
     const windows: ToolCallWindow[] = [];
-    for (const msg of messagesResult.rows) {
-      const msgWindows = parseToolCallWindows(
-        ensureNumber(msg.id),
-        msg.content,
-        new Date(ensureNumber(msg.created_at_ms)),
-        sessionId,
-        workspacePath,
-        msg.metadata,
+    let cursor = 0;
+
+    while (true) {
+      // The database API cannot cancel an in-flight PGLite query. These checks
+      // deliberately stop only before issuing the next page and before using a
+      // completed page, which keeps cancellation deterministic and cooperative.
+      throwIfToolCallMatcherCancelled(options?.signal);
+
+      const conditions = [
+        'session_id = $1',
+        "direction = 'output'",
+        'hidden = FALSE',
+      ];
+      const params: any[] = [sessionId];
+      let paramIdx = 2;
+
+      if (options?.afterDate) {
+        conditions.push(`(EXTRACT(EPOCH FROM created_at) * 1000) >= $${paramIdx}`);
+        params.push(options.afterDate.getTime());
+        paramIdx++;
+      }
+      if (options?.beforeDate) {
+        conditions.push(`(EXTRACT(EPOCH FROM created_at) * 1000) <= $${paramIdx}`);
+        params.push(options.beforeDate.getTime());
+        paramIdx++;
+      }
+      conditions.push(`id > $${paramIdx}`);
+      params.push(cursor);
+      paramIdx++;
+      params.push(RAW_TOOL_CALL_PAGE_SIZE);
+
+      const messagesResult = await database.query<AgentMessageRow>(
+        `SELECT id, content, metadata, EXTRACT(EPOCH FROM created_at) * 1000 AS created_at_ms
+         FROM ai_agent_messages
+         WHERE ${conditions.join(' AND ')}
+         ORDER BY id ASC
+         LIMIT $${paramIdx}`,
+        params,
       );
-      windows.push(...msgWindows);
+
+      throwIfToolCallMatcherCancelled(options?.signal);
+      for (const msg of messagesResult.rows) {
+        const msgWindows = parseToolCallWindows(
+          ensureNumber(msg.id),
+          msg.content,
+          new Date(ensureNumber(msg.created_at_ms)),
+          sessionId,
+          workspacePath,
+          msg.metadata,
+        );
+        windows.push(...msgWindows);
+      }
+
+      if (messagesResult.rows.length < RAW_TOOL_CALL_PAGE_SIZE) break;
+      cursor = ensureNumber(messagesResult.rows[messagesResult.rows.length - 1].id);
     }
     return windows;
   } catch (error) {
+    if (isToolCallMatcherCancelled(error)) throw error;
     logger.main.warn('[ToolCallMatcher] Failed to read raw tool call windows:', error);
     return [];
   }
@@ -949,8 +989,9 @@ class ToolCallMatcherImpl {
    * Match all unmatched session_files entries for a session.
    * Returns the number of new matches created.
    */
-  async matchSession(sessionId: string): Promise<number> {
+  async matchSession(sessionId: string, options?: ToolCallMatcherOptions): Promise<number> {
     try {
+      throwIfToolCallMatcherCancelled(options?.signal);
       if (!database.isInitialized()) {
         await database.initialize();
       }
@@ -1061,8 +1102,13 @@ class ToolCallMatcherImpl {
         }
       }
 
-      // 3. Load tool call windows from raw ai_agent_messages.
-      const windows = await getRawToolCallWindows(sessionId, workspacePath, rawWindowOptions);
+      // 3. Load tool call windows from raw ai_agent_messages. Threads the
+      // caller's cancellation signal through regardless of which window shape
+      // (bounded or unbounded) applies above.
+      const windows = await getRawToolCallWindows(sessionId, workspacePath, {
+        ...rawWindowOptions,
+        signal: options?.signal,
+      });
 
       if (windows.length === 0) return 0;
 
@@ -1186,20 +1232,21 @@ class ToolCallMatcherImpl {
         });
       }
 
-      // Remove old matches that are being replaced by better ones
+      // Replacement, insertion, and related orphan cleanup must commit as one
+      // unit. Cancellation is intentionally checked before this phase only;
+      // once the transaction starts it is deferred until commit/rollback.
+      const statements: Array<{ sql: string; params?: any[] }> = [];
       if (replacedFileIds.length > 0) {
-        await database.query(
-          `DELETE FROM ai_tool_call_file_edits
-           WHERE session_id = $1 AND session_file_id = ANY($2)`,
-          [sessionId, replacedFileIds]
-        );
+        statements.push({
+          sql: `DELETE FROM ai_tool_call_file_edits
+                WHERE session_id = $1 AND session_file_id = ANY($2)`,
+          params: [sessionId, replacedFileIds],
+        });
         logger.main.debug(`[ToolCallMatcher] Replaced ${replacedFileIds.length} matches with better ones`);
       }
 
-      if (matches.length > 0) {
-        await this.insertMatchesBatch(matches);
-        logger.main.debug(`[ToolCallMatcher] Matched ${matches.length} files for session ${sessionId}`);
-      }
+      const insertMatchesStatement = this.buildInsertMatchesStatement(matches);
+      if (insertMatchesStatement) statements.push(insertMatchesStatement);
 
       // Clean up provisional bash side-effect entries that didn't match any tool call.
       // When multiple sessions share a workspace, each creates a provisional entry
@@ -1213,15 +1260,24 @@ class ToolCallMatcherImpl {
         .filter(f => f.metadata?.bashSideEffect === true && !matchedFileIds.has(f.id));
       if (orphanedBashSideEffects.length > 0) {
         const orphanIds = orphanedBashSideEffects.map(f => f.id);
-        await database.query(
-          `DELETE FROM session_files WHERE id = ANY($1)`,
-          [orphanIds]
-        );
+        statements.push({
+          sql: `DELETE FROM session_files WHERE id = ANY($1)`,
+          params: [orphanIds],
+        });
         logger.main.debug(`[ToolCallMatcher] Removed ${orphanIds.length} unmatched bash side-effect entries`);
+      }
+
+      throwIfToolCallMatcherCancelled(options?.signal);
+      if (statements.length > 0) {
+        await database.runTransaction(statements);
+        if (matches.length > 0) {
+          logger.main.debug(`[ToolCallMatcher] Matched ${matches.length} files for session ${sessionId}`);
+        }
       }
 
       return matches.length;
     } catch (error) {
+      if (isToolCallMatcherCancelled(error)) throw error;
       logger.main.error('[ToolCallMatcher] matchSession failed:', error);
       return 0;
     }
@@ -1230,8 +1286,9 @@ class ToolCallMatcherImpl {
   /**
    * Get all matches for a session.
    */
-  async getMatchesForSession(sessionId: string): Promise<ToolCallFileEdit[]> {
+  async getMatchesForSession(sessionId: string, options?: ToolCallMatcherOptions): Promise<ToolCallFileEdit[]> {
     try {
+      throwIfToolCallMatcherCancelled(options?.signal);
       if (!database.isInitialized()) {
         await database.initialize();
       }
@@ -1245,8 +1302,10 @@ class ToolCallMatcherImpl {
         [sessionId]
       );
 
+      throwIfToolCallMatcherCancelled(options?.signal);
       return result.rows.map(row => this.mapRowToToolCallFileEdit(row));
     } catch (error) {
+      if (isToolCallMatcherCancelled(error)) throw error;
       logger.main.error('[ToolCallMatcher] getMatchesForSession failed:', error);
       return [];
     }
@@ -1408,28 +1467,35 @@ class ToolCallMatcherImpl {
    */
   async getDiffsForSession(
     sessionId: string,
-    refs: Array<{ toolCallItemId: string; toolCallTimestamp?: number }>
+    refs: Array<{ toolCallItemId: string; toolCallTimestamp?: number }>,
+    options?: ToolCallMatcherOptions,
   ): Promise<Map<string, ToolCallDiffResult[]>> {
     const out = new Map<string, ToolCallDiffResult[]>();
     if (refs.length === 0) return out;
+    throwIfToolCallMatcherCancelled(options?.signal);
 
     let ctx: SessionEnrichmentContext | undefined;
     try {
       ctx = await this.createSessionEnrichmentContext(sessionId);
     } catch (error) {
+      if (isToolCallMatcherCancelled(error)) throw error;
       logger.main.warn('[ToolCallMatcher] createSessionEnrichmentContext failed, falling back to per-call queries:', error);
       ctx = undefined;
     }
+    throwIfToolCallMatcherCancelled(options?.signal);
 
     for (const ref of refs) {
+      throwIfToolCallMatcherCancelled(options?.signal);
       const key = `${ref.toolCallItemId} ${ref.toolCallTimestamp ?? ''}`;
       if (out.has(key)) continue;
       try {
         out.set(key, await this.getDiffsForToolCall(sessionId, ref.toolCallItemId, ref.toolCallTimestamp, ctx));
       } catch (error) {
+        if (isToolCallMatcherCancelled(error)) throw error;
         logger.main.error('[ToolCallMatcher] getDiffsForSession item failed:', error);
         out.set(key, []);
       }
+      throwIfToolCallMatcherCancelled(options?.signal);
     }
 
     return out;
@@ -2132,7 +2198,7 @@ class ToolCallMatcherImpl {
     return null;
   }
 
-  private async insertMatchesBatch(
+  private buildInsertMatchesStatement(
     matches: Array<{
       sessionId: string;
       sessionFileId: string;
@@ -2143,8 +2209,8 @@ class ToolCallMatcherImpl {
       reason: string;
       fileTimestamp: number;
     }>
-  ): Promise<void> {
-    if (matches.length === 0) return;
+  ): { sql: string; params: any[] } | null {
+    if (matches.length === 0) return null;
 
     const values: any[] = [];
     const placeholders: string[] = [];
@@ -2157,16 +2223,16 @@ class ToolCallMatcherImpl {
       paramIdx += 8;
     }
 
-    await database.query(
-      `INSERT INTO ai_tool_call_file_edits
-       (session_id, session_file_id, message_id, tool_call_item_id, tool_use_id, match_score, match_reason, file_timestamp)
-       VALUES ${placeholders.join(', ')}
-       ON CONFLICT (session_file_id, message_id) DO UPDATE SET
-         match_score = EXCLUDED.match_score,
-         match_reason = EXCLUDED.match_reason,
-         file_timestamp = EXCLUDED.file_timestamp`,
-      values
-    );
+    return {
+      sql: `INSERT INTO ai_tool_call_file_edits
+            (session_id, session_file_id, message_id, tool_call_item_id, tool_use_id, match_score, match_reason, file_timestamp)
+            VALUES ${placeholders.join(', ')}
+            ON CONFLICT (session_file_id, message_id) DO UPDATE SET
+              match_score = EXCLUDED.match_score,
+              match_reason = EXCLUDED.match_reason,
+              file_timestamp = EXCLUDED.file_timestamp`,
+      params: values,
+    };
   }
 
   /**
