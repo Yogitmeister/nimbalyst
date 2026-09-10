@@ -12,9 +12,9 @@
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import {
   AISessionsRepository,
-  SessionFilesRepository,
-} from "@nimbalyst/runtime";
-import type { SessionMeta } from "@nimbalyst/runtime";
+  type SessionMeta,
+} from "@nimbalyst/runtime/storage/repositories/AISessionsRepository";
+import { SessionFilesRepository } from "@nimbalyst/runtime/storage/repositories/SessionFilesRepository";
 import {
   appendPendingPromptSection,
   collectPendingPromptDescriptionsFromRawRows,

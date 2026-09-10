@@ -22,7 +22,7 @@ const {
   getAllWindowsMock: vi.fn(() => []),
 }));
 
-vi.mock('@nimbalyst/runtime', () => ({
+vi.mock('@nimbalyst/runtime/storage/repositories/AISessionsRepository', () => ({
   AISessionsRepository: {
     get: (...args: unknown[]) => getMock(...args),
     list: (...args: unknown[]) => listMock(...args),
@@ -30,6 +30,8 @@ vi.mock('@nimbalyst/runtime', () => ({
     updateMetadata: (...args: unknown[]) => updateMetadataMock(...args),
     getMany: vi.fn(async () => []),
   },
+}));
+vi.mock('@nimbalyst/runtime/storage/repositories/SessionFilesRepository', () => ({
   SessionFilesRepository: { getFilesBySession: vi.fn(), getFilesBySessionMany: vi.fn() },
 }));
 vi.mock('../../services/RepositoryManager', () => ({
