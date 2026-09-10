@@ -1,9 +1,12 @@
+// [ASTRA-ORCH]
 import { describe, expect, it, vi } from 'vitest';
 
 // mcpWorkspaceResolver imports electron + WindowManager at the top. Mock them so
 // the registry helpers can be exercised in a plain node test.
 vi.mock('electron', () => ({ BrowserWindow: { fromId: vi.fn(() => null) } }));
 vi.mock('../../window/WindowManager', () => ({ findWindowByWorkspace: vi.fn(() => null) }));
+// Workspace identity has its own tests; this suite owns only the tool registry.
+vi.mock('../../utils/workspaceDetection', () => ({ isWorktreePath: () => false, resolveProjectPath: (value: string) => value }));
 
 // The unknown-workspace path dynamically imports the database init + worktree
 // store for worktree resolution. Stub them so the test does not load the whole

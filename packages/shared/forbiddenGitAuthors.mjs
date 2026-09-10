@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Single source of truth for the git-fixture-identity denylist.
  *

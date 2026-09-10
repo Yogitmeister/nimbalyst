@@ -1,3 +1,4 @@
+-- [ASTRA-ORCH]
 -- Durable priority/control delivery metadata. Ordinary rows remain ready FIFO work.
 
 ALTER TABLE queued_prompts ADD COLUMN delivery_class TEXT NOT NULL DEFAULT 'ordinary'

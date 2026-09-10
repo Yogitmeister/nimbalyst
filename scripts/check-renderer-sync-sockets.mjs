@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node # [ASTRA-ORCH]
 /**
  * Guards every renderer-side sync provider against opening a raw browser
  * WebSocket to the collab sync server.

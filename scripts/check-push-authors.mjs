@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node # [ASTRA-ORCH]
 // Refuse to push commits authored by test-fixture identities. The vitest suite
 // builds real git repos (GitCommitService.test.ts and friends); on 2026-07-22 a
 // run escaped its temp sandbox during a release and pushed ten fixture commits

@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 // @vitest-environment node
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { PGlite } from "@electric-sql/pglite";
@@ -18,7 +19,12 @@ describe.each(["pglite", "sqlite"])("session inbox (%s)", (backend) => {
       const pg = new PGlite();
       await pg.exec(`CREATE TABLE ai_sessions(id TEXT PRIMARY KEY, provider TEXT, status TEXT);
         CREATE TABLE ai_agent_messages(id SERIAL PRIMARY KEY, session_id TEXT, source TEXT, direction TEXT, content TEXT, metadata JSONB, provider_message_id TEXT, message_kind TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
-        CREATE TABLE queued_prompts(id TEXT PRIMARY KEY, session_id TEXT, prompt TEXT, status TEXT DEFAULT 'pending', document_context JSONB, attachments JSONB, created_at TIMESTAMPTZ DEFAULT NOW(), claimed_at TIMESTAMPTZ, completed_at TIMESTAMPTZ, error_message TEXT);`);
+        CREATE TABLE queued_prompts(id TEXT PRIMARY KEY, session_id TEXT, prompt TEXT, status TEXT DEFAULT 'pending', document_context JSONB, attachments JSONB, created_at TIMESTAMPTZ DEFAULT NOW(), claimed_at TIMESTAMPTZ, completed_at TIMESTAMPTZ, error_message TEXT,
+          delivery_class TEXT NOT NULL DEFAULT 'ordinary' CHECK (delivery_class IN ('ordinary', 'control')),
+          priority_rank INTEGER NOT NULL DEFAULT 0,
+          delivery_ready INTEGER NOT NULL DEFAULT 1 CHECK (delivery_ready IN (0, 1)),
+          producer TEXT, idempotency_key TEXT, request_digest TEXT, control_operation TEXT,
+          interrupt_target_generation TEXT, interrupt_reservation_owner TEXT, interrupt_receipt TEXT);`);
       db = {
         query: (sql, params) => pg.query(sql, params),
         runTransaction: (statements) =>

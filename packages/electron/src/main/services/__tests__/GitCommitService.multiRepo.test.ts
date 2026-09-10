@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Cross-repo commit splitting, against real git repositories.
  *
@@ -20,6 +21,14 @@ const testTempRoot = process.env.NIMBALYST_TEST_TEMP_DIR ?? os.tmpdir();
 const rootsByWorkspace = new Map<string, string[]>();
 vi.mock('../../utils/store', () => ({
   getWorkspaceRoots: (workspacePath: string) => rootsByWorkspace.get(workspacePath) ?? [workspacePath],
+}));
+
+// This suite exercises repo splitting. Keep REAL commits on the forbidden fixture
+// identity so the push guard still catches any sandbox escape. The production
+// identity resolver is exercised separately in GitCommitService.test.ts.
+vi.mock('../GitAuthorIdentityGuard', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../GitAuthorIdentityGuard')>(),
+  resolveGitAuthorIdentity: vi.fn(async () => ({ name: 'Ada Contributor', email: 'ada@nimbalyst.dev' })),
 }));
 
 const { executeGitCommitAcrossRepos, createGitCommitProposalResponse } = await import('../GitCommitService');
