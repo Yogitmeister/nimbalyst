@@ -4,7 +4,16 @@ import path from 'path';
 import { BrowserWindow } from 'electron';
 import { randomUUID } from 'crypto';
 import { safeHandle } from '../utils/ipcRegistry';
-import { SessionManager } from '@nimbalyst/runtime/ai/server';
+import {
+  BUILT_IN_PROVIDER_CATALOG,
+  isCatalogPersistedModelId,
+  resolveClaudeAgentRuntimeRoutes,
+  resolveProviderCatalog,
+  SessionManager,
+  type ClaudeAgentRuntimeRouteBundle,
+  type ProviderCatalogEntry,
+  type ProviderCatalogResolution,
+} from '@nimbalyst/runtime/ai/server';
 import type { AIProviderType, PromptProvenance } from '@nimbalyst/runtime/ai/server/types';
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
 import {
@@ -12,6 +21,12 @@ import {
   clampEffortLevel,
   type EffortLevel,
 } from '@nimbalyst/runtime/ai/server/effortLevels';
+import { ClaudeCodeDeps } from '@nimbalyst/runtime/ai/server/providers/claudeCode/dependencyInjection';
+import { getProviderRouteCredentialPresence } from '@nimbalyst/runtime/ai/server/providers/claudeCode/providerRouteCredentials';
+import {
+  createDurableProviderRuntimeRouteSnapshot,
+  PROVIDER_RUNTIME_ROUTE_METADATA_KEY,
+} from '@nimbalyst/runtime/ai/server/providers/claudeCode/providerRuntimeRoutePersistence';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import { AgentMessagesRepository } from '@nimbalyst/runtime/storage/repositories/AgentMessagesRepository';
 import { SessionFilesRepository } from '@nimbalyst/runtime/storage/repositories/SessionFilesRepository';
@@ -75,6 +90,7 @@ interface CreateChildSessionArgs {
   title?: string;
   provider?: string;
   model?: string;
+  claudeCodeBackend?: string;
   prompt?: string;
   useWorktree?: boolean;
   worktreeId?: string;
@@ -114,6 +130,13 @@ function normalizeStoredChildModelIdentifier(
     return null;
   }
 
+  if (
+    isCatalogPersistedModelId(model) &&
+    (provider === 'claude-code' || model.startsWith('claude-code:'))
+  ) {
+    return model;
+  }
+
   if (provider === 'claude-code' || model.startsWith('claude-code:')) {
     const parsed = ModelIdentifier.parse(model);
     if (provider === 'claude-code' && parsed.provider !== 'claude-code') {
@@ -129,7 +152,9 @@ interface SpawnSessionArgs {
   title?: string;
   prompt: string;
   useWorktree?: boolean;
+  provider?: string;
   model?: string;
+  claudeCodeBackend?: string;
   /**
    * When true and `model` is not explicitly set, the new session uses the
    * caller's model instead of the global app default. Ignored if `model` is
@@ -157,6 +182,148 @@ interface SpawnSessionArgs {
    * `model` there is no inherit-from-caller mode.
    */
   effortLevel?: string;
+}
+
+interface PublicClaudeCodeBackend {
+  id: string;
+  provider: string;
+  persistedModel: string;
+  model: string;
+}
+
+interface ResolvedChildModel {
+  provider: AIProviderType;
+  normalizedModel: string;
+  claudeCodeBackend?: PublicClaudeCodeBackend;
+  runtimeRoutes?: Readonly<ClaudeAgentRuntimeRouteBundle>;
+}
+
+function getProviderCatalogResolution(): ProviderCatalogResolution {
+  return ClaudeCodeDeps.providerCatalogResolutionLoader?.()
+    ?? resolveProviderCatalog(BUILT_IN_PROVIDER_CATALOG, undefined);
+}
+
+function toPublicClaudeCodeBackend(entry: ProviderCatalogEntry): PublicClaudeCodeBackend {
+  return {
+    id: entry.id,
+    provider: entry.provider,
+    persistedModel: entry.model.persistedId,
+    model: entry.model.providerModelId,
+  };
+}
+
+function resolveCatalogRouteForChild(
+  model: string | undefined,
+  backendId: string | undefined,
+  workspacePath: string,
+): {
+  entry: ProviderCatalogEntry;
+  runtimeRoutes: Readonly<ClaudeAgentRuntimeRouteBundle>;
+} | undefined {
+  const resolution = getProviderCatalogResolution();
+  const candidate = resolution.entries.find((entry) =>
+    entry.id === backendId || entry.model.persistedId === model
+  );
+  const credentialReferences = candidate?.interfaces.map((catalogInterface) =>
+    catalogInterface.credentialRef
+  ) ?? [];
+  const credentialPresence = getProviderRouteCredentialPresence(
+    credentialReferences,
+    { workspacePath },
+  );
+  const runtimeRoutes = resolveClaudeAgentRuntimeRoutes(
+    resolution,
+    { model, claudeCodeBackend: backendId },
+    credentialPresence,
+  );
+  if (!runtimeRoutes) return undefined;
+  const entry = resolution.entries.find(
+    (candidateEntry) => candidateEntry.id === runtimeRoutes.main.model.catalogEntryId
+  );
+  if (!entry) {
+    throw new Error(
+      `Provider catalog route ${runtimeRoutes.main.model.catalogEntryId} has no accepted catalog entry.`
+    );
+  }
+  return { entry, runtimeRoutes };
+}
+
+async function resolveChildSessionModelAndProvider(
+  parentSessionId: string,
+  workspacePath: string,
+  args: Pick<CreateChildSessionArgs, 'provider' | 'model' | 'claudeCodeBackend'>,
+): Promise<ResolvedChildModel> {
+  let parentProvider: string | null = null;
+  let parentModel: string | null = null;
+  try {
+    const parentSession = await AISessionsRepository.get(parentSessionId);
+    if (parentSession) {
+      parentProvider = parentSession.provider ?? null;
+      parentModel = normalizeStoredChildModelIdentifier(parentProvider, parentSession.model ?? null);
+    }
+  } catch {
+    // Orphan callers fall through to the configured/default model.
+  }
+
+  const configuredDefaultModel = normalizeStoredChildModelIdentifier(null, getDefaultAIModel());
+  const defaultModel = parentModel || configuredDefaultModel || 'claude-code:opus';
+  const parsedExplicitModel = args.model ? ModelIdentifier.tryParse(args.model) : null;
+  const explicitModelProvider = isCatalogPersistedModelId(args.model ?? '')
+    ? 'claude-code'
+    : parsedExplicitModel?.provider ?? null;
+  if (
+    args.provider &&
+    explicitModelProvider &&
+    args.provider !== explicitModelProvider
+  ) {
+    throw new Error(
+      `provider ${args.provider} does not match model provider ${explicitModelProvider}`
+    );
+  }
+
+  const modelProvider = args.provider ?? explicitModelProvider ?? parentProvider;
+  const explicitModel = normalizeStoredChildModelIdentifier(modelProvider, args.model ?? null);
+  const model = explicitModel || defaultModel;
+  const parsed = ModelIdentifier.tryParse(model);
+  const provider = (args.provider ||
+    parsed?.provider ||
+    (isCatalogPersistedModelId(model) ? 'claude-code' : null) ||
+    parentProvider ||
+    'claude-code') as AIProviderType;
+  const parentModelProvider = parentModel
+    ? (ModelIdentifier.tryParse(parentModel)?.provider ?? parentProvider)
+    : null;
+  let normalizedModel =
+    explicitModel
+    || (parentModel && parentModelProvider === provider ? parentModel : null)
+    || ModelIdentifier.getDefaultModelId(provider);
+
+  const requestedBackendId = args.claudeCodeBackend?.trim() || undefined;
+  const catalogModelSignal = isCatalogPersistedModelId(normalizedModel);
+  if (requestedBackendId || catalogModelSignal) {
+    if (provider !== 'claude-code') {
+      throw new Error(
+        `Claude Code backend ${requestedBackendId ?? normalizedModel} requires provider claude-code, received ${provider}`
+      );
+    }
+    const qualified = resolveCatalogRouteForChild(
+      requestedBackendId && !args.model ? undefined : normalizedModel,
+      requestedBackendId,
+      workspacePath,
+    );
+    if (!qualified) {
+      throw new Error(`Provider catalog route could not be qualified for child model ${normalizedModel}`);
+    }
+    normalizedModel = qualified.runtimeRoutes.main.model.persistedId;
+    return {
+      provider,
+      normalizedModel,
+      claudeCodeBackend: toPublicClaudeCodeBackend(qualified.entry),
+      runtimeRoutes: qualified.runtimeRoutes,
+    };
+  }
+
+  return { provider, normalizedModel };
 }
 
 interface NotifyUserArgs {
@@ -493,7 +660,10 @@ export class MetaAgentService {
   private async createChildSessionInternal(
     metaSessionId: string,
     workspaceId: string,
-    args: CreateChildSessionArgs & { parentSessionIdOverride?: string | null }
+    args: CreateChildSessionArgs & {
+      parentSessionIdOverride?: string | null;
+      resolvedChildSession?: ResolvedChildModel;
+    }
   ): Promise<{
     sessionId: string;
     title: string;
@@ -507,6 +677,7 @@ export class MetaAgentService {
     parentSessionId: string | null;
     /** Effort actually applied, after clamping; null when left on the app default. */
     effortLevel: string | null;
+    claudeCodeBackend?: PublicClaudeCodeBackend;
   }> {
     if (!this.aiService) {
       throw new Error('AI service not initialized');
@@ -535,57 +706,14 @@ export class MetaAgentService {
       );
     }
 
-    // Inherit the calling session's provider+model as the primary fallback so a
-    // non-Claude parent (Gemini, OpenAI-Codex, LM Studio, etc.) spawning a child
-    // via the meta-agent tools without an explicit model does NOT silently land
-    // on the hardcoded Opus default and bill the user's Anthropic pool. Only fall
-    // through to getDefaultAIModel() / the last-resort default when the parent
-    // session cannot be loaded (orphan call) or carries no usable provider+model.
-    // An explicit args.provider/args.model still wins; that is what they are for.
-    let parentProvider: string | null = null;
-    let parentModel: string | null = null;
-    try {
-      const parentSession = await AISessionsRepository.get(metaSessionId);
-      if (parentSession) {
-        parentProvider = parentSession.provider ?? null;
-        parentModel = normalizeStoredChildModelIdentifier(parentProvider, parentSession.model ?? null);
-      }
-    } catch {
-      // Best-effort lookup; fall through to the hardcoded default below.
-    }
-
-    const defaultModel =
-      parentModel
-      || normalizeStoredChildModelIdentifier(null, getDefaultAIModel())
-      || 'claude-code:opus';
-    // For an explicit model, the model's own "provider:" prefix is
-    // authoritative (e.g. a claude-code parent launching an
-    // "openai-codex:gpt-5.5" action). Only fall back to the parent's provider
-    // for a bare, prefix-less variant; passing the parent provider for a
-    // self-describing identifier wrongly trips the claude-code mismatch guard.
-    const explicitModelProvider =
-      args.provider
-      ?? (args.model?.includes(':') ? ModelIdentifier.tryParse(args.model)?.provider ?? null : null)
-      ?? parentProvider;
-    const explicitModel = normalizeStoredChildModelIdentifier(explicitModelProvider, args.model ?? null);
-    const model = explicitModel || defaultModel;
-    const parsed = ModelIdentifier.tryParse(model);
-    const provider = (args.provider ||
-      parsed?.provider ||
-      parentProvider ||
-      'claude-code') as AIProviderType;
-    // Provider and model MUST agree. Otherwise a child is persisted with, e.g.,
-    // provider=claude-code + an antigravity-gemini model, gets routed to the
-    // Claude Code provider, is rejected ("requires a claude-code:* identifier"),
-    // and dies with no output. Only reuse the parent model when it actually
-    // belongs to the resolved provider; otherwise use that provider default.
-    const parentModelProvider = parentModel
-      ? (ModelIdentifier.tryParse(parentModel)?.provider ?? parentProvider)
-      : null;
-    const normalizedModel =
-      explicitModel
-      || (parentModel && parentModelProvider === provider ? parentModel : null)
-      || ModelIdentifier.getDefaultModelId(provider);
+    const resolvedChild = args.resolvedChildSession
+      ?? await resolveChildSessionModelAndProvider(metaSessionId, workspaceId, args);
+    const {
+      provider,
+      normalizedModel,
+      claudeCodeBackend,
+      runtimeRoutes,
+    } = resolvedChild;
 
     const callerProvidedTitle = !!args.title?.trim();
     const title = (args.title || this.deriveTitleFromPrompt(args.prompt) || 'Meta Task').trim();
@@ -712,6 +840,14 @@ export class MetaAgentService {
       agentRole: 'standard',
       createdBySessionId: metaSessionId,
       parentSessionId: args.parentSessionIdOverride ?? null,
+      ...(runtimeRoutes
+        ? {
+            metadata: {
+              [PROVIDER_RUNTIME_ROUTE_METADATA_KEY]:
+                createDurableProviderRuntimeRouteSnapshot(runtimeRoutes),
+            },
+          }
+        : {}),
       // When the meta-agent (or any caller of spawn_session) supplies an
       // explicit title, treat the session as already named. claude-code reads
       // this flag (via documentContext.hasBeenNamed) to set hasOutOfBandNaming
@@ -799,6 +935,7 @@ export class MetaAgentService {
       queuedInitialPrompt: !!initialPrompt,
       parentSessionId: args.parentSessionIdOverride ?? null,
       effortLevel: childEffortLevel ?? null,
+      ...(claudeCodeBackend ? { claudeCodeBackend } : {}),
     };
   }
 
@@ -817,6 +954,21 @@ export class MetaAgentService {
     }
 
     const isolated = args.isolated === true;
+
+    const effectiveModel =
+      args.model ?? (args.inheritModel ? parent.model ?? undefined : undefined);
+    // This is deliberately before workstream/worktree/session mutation. The
+    // qualified result is passed into creation so spawn performs one catalog
+    // admission rather than resolving or falling back a second time.
+    const resolvedChildSession = await resolveChildSessionModelAndProvider(
+      parentSessionId,
+      workspaceId,
+      {
+        provider: args.provider,
+        model: effectiveModel,
+        claudeCodeBackend: args.claudeCodeBackend,
+      },
+    );
 
     // Sibling mode: resolve (or create) a workstream container so the new
     // session shares files-edited, tabs, and workstream overview with the
@@ -839,20 +991,16 @@ export class MetaAgentService {
     const inheritedWorktreeId =
       !args.useWorktree && parent.worktreeId ? parent.worktreeId : undefined;
 
-    // Resolve effective model: explicit `model` wins; otherwise `inheritModel`
-    // copies the caller's model so the new session keeps the same provider/model
-    // (e.g. opus stays on opus). Falling through to undefined lets
-    // createChildSessionInternal use the global default.
-    const effectiveModel =
-      args.model ?? (args.inheritModel ? parent.model ?? undefined : undefined);
-
     const childResult = await this.createChildSessionInternal(parentSessionId, workspaceId, {
       title: args.title,
       prompt: args.prompt,
       useWorktree: !!args.useWorktree,
       worktreeId: inheritedWorktreeId,
+      provider: args.provider,
       model: effectiveModel,
       effortLevel: args.effortLevel,
+      claudeCodeBackend: args.claudeCodeBackend,
+      resolvedChildSession,
       parentSessionIdOverride: workstreamId,
     });
 

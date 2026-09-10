@@ -10,6 +10,7 @@ export * from './providers/claudeCode/customBackends';
 export * from './providers/claudeCode/providerCatalog';
 export * from './providers/claudeCode/providerCatalogDefaults';
 export * from './providers/claudeCode/providerCatalogLoader';
+export * from './providers/claudeCode/runtimeRouteResolver';
 export * from './providers/OpenAIProvider';
 export * from './providers/OpenAICodexProvider';
 export * from './providers/OpenAICodexACPProvider';

@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * TeammateManager: manages the lifecycle, messaging, and state of managed teammates
  * spawned by the lead agent via query().
@@ -15,6 +16,11 @@ import path from 'path';
 import fsp from 'fs/promises';
 import os from 'os';
 import { resolveClaudeConfigDir } from './claudeCode/claudeConfigDir';
+import {
+  ProviderRuntimeRouteError,
+  serializeProviderRuntimeRouteReceipt,
+  type ProviderRuntimeRouteReceipt,
+} from './claudeCode/runtimeRouteResolver';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -97,6 +103,64 @@ export interface PackagedBuildOptions {
   pathToClaudeCodeExecutable?: string;
 }
 
+/**
+ * Immutable provider route prepared by the lead's SDK-options builder. This is
+ * used in both packaged and development launches so a teammate cannot inherit
+ * a process, shell, or task-requested route.
+ */
+export interface RuntimeTeammateRouteOptions extends PackagedBuildOptions {
+  exactModel: string;
+  routeReceipt: Readonly<ProviderRuntimeRouteReceipt>;
+  thinking?: Readonly<{ type: string }>;
+}
+
+function assertRuntimeTeammateRoute(
+  route: RuntimeTeammateRouteOptions,
+): void {
+  const { routeReceipt, exactModel, env } = route;
+  const identityMatches =
+    routeReceipt.requested.consumer === 'claude-subagent' &&
+    routeReceipt.resolved.catalogEntryId === routeReceipt.requested.catalogEntryId &&
+    routeReceipt.resolved.persistedModelId === routeReceipt.requested.persistedModelId &&
+    routeReceipt.selectedInterface.credentialReferencePresent === true &&
+    routeReceipt.selectedInterface.modelAlias === exactModel &&
+    routeReceipt.confirmationState === 'confirmed' &&
+    routeReceipt.fallbackUsed === false &&
+    env.ANTHROPIC_MODEL === exactModel &&
+    env.CLAUDE_CODE_SUBAGENT_MODEL === exactModel &&
+    env.CLAUDE_CODE_NO_MODEL_FALLBACK === '1' &&
+    Boolean(env.ANTHROPIC_BASE_URL) &&
+    !Object.keys(env).some((key) => {
+      const normalized = key.toUpperCase();
+      return normalized === 'ANTHROPIC_API_KEY' || normalized === 'OPENAI_API_KEY';
+    });
+  if (!identityMatches) {
+    throw new ProviderRuntimeRouteError(
+      'identity-mismatch',
+      `Provider route ${routeReceipt.resolved.catalogEntryId} cannot launch a teammate from an invalid immutable route.`,
+      routeReceipt.resolved.catalogEntryId,
+    );
+  }
+}
+
+function collectNativeChildAgentId(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    return value.match(/\bagentId:\s*([A-Za-z0-9@._-]+)/)?.[1];
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const agentId = collectNativeChildAgentId(item);
+      if (agentId) return agentId;
+    }
+    return undefined;
+  }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return collectNativeChildAgentId(record.text ?? record.content);
+  }
+  return undefined;
+}
+
 // ─── Class ──────────────────────────────────────────────────────────────────
 
 export class TeammateManager {
@@ -130,6 +194,8 @@ export class TeammateManager {
 
   /** Packaged-build options set by ClaudeCodeProvider for production Electron builds */
   packagedBuildOptions?: PackagedBuildOptions;
+  /** Exact route/receipt set once per lead launch; absent for native Claude. */
+  runtimeRouteOptions?: RuntimeTeammateRouteOptions;
   private static readonly EMIT_DEBOUNCE_MS = 100;
 
   /** Captured from lead's sendMessage() for teammate spawning. */
@@ -138,6 +204,55 @@ export class TeammateManager {
   lastUsedPermissionsPath?: string;
 
   constructor(private readonly deps: TeammateManagerDeps) {}
+
+  /**
+   * SDK-native Agent and Task children inherit the lead process environment.
+   * Record the already-confirmed subagent receipt without serializing either a
+   * credential or the arbitrary tool result.
+   */
+  recordNativeAgentToolResult(
+    sessionId: string | undefined,
+    toolName: string,
+    toolArguments: Record<string, unknown> | undefined,
+    toolResult: unknown,
+    isError: boolean,
+  ): void {
+    if ((toolName !== 'Agent' && toolName !== 'Task') || isError) return;
+    const route = this.runtimeRouteOptions;
+    if (!route) return;
+    assertRuntimeTeammateRoute(route);
+    if (!sessionId) {
+      throw new ProviderRuntimeRouteError(
+        'immutable-session-route',
+        `Provider route ${route.routeReceipt.resolved.catalogEntryId} requires a stable manager session for a native child receipt.`,
+        route.routeReceipt.resolved.catalogEntryId,
+      );
+    }
+    const agentId = collectNativeChildAgentId(toolResult);
+    if (!agentId) {
+      throw new ProviderRuntimeRouteError(
+        'identity-mismatch',
+        `Provider route ${route.routeReceipt.resolved.catalogEntryId} native child result omitted its agent identity.`,
+        route.routeReceipt.resolved.catalogEntryId,
+      );
+    }
+    const agentName =
+      typeof toolArguments?.name === 'string'
+        ? toolArguments.name
+        : 'native-agent';
+    this.deps.logNonBlocking(
+      sessionId,
+      'claude-code',
+      'output',
+      serializeProviderRuntimeRouteReceipt(route.routeReceipt),
+      {
+        messageType: 'native_agent_provider_runtime_route',
+        nativeAgentId: agentId,
+        nativeAgentName: agentName,
+        catalogEntryId: route.routeReceipt.resolved.catalogEntryId,
+      },
+    );
+  }
 
   // ─── Teammate-to-lead message queue ────────────────────────────────────
 
@@ -1192,7 +1307,6 @@ export class TeammateManager {
 
       await AISessionsRepository.updateMetadata(sessionId, {
         metadata: {
-          ...currentMetadata,
           currentTeammates: updatedTeammates,
         }
       });
@@ -1426,10 +1540,15 @@ export class TeammateManager {
 
     // Build environment: use packaged build env if available (production Electron),
     // otherwise fall back to process.env (development mode)
-    const baseEnv = this.packagedBuildOptions?.env ?? process.env;
+    const runtimeRoute = this.runtimeRouteOptions;
+    if (runtimeRoute) {
+      assertRuntimeTeammateRoute(runtimeRoute);
+    }
+    const baseEnv = runtimeRoute?.env ?? this.packagedBuildOptions?.env ?? process.env;
 
     const options: any = {
-      model: model || 'haiku',
+      model: runtimeRoute?.exactModel ?? (model || 'haiku'),
+      ...(runtimeRoute?.thinking && { thinking: runtimeRoute.thinking }),
       maxTurns: 20,
       permissionMode: 'default',
       persistSession: true,
@@ -1469,6 +1588,20 @@ export class TeammateManager {
     // Apply packaged-build options (production Electron)
     if (this.packagedBuildOptions?.pathToClaudeCodeExecutable) {
       options.pathToClaudeCodeExecutable = this.packagedBuildOptions.pathToClaudeCodeExecutable;
+    }
+
+    if (runtimeRoute && sessionId) {
+      this.deps.logNonBlocking(
+        sessionId,
+        'claude-code',
+        'output',
+        serializeProviderRuntimeRouteReceipt(runtimeRoute.routeReceipt),
+        {
+          messageType: 'teammate_provider_runtime_route',
+          teammateAgentId: agentId,
+          teammateName: name,
+        }
+      );
     }
 
     if (resumeSessionId) {

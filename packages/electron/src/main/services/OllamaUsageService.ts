@@ -46,7 +46,7 @@
 
 import { BrowserWindow } from 'electron';
 import { logger } from '../utils/logger';
-import { getProviderApiKeyFromSettings } from '../utils/store';
+import { resolveProviderCredential } from './ai/workspaceEnvCredentials';
 
 
 export interface OllamaUsageModelBreakdown {
@@ -257,7 +257,7 @@ class OllamaUsageServiceImpl {
   private async fetchAccountUsage(): Promise<
     Pick<OllamaUsageData, 'limitsAvailable' | 'session' | 'weekly' | 'costUSD' | 'costPeriod' | 'error'>
   > {
-    const apiKey = getProviderApiKeyFromSettings('ollama');
+    const apiKey = resolveProviderCredential('ollama', 'OLLAMA_API_KEY');
     if (!apiKey) {
       logger.main.debug('[OllamaUsageService] No Ollama API key configured; account usage unavailable.');
       return { limitsAvailable: false, error: 'Ollama API key not configured in settings.' };

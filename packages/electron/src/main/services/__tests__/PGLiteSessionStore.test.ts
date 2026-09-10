@@ -1,4 +1,15 @@
+// [ASTRA-ORCH]
 import { describe, expect, it, vi } from 'vitest';
+import { PGlite } from '@electric-sql/pglite';
+import {
+  BUILT_IN_PROVIDER_CATALOG,
+  CLAUDEX_SOL_ENTRY_ID,
+  DEEPSEEK_V4_FLASH_OPENROUTER_ENTRY_ID,
+  REVIEWED_PROVIDER_CREDENTIAL_REFERENCES,
+  resolveProviderCatalog,
+} from '@nimbalyst/runtime/ai/server';
+import { persistProviderRuntimeRouteSnapshot } from '@nimbalyst/runtime/ai/server/providers/claudeCode/providerRuntimeRoutePersistence';
+import { resolveClaudeAgentRuntimeRoutes } from '@nimbalyst/runtime/ai/server/providers/claudeCode/runtimeRouteResolver';
 import {
   createPGLiteSessionStore,
   getAllSessionsForSync,
@@ -35,6 +46,135 @@ describe('PGLiteSessionStore archive filters', () => {
 
     expect(queries[0]).toContain('LEFT JOIN worktrees w ON s.worktree_id = w.id');
     expect(queries[0]).toContain('(s.worktree_id IS NULL OR w.is_archived = FALSE OR w.is_archived IS NULL)');
+  });
+});
+describe('PGLiteSessionStore atomic provider route metadata', () => {
+  it('allows one competing route winner, rejects the loser, and preserves unrelated metadata', async () => {
+    let metadata = JSON.stringify({ unrelated: { preserved: true } });
+    let initialSelects = 0;
+    let releaseInitialReads!: () => void;
+    const initialReadsReady = new Promise<void>((resolve) => {
+      releaseInitialReads = resolve;
+    });
+    const db = {
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        if (/^SELECT metadata FROM ai_sessions/i.test(sql.trim())) {
+          const snapshot = metadata;
+          initialSelects += 1;
+          if (initialSelects === 2) releaseInitialReads();
+          if (initialSelects <= 2) await initialReadsReady;
+          return { rows: [{ metadata: snapshot }] };
+        }
+        if (/UPDATE ai_sessions\s+SET metadata = \$3/i.test(sql)) {
+          const expected = params[1];
+          const next = params[2] as string;
+          if (metadata !== expected) return { rows: [] };
+          metadata = next;
+          return { rows: [{ metadata }] };
+        }
+        throw new Error(`Unexpected atomic-route query: ${sql}`);
+      }),
+    };
+    const store = createPGLiteSessionStore(db as any);
+    const resolution = resolveProviderCatalog(
+      BUILT_IN_PROVIDER_CATALOG,
+      undefined,
+    );
+    const credentialReferences = Object.fromEntries(
+      REVIEWED_PROVIDER_CREDENTIAL_REFERENCES.map((reference) => [
+        reference,
+        true,
+      ]),
+    );
+    const routesFor = (catalogEntryId: string) => {
+      const entry = resolution.entries.find(
+        (candidate) => candidate.id === catalogEntryId,
+      );
+      if (!entry) throw new Error(`Missing test catalog entry ${catalogEntryId}`);
+      const routes = resolveClaudeAgentRuntimeRoutes(
+        resolution,
+        { model: entry.model.persistedId },
+        credentialReferences,
+      );
+      if (!routes) throw new Error(`Missing runtime route ${catalogEntryId}`);
+      return routes;
+    };
+    const adapter = {
+      installSessionMetadataValueIfAbsent: (
+        sessionId: string,
+        key: string,
+        value: unknown,
+      ) => store.installMetadataValueIfAbsent!(sessionId, key, value),
+    };
+
+    const results = await Promise.allSettled([
+      persistProviderRuntimeRouteSnapshot(
+        'contended-session',
+        routesFor(CLAUDEX_SOL_ENTRY_ID),
+        adapter,
+      ),
+      persistProviderRuntimeRouteSnapshot(
+        'contended-session',
+        routesFor(DEEPSEEK_V4_FLASH_OPENROUTER_ENTRY_ID),
+        adapter,
+      ),
+    ]);
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find((result) => result.status === 'rejected');
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      reason: {
+        name: 'ProviderRuntimeRouteError',
+        code: 'immutable-session-route',
+      },
+    });
+    const persisted = JSON.parse(metadata);
+    expect(persisted.unrelated).toEqual({ preserved: true });
+    expect(persisted.providerRuntimeRouteSnapshotV1).toBeTruthy();
+  });
+
+  it('executes the compare-and-set contract against a real JSONB row', async () => {
+    const db = new PGlite();
+    try {
+      await db.exec(`
+        CREATE TABLE ai_sessions (
+          id TEXT PRIMARY KEY,
+          metadata JSONB DEFAULT '{}'
+        );
+        INSERT INTO ai_sessions (id, metadata)
+        VALUES ('real-session', '{"unrelated":{"preserved":true}}'::jsonb);
+      `);
+      const store = createPGLiteSessionStore(db as any);
+
+      expect(
+        await store.installMetadataValueIfAbsent!(
+          'real-session',
+          'providerRuntimeRouteSnapshotV1',
+          { catalogEntryId: CLAUDEX_SOL_ENTRY_ID },
+        ),
+      ).toEqual({ catalogEntryId: CLAUDEX_SOL_ENTRY_ID });
+      expect(
+        await store.installMetadataValueIfAbsent!(
+          'real-session',
+          'providerRuntimeRouteSnapshotV1',
+          { catalogEntryId: DEEPSEEK_V4_FLASH_OPENROUTER_ENTRY_ID },
+        ),
+      ).toEqual({ catalogEntryId: CLAUDEX_SOL_ENTRY_ID });
+
+      const { rows } = await db.query<{ metadata: Record<string, unknown> }>(
+        'SELECT metadata FROM ai_sessions WHERE id = $1',
+        ['real-session'],
+      );
+      expect(rows[0]?.metadata).toMatchObject({
+        unrelated: { preserved: true },
+        providerRuntimeRouteSnapshotV1: {
+          catalogEntryId: CLAUDEX_SOL_ENTRY_ID,
+        },
+      });
+    } finally {
+      await db.close();
+    }
   });
 });
 
@@ -485,6 +625,70 @@ describe('PGLiteSessionStore.updateMetadata defense-in-depth', () => {
     expect(updateCalls.length).toBe(0);
     expect(warn).toHaveBeenCalled();
     warn.mockRestore();
+  });
+
+  it('serializes concurrent shallow metadata patches so recovery and unrelated fields both survive', async () => {
+    let storedMetadata = '{}';
+    let updateCount = 0;
+    let releaseFirstUpdate!: () => void;
+    const firstUpdateBlocked = new Promise<void>((resolve) => {
+      releaseFirstUpdate = resolve;
+    });
+    let firstUpdateEntered!: () => void;
+    const firstUpdateStarted = new Promise<void>((resolve) => {
+      firstUpdateEntered = resolve;
+    });
+
+    const db = {
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        if (/SELECT\s+metadata\s+FROM\s+ai_sessions/i.test(sql)) {
+          return { rows: [{ metadata: storedMetadata }] };
+        }
+        if (/UPDATE\s+ai_sessions\s+SET\s+metadata\s*=/i.test(sql)) {
+          updateCount += 1;
+          const nextMetadata = String(params[params.length - 1]);
+          if (updateCount === 1) {
+            firstUpdateEntered();
+            await firstUpdateBlocked;
+          }
+          storedMetadata = nextMetadata;
+          return { rows: [] };
+        }
+        return { rows: [] };
+      }),
+    };
+    const recoveryStore = createPGLiteSessionStore(db as any);
+    const unrelatedStore = createPGLiteSessionStore(db as any);
+
+    const recoveryPatch = recoveryStore.updateMetadata('s1', {
+      metadata: {
+        backgroundAgentRecovery: {
+          version: 1,
+          tasks: { generation1: { recoveryState: 'claimed' } },
+        },
+      },
+    });
+    await firstUpdateStarted;
+    const unrelatedPatch = unrelatedStore.updateMetadata('s1', {
+      metadata: { phase: 'validating', tags: ['recovery'] },
+    });
+
+    // Drain the promise queue while the first write remains blocked. Without
+    // per-session serialization, the second caller reads the same stale JSON,
+    // writes its patch, and is then overwritten when the first write resumes.
+    for (let index = 0; index < 8; index += 1) await Promise.resolve();
+    releaseFirstUpdate();
+    await Promise.all([recoveryPatch, unrelatedPatch]);
+
+    expect(JSON.parse(storedMetadata)).toEqual({
+      backgroundAgentRecovery: {
+        version: 1,
+        tasks: { generation1: { recoveryState: 'claimed' } },
+      },
+      phase: 'validating',
+      tags: ['recovery'],
+      activity: expect.any(Array),
+    });
   });
 });
 

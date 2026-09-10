@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * The setup half of `ClaudeCodeProvider.sendMessage()`: everything between the
  * caller's arguments and the first chunk off the SDK.
@@ -217,6 +218,11 @@ export interface TurnQueryHost {
   sessions: BuildSdkOptionsDeps['sessions'];
   config: BuildSdkOptionsDeps['config'];
   abortController: AbortController;
+  mainRouteSnapshot?: BuildSdkOptionsDeps['mainRouteSnapshot'];
+  subagentRouteSnapshot?: BuildSdkOptionsDeps['subagentRouteSnapshot'];
+  mainRouteCredential?: BuildSdkOptionsDeps['mainRouteCredential'];
+  subagentRouteCredential?: BuildSdkOptionsDeps['subagentRouteCredential'];
+
   currentMode: SessionMode | undefined;
   /** `BaseAgentProvider.META_AGENT_ALLOWED_TOOLS` (a protected static). */
   metaAgentAllowedTools: readonly string[];
@@ -358,6 +364,11 @@ export async function buildTurnQuery(
       sessions: host.sessions,
       config: host.config,
       abortController: host.abortController,
+      mainRouteSnapshot: host.mainRouteSnapshot,
+      subagentRouteSnapshot: host.subagentRouteSnapshot,
+      mainRouteCredential: host.mainRouteCredential,
+      subagentRouteCredential: host.subagentRouteCredential,
+
     },
     {
       message: state.message,

@@ -237,6 +237,8 @@ import {
   configureOpenCodeModelCatalog,
 } from '@nimbalyst/runtime/ai/server';
 import { configureMcpServers } from '@nimbalyst/runtime/ai/server';
+import { BUILT_IN_PROVIDER_CATALOG } from '@nimbalyst/runtime/ai/server/providers/claudeCode/providerCatalogDefaults';
+import { readProviderCatalog } from '@nimbalyst/runtime/ai/server/providers/claudeCode/providerCatalogLoader';
 import { matchesAllowPattern } from '@nimbalyst/runtime/ai/server/permissions/toolPermissionHelpers';
 import { resolveCodexPreEditHookScriptPath } from './services/ai/codexPreEditHookPath';
 import {configureCodexShellTracking} from './services/ai/codexShellTrackingHost';
@@ -344,6 +346,7 @@ import {
     FEEDBACK_REQUEST_DEEP_LINK_HOST,
     parseFeedbackRequestDeepLink,
 } from '../shared/feedbackRequestLinks';
+import { createProviderRouteCredentialResolver } from './services/ai/providerRouteCredentialResolver';
 
 setAuthCallbackSuccessHandler(async () => {
   try {
@@ -2291,6 +2294,15 @@ runIfSingleInstanceLifecycleOwner(singleInstanceLifecycle, () => {
 
     ClaudeCodeProvider.setMcpWithheldNamesLoader(
         (workspacePath?: string) => claudeAgentWithheldServerNames.get(withheldNamesKey(workspacePath)) ?? []
+    );
+    // Route data contains named credential references only. Resolve the current
+    // reviewed host material at the provider's final lifecycle boundary and
+    // reload the user overlay for each provider initialization.
+    ClaudeCodeProvider.setProviderCredentialResolver(
+        createProviderRouteCredentialResolver()
+    );
+    ClaudeCodeProvider.setProviderCatalogResolutionLoader(
+        () => readProviderCatalog(BUILT_IN_PROVIDER_CATALOG).resolution
     );
     OpenAICodexProvider.setMCPConfigLoader(async (workspacePath?: string) => {
         if (!mcpConfigService) {

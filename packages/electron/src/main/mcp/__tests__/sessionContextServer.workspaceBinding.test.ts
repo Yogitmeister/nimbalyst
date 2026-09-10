@@ -43,6 +43,9 @@ vi.mock('../../services/SessionWakeupScheduler', () => ({
 vi.mock('electron', () => ({
   BrowserWindow: { getAllWindows: getAllWindowsMock },
 }));
+vi.mock('../../utils/workspaceDetection', () => ({
+  resolveProjectPath: (workspacePath: string) => workspacePath,
+}));
 
 import { dispatchSessionContextTool } from '../sessionContextServer';
 

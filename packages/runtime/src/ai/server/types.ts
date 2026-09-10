@@ -520,6 +520,8 @@ export interface SessionData {
 
 export interface ProviderConfig {
   apiKey?: string;
+  /** Stable project scope for explicit per-workspace provider credentials. */
+  workspacePath?: string;
   model?: string;
   maxTokens?: number;
   temperature?: number;
@@ -533,6 +535,11 @@ export interface ProviderConfig {
    */
   agentRole?: string;
   thinkingMode?: ThinkingMode;  // Extended thinking mode for Claude Agent (enabled/disabled)
+  customBackend?: string;  // Per-session Claude Agent backend selected by a synthetic model profile (DeepSeek)
+  /**
+   * Claude Code only: exact per-session backend profile. The profile is
+   * resolved for every turn and unknown values fail closed. (Ollama fleet)
+   */
   claudeCodeBackend?: string;
   providerControlSnapshot?: Readonly<ProviderControlSnapshot>; // Immutable reviewed route/control receipt
   responseFormat?: ProviderResponseFormat;  // Response format constraint (extension chat completions)

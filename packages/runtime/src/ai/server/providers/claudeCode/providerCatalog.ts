@@ -289,6 +289,10 @@ const CATALOG_PERSISTED_ID_NAMESPACES = new Set([
 ]);
 export const REVIEWED_PROVIDER_CREDENTIAL_REFERENCES = [
   "nimbalyst.local-proxy",
+  "workspace.claudex-ingress",
+  "workspace.deepseek-api",
+  "workspace.openrouter-api",
+  "workspace.ollama-api",
 ] as const;
 const REVIEWED_CREDENTIAL_REFERENCES = new Set<string>(
   REVIEWED_PROVIDER_CREDENTIAL_REFERENCES
@@ -296,7 +300,7 @@ const REVIEWED_CREDENTIAL_REFERENCES = new Set<string>(
 const SECRET_LIKE_CREDENTIAL_REFERENCE_PATTERN =
   /^(?:api|auth|bearer|key|password|pk|secret|sk|token)[._-]/;
 const REVIEWED_ANTHROPIC_PROXY_BASE_PATH_PATTERN =
-  /^\/(?:(?:(?:anthropic|api|openai)\/)?v[0-9]+\/?)?$/;
+  /^\/(?:(?:anthropic|api|openai)(?:\/v[0-9]+)?|v[0-9]+)?\/?$/;
 
 export function isCatalogPersistedModelId(model: string): boolean {
   return [...CATALOG_PERSISTED_ID_NAMESPACES].some((namespace) =>
@@ -1140,6 +1144,41 @@ function parseMigrationRecord(value: unknown): {
   };
 }
 
+/**
+ * True when an overlay patch would pin the retired local-proxy transport onto a
+ * built-in route that has already moved off it. See the call site for why these
+ * patches exist and why they carry no user intent.
+ */
+function pinsRetiredLocalProxy(
+  base: ProviderCatalogEntry | undefined,
+  patch: Readonly<Record<string, unknown>>
+): boolean {
+  if (!base) return false;
+  const patchedInterfaces = patch.interfaces;
+  if (!Array.isArray(patchedInterfaces)) return false;
+  const localProxyRef = REVIEWED_PROVIDER_CREDENTIAL_REFERENCES[0];
+  if (
+    base.interfaces.some(
+      (candidate) => candidate.credentialRef === localProxyRef
+    )
+  ) {
+    return false;
+  }
+  return patchedInterfaces.some(
+    (candidate) =>
+      isRecord(candidate) && candidate.credentialRef === localProxyRef
+  );
+}
+
+function omitKey(
+  source: Readonly<Record<string, unknown>>,
+  key: string
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(source).filter(([candidate]) => candidate !== key)
+  );
+}
+
 export function resolveProviderCatalog(
   defaults: readonly ProviderCatalogEntry[],
   overlay: unknown,
@@ -1301,9 +1340,19 @@ export function resolveProviderCatalog(
           );
           return;
         }
+        // The legacy ollama-backends.json migration wrote a snapshot of the
+        // then-current defaults into this overlay, LiteLLM local-proxy
+        // interface included. That snapshot restated the built-in rather than
+        // expressing user intent, so once a built-in route leaves the local
+        // proxy the stale patch must not resurrect the retired transport
+        // underneath it -- otherwise a shipped route change is silently undone
+        // on every machine that ever ran the migration.
+        const effectivePatch = pinsRetiredLocalProxy(base, candidate.patch)
+          ? omitKey(candidate.patch, "interfaces")
+          : candidate.patch;
         const merged = base
-          ? deepMerge(base, candidate.patch)
-          : { id: candidate.id, ...cloneJson(candidate.patch) };
+          ? deepMerge(base, effectivePatch)
+          : { id: candidate.id, ...cloneJson(effectivePatch) };
         const entryError = validateProviderCatalogEntry(merged, candidate.id);
         if (entryError) {
           byId.delete(candidate.id);

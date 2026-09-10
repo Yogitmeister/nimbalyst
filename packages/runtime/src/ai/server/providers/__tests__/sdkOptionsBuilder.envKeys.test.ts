@@ -172,6 +172,68 @@ describe('buildSdkOptions env-key hardening', () => {
     expect(options.env!.ANTHROPIC_API_KEY).toBe('sk-ant-user-configured');
   });
 
+  it('rejects a route receipt that permits fallback before MCP or SDK launch setup', async () => {
+    const getMcpServersSnapshot = vi.fn(async () => ({}));
+    const invalidSnapshot = {
+      plan: {
+        requested: {
+          catalogEntryId: 'synthetic-route',
+          persistedModelId: 'claude-code:ollama-synthetic-route',
+          consumer: 'claude-agent-main',
+        },
+        model: {
+          catalogEntryId: 'synthetic-route',
+          persistedId: 'claude-code:ollama-synthetic-route',
+          providerModelId: 'synthetic-model',
+        },
+        selectedInterface: {
+          id: 'synthetic-interface',
+          credentialRef: 'nimbalyst.local-proxy',
+          credentialReferencePresent: true,
+          modelAlias: 'synthetic-model',
+        },
+        confirmationState: 'confirmed',
+        fallbackUsed: false,
+      },
+      receipt: {
+        requested: {
+          catalogEntryId: 'synthetic-route',
+          persistedModelId: 'claude-code:ollama-synthetic-route',
+          consumer: 'claude-agent-main',
+        },
+        resolved: {
+          catalogEntryId: 'synthetic-route',
+          persistedModelId: 'claude-code:ollama-synthetic-route',
+          providerModelId: 'synthetic-model',
+        },
+        selectedInterface: {
+          id: 'synthetic-interface',
+          credentialRef: 'nimbalyst.local-proxy',
+          credentialReferencePresent: true,
+          modelAlias: 'synthetic-model',
+        },
+        confirmationState: 'confirmed',
+        fallbackUsed: true,
+      },
+    };
+
+    await expect(
+      buildSdkOptions(
+        makeDeps({
+          getMcpServersSnapshot,
+          mainRouteSnapshot: invalidSnapshot as never,
+          mainRouteCredential: 'x'.repeat(64),
+        }),
+        makeParams(),
+      ),
+    ).rejects.toMatchObject({
+      name: 'ProviderRuntimeRouteError',
+      code: 'identity-mismatch',
+      stage: 'pre-mutation',
+    });
+    expect(getMcpServersSnapshot).not.toHaveBeenCalled();
+  });
+
   it('sets the base env flags buildSdkOptions applies to every spawn', async () => {
     delete process.env.CLAUDE_CODE_ENTRYPOINT;
     delete process.env.ENABLE_TOOL_SEARCH;

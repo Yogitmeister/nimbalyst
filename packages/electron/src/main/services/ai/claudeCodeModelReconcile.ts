@@ -1,14 +1,19 @@
 // [ASTRA-ORCH]
 import { CLAUDE_CODE_VARIANTS, ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
-import { CLAUDE_CODE_BACKENDS } from '@nimbalyst/runtime/ai/server';
+import { listLaunchableCatalogRoutes } from '@nimbalyst/runtime/ai/server';
 
 /**
  * The full set of shipped Claude Code model ids: the base variants from
- * `CLAUDE_CODE_VARIANTS`, plus the catalog-backed brain-swap routes exposed by
- * `CLAUDE_CODE_BACKENDS`. This is the canonical enabled list for a fresh
- * install, and the catalog the saved allow-list is reconciled against — so a
- * newly-added model can never be silently dropped from the picker again (the
- * drift that hid Fable 5 and sonnet-4-6).
+ * `CLAUDE_CODE_VARIANTS`, plus every catalog route that can open a lead
+ * session. This is the canonical enabled list for a fresh install, and the
+ * catalog the saved allow-list is reconciled against — so a newly-added model
+ * can never be silently dropped from the picker again (the drift that hid
+ * Fable 5 and sonnet-4-6).
+ *
+ * It reads the catalog, not the legacy `CLAUDE_CODE_BACKENDS` projection:
+ * that projection only accepted local-proxy routes, so direct-API brains would
+ * be exported by the provider and then filtered straight back out by an
+ * existing install's exclusive allow-list. Both gates have to agree.
  *
  * The catalog routes belong here for the same reason the variants do. They are
  * `claude-code` picker rows, an explicit allow-list is exclusive, and there is
@@ -18,7 +23,7 @@ import { CLAUDE_CODE_BACKENDS } from '@nimbalyst/runtime/ai/server';
 export function claudeCodeCatalogModelIds(): string[] {
   return [
     ...CLAUDE_CODE_VARIANTS.map((v) => ModelIdentifier.create('claude-code', v).combined),
-    ...CLAUDE_CODE_BACKENDS.map((backend) => backend.persistedModel),
+    ...listLaunchableCatalogRoutes().map((entry) => entry.model.persistedId),
   ];
 }
 

@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { createPGLiteSessionStore } from '../../PGLiteSessionStore';
@@ -18,12 +19,18 @@ function makeFakeDb(initialMetadata: Record<string, unknown> | null) {
       if (trimmed.startsWith('SELECT metadata FROM ai_sessions')) {
         return { rows: [{ metadata: state.metadata }] as unknown as T[] };
       }
-      if (trimmed.startsWith('UPDATE ai_sessions SET')) {
+      if (/^UPDATE\s+ai_sessions\s+SET/i.test(trimmed)) {
         // The metadata blob is the JSON-stringified param; find it and apply.
-        const jsonParam = params.find(
-          p => typeof p === 'string' && p.startsWith('{') && p.includes('"phase"'),
-        );
-        if (jsonParam) state.metadata = JSON.parse(jsonParam);
+        const returnsMetadata = /RETURNING\s+metadata/i.test(sql);
+        const jsonParam = returnsMetadata
+          ? params[2]
+          : params.find(
+              p => typeof p === 'string' && p.startsWith('{') && p.includes('"phase"'),
+            );
+        if (typeof jsonParam === 'string') state.metadata = JSON.parse(jsonParam);
+        if (returnsMetadata) {
+          return { rows: [{ metadata: state.metadata }] as unknown as T[] };
+        }
         return { rows: [] };
       }
       return { rows: [] };

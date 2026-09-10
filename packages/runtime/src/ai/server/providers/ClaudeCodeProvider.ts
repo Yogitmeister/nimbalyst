@@ -51,17 +51,33 @@ import {
   CLAUDE_CODE_SAFE_FALLBACK_MODEL,
   baseContextWindowForVariant,
 } from '../../modelConstants';
-// NOTE: the original commit's parent also imported providerRouteCredentials/
-// providerRuntimeRoutePersistence/runtimeRouteResolver symbols for the
-// route-pinning system (2ee794998), not carried in this release. Nothing in
-// this file's actual diff (CLAUDE_CODE_BACKENDS enumeration) uses them.
-import { CLAUDE_CODE_BACKENDS } from './claudeCode/customBackends';
+import {
+  CLAUDE_CODE_BACKENDS,
+  listLaunchableCatalogRoutes,
+  PROVIDER_CATALOG_RESOLUTION,
+} from './claudeCode/customBackends';
+import type { ProviderCatalogResolution } from './claudeCode/providerCatalog';
+import {
+  getProviderRouteCredentialPresence,
+  preflightProviderRuntimeCredentials,
+  type ConfirmedProviderRuntimeCredentials,
+} from './claudeCode/providerRouteCredentials';
+import { persistProviderRuntimeRouteSnapshot } from './claudeCode/providerRuntimeRoutePersistence';
+import {
+  ProviderRuntimeRouteError,
+  resolveClaudeAgentRuntimeRoutes,
+  serializeProviderRuntimeRouteReceipt,
+  type ClaudeAgentRuntimeRouteBundle,
+  type ProviderRuntimeSessionSnapshot,
+} from './claudeCode/runtimeRouteResolver';
 import type { InterruptTurnResult } from '../AIProvider';
 import { isBedrockToolSearchError } from '../utils/errorDetection';
 import { AgentMessagesRepository } from '../../../storage/repositories/AgentMessagesRepository';
+import { AISessionsRepository } from '../../../storage/repositories/AISessionsRepository';
 import { TranscriptMigrationRepository } from '../../../storage/repositories/TranscriptMigrationRepository';
 import { TeammateManager, type TeammateToLeadMessage } from './TeammateManager';
 import path from 'path';
+import os from 'os';
 import { buildClaudeCodeSystemPrompt, buildMetaAgentSystemPrompt, type MetaAgentWorkflowPreset } from '../../prompt';
 
 import { SessionManager } from '../SessionManager';
@@ -144,7 +160,19 @@ import { createTurnState } from './claudeCode/turnState';
 import { buildTurnQuery, prepareTurnAttachments, resolveTurnPaths } from './claudeCode/turnPrologue';
 import { finishTurn, handleTurnError, type TurnEpilogueHost } from './claudeCode/turnEpilogue';
 import { applyTaskListMutation, sortTaskList, type TaskListItem } from './claudeCode/taskListReconstruct';
+import {
+  BackgroundAgentRecoveryCoordinator,
+  inspectClaudeBackgroundAgentTranscript,
+} from './claudeCode/backgroundTaskRecovery';
+import {
+  getClaudeTaskStopTarget,
+  guardClaudeBackgroundAgentRecoveryTool,
+  observeClaudeBackgroundAgentRecoveryToolResult,
+  prepareClaudeBackgroundAgentRecoveryTurn,
+} from './claudeCode/backgroundTaskRecoveryLifecycle';
 
+
+let claudeProviderInstanceSequence = 0;
 
 /**
  * Track changes in the agent-sdk and claude-code itself here:
@@ -166,6 +194,9 @@ export interface ScheduleWakeupRequest {
 /** Display labels for catalog-backed Claude Agent routes in the model picker. */
 const CATALOG_PROVIDER_LABELS: Record<string, string> = {
   ollama: 'Ollama Cloud',
+  openrouter: 'OpenRouter',
+  deepseek: 'DeepSeek',
+  openai: 'Codex',
 };
 
 export class ClaudeCodeProvider extends BaseAgentProvider {
@@ -212,6 +243,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
 
   private markMessagesAsHidden: boolean = false; // Flag to mark next messages as hidden
   private helperMethod: 'native' | 'custom' = 'native';
+  /** Frozen at initialization; every lead and teammate launch derives from it. */
+  private runtimeRoutes: Readonly<ClaudeAgentRuntimeRouteBundle> | undefined;
+  private readonly loggedRuntimeRouteReceipts = new Set<string>();
 
   // Lead query reference for interruptWithMessage support
   private leadQuery: Query | null = null;
@@ -281,7 +315,19 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     // Set from task_updated patches (is_backgrounded): the task's tool call
     // returned a launch acknowledgement, not a completion. See NIM-1470.
     isBackgrounded?: boolean;
+    sourceTurnId?: string;
+    agentName?: string;
   }>();
+
+  private readonly backgroundAgentRecovery: BackgroundAgentRecoveryCoordinator;
+  private readonly recoveryInstanceId: string;
+  private recoveryTurnSequence = 0;
+  private recoverySessionId: string | undefined;
+  private destroying = false;
+  // Monotonic high-water mark for turns covered by explicit user stop intent.
+  // Later turns receive a greater sequence and remain eligible, while late SDK
+  // chunks from any stopped turn stay gated without an unbounded identity set.
+  private explicitUserStopThroughRecoveryTurnSequence = 0;
 
   // Terminal task_notification chunks for background tasks — recorded while
   // draining after the lead turn ended (NIM-1470), and also when a backgrounded
@@ -363,9 +409,24 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   // These forwarding setters maintain backward compatibility for callers.
 
   public static setCustomClaudeCodePathLoader(loader: ((workspacePath: string) => string) | null): void { ClaudeCodeDeps.setCustomClaudeCodePathLoader(loader); }
+  public static setProviderCredentialResolver(loader: ((credentialRef: string, context?: Readonly<{ workspacePath?: string }>) => string | undefined) | null): void { ClaudeCodeDeps.setProviderCredentialResolver(loader); }
+  public static setProviderCatalogResolutionLoader(loader: (() => ProviderCatalogResolution) | null): void { ClaudeCodeDeps.setProviderCatalogResolutionLoader(loader); }
 
   constructor() {
     super();
+    this.recoveryInstanceId = `claude-provider-${process.pid}-${Date.now()}-${++claudeProviderInstanceSequence}`;
+    this.backgroundAgentRecovery = new BackgroundAgentRecoveryCoordinator({
+      instanceId: this.recoveryInstanceId,
+      getSession: async (sessionId) => AISessionsRepository.get(sessionId),
+      mergeSessionMetadata: async (sessionId, patch) => {
+        await AISessionsRepository.updateMetadata(sessionId, { metadata: patch });
+      },
+      inspectTranscript: (input) => inspectClaudeBackgroundAgentTranscript({
+        ...input,
+        projectsDir: process.env.NIMBALYST_CLAUDE_PROJECTS_DIR
+          || path.join(os.homedir(), '.claude', 'projects'),
+      }),
+    });
     this.teammateManager = new TeammateManager({
       logNonBlocking: (sessionId, source, direction, content, metadata) =>
         this.logAgentMessageNonBlocking(sessionId, source, direction, content, metadata),
@@ -457,7 +518,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     workspacePath: string,
     sessionId: string | undefined,
     permissionsPath: string | undefined,
-    isTeammateSession: boolean
+    isTeammateSession: boolean,
+    recoveryTurnId?: string,
+    plannedRecoveryGenerations?: readonly string[],
   ): AgentToolHooks {
     return new AgentToolHooks({
       workspacePath: workspacePath,
@@ -473,8 +536,39 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       getPendingExitPlanModeConfirmations: () => this.pendingExitPlanModeConfirmations,
       getSessionApprovedPatterns: () => this.permissions.sessionApprovedPatterns,
       getPendingToolPermissions: () => this.permissions.pendingToolPermissions,
-      teammatePreToolHandler: async (toolName, toolInput, toolUseID, sessionId) =>
-        this.teammateManager.handlePreToolUse(toolName, toolInput, toolUseID, sessionId),
+      teammatePreToolHandler: async (toolName, toolInput, toolUseID, hookSessionId) => {
+        if (toolName === 'SendMessage' && hookSessionId && recoveryTurnId && toolUseID) {
+          try {
+            const recoveryGuard = await guardClaudeBackgroundAgentRecoveryTool(
+              this.backgroundAgentRecovery,
+              {
+                toolName,
+                sessionId: hookSessionId,
+                turnId: recoveryTurnId,
+                toolUseId: toolUseID,
+                toolInput: toolInput || {},
+                plannedGenerations: plannedRecoveryGenerations,
+              },
+            );
+            if (recoveryGuard.handled) return recoveryGuard;
+          } catch (error) {
+            console.error('[CLAUDE-CODE] Failed to guard native background-agent recovery dispatch:', error);
+            if ((plannedRecoveryGenerations?.length ?? 0) > 0) {
+              return {
+                handled: true,
+                result: {
+                  hookSpecificOutput: {
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'deny',
+                    permissionDecisionReason: 'Background-agent recovery state could not be verified.',
+                  },
+                },
+              };
+            }
+          }
+        }
+        return this.teammateManager.handlePreToolUse(toolName, toolInput, toolUseID, hookSessionId);
+      },
       isTeammateSession: !!isTeammateSession,
       permissionsPath,
       // Undefined on a host with no document history; AgentToolHooks guards
@@ -578,7 +672,32 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     //   config: safeConfig
     // }, null, 2));
 
-    this.config = config;
+    const catalogResolution =
+      ClaudeCodeDeps.providerCatalogResolutionLoader?.() ??
+      PROVIDER_CATALOG_RESOLUTION;
+    const catalogEntry = catalogResolution.entries.find(
+      (entry) =>
+        entry.id === (config as ProviderConfig & { claudeCodeBackend?: string }).claudeCodeBackend ||
+        entry.model.persistedId === config.model
+    );
+    const credentialPresence = getProviderRouteCredentialPresence(
+      catalogEntry?.interfaces.map((catalogInterface) =>
+        catalogInterface.credentialRef
+      ) ?? [],
+      config
+    );
+    this.runtimeRoutes = resolveClaudeAgentRuntimeRoutes(
+      catalogResolution,
+      config,
+      credentialPresence
+    );
+    this.config = this.runtimeRoutes
+      ? {
+          ...config,
+          claudeCodeBackend: this.runtimeRoutes.main.model.catalogEntryId,
+          model: this.runtimeRoutes.main.model.persistedId,
+        }
+      : config;
 
     // Claude Code manages its own authentication - do not require or use API key
   }
@@ -601,6 +720,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     return resolveClaudeCodeModelVariant(this.config.model, CLAUDE_CODE_SAFE_FALLBACK_MODEL);
   }
 
+  private beginRecoveryTurn(): string {
+    return `${this.recoveryInstanceId}:turn-${++this.recoveryTurnSequence}`;
+  }
 
 
   /**
@@ -628,11 +750,40 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     attachments?: any[]
   ): AsyncIterableIterator<StreamChunk> {
     const startTime = Date.now();
-    // NOTE: this turn-start block also depends on the route-pinning system
-    // (2ee794998, not carried) for runtimeRoutes/routeCredentials, and on the
-    // Claude-background-recovery family's beginRecoveryTurn()/recoverySessionId
-    // (not yet landed at this point in the fold sequence) -- left empty here,
-    // to be reconciled once/if that family lands and touches this file again.
+    let mainRouteSnapshot:
+      | Readonly<ProviderRuntimeSessionSnapshot>
+      | undefined;
+    let subagentRouteSnapshot:
+      | Readonly<ProviderRuntimeSessionSnapshot>
+      | undefined;
+    let routeCredentials:
+      | Readonly<ConfirmedProviderRuntimeCredentials>
+      | undefined;
+    if (this.runtimeRoutes) {
+      if (!sessionId) {
+        throw new ProviderRuntimeRouteError(
+          'immutable-session-route',
+          `Provider route ${this.runtimeRoutes.main.model.catalogEntryId} requires a stable session id before launch.`,
+          this.runtimeRoutes.main.model.catalogEntryId
+        );
+      }
+      // This is deliberately the first per-turn gate: no attachment, abort
+      // controller, hook, persistence, queue, or SDK process mutation precedes
+      // credential and route-identity verification.
+      routeCredentials = preflightProviderRuntimeCredentials(
+        this.runtimeRoutes,
+        this.config
+      );
+      const durableRoutes = await persistProviderRuntimeRouteSnapshot(
+        sessionId,
+        this.runtimeRoutes
+      );
+      mainRouteSnapshot = durableRoutes.main;
+      subagentRouteSnapshot = durableRoutes.subagent;
+    }
+    const recoveryTurnId = this.beginRecoveryTurn();
+    const plannedRecoveryGenerations: string[] = [];
+    if (sessionId) this.recoverySessionId = sessionId;
 
     // CRITICAL: Capture hidden mode flag at START and reset immediately
     // This prevents race conditions when concurrent sendMessage calls overlap
@@ -675,13 +826,52 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       workspacePath!,
       sessionId,
       paths.permissionsPath,
-      false
+      false,
+      recoveryTurnId,
+      plannedRecoveryGenerations,
     );
 
     // Clear edited files tracker for new turn
     this.toolHooksService.clearEditedFiles();
 
     try {
+      // Require workspace path before inspecting any persisted provider evidence.
+      if (!workspacePath) {
+        throw new Error('[CLAUDE-CODE] workspacePath is required but was not provided');
+      }
+
+      const providerSessionId = sessionId ? this.sessions.getSessionId(sessionId) ?? undefined : undefined;
+      const recovery = sessionId
+        ? await prepareClaudeBackgroundAgentRecoveryTurn(
+          this.backgroundAgentRecovery,
+          {
+            sessionId,
+            workspacePath,
+            providerSessionId,
+            turnId: recoveryTurnId,
+            isResume: Boolean(providerSessionId),
+          },
+        ).catch((error) => {
+          console.error('[CLAUDE-CODE] Failed to inspect durable background-agent recovery state:', error);
+          return {
+            dispatches: [],
+            notices: [],
+            plannedGenerations: [],
+            systemInstruction: '',
+          };
+        })
+        : {
+          dispatches: [],
+          notices: [],
+          plannedGenerations: [],
+          systemInstruction: '',
+        };
+      plannedRecoveryGenerations.push(...recovery.plannedGenerations);
+      const recoveryInstruction = recovery.systemInstruction;
+      if (sessionId && providerSessionId) {
+        this.emit('message:logged', { sessionId, direction: 'output' });
+      }
+
       // Prompt rewriting, system prompt, SDK options, input logging and the
       // transcript adapter. Inside the try, as before: `buildTurnQuery` throws
       // on an unusable workspace and the catch below turns that into the
@@ -696,7 +886,10 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
           getAgentRole: (sid) => this.getAgentRole(sid),
           getWorkflowPreset: (sid) => this.getWorkflowPreset(sid),
           ensureGitContext: (wp) => this.ensureGitContext(wp),
-          buildSystemPrompt: (dc, teams, meta, preset) => this.buildSystemPrompt(dc, teams, meta, preset),
+          buildSystemPrompt: (dc, teams, meta, preset) => {
+            const prompt = this.buildSystemPrompt(dc, teams, meta, preset);
+            return recoveryInstruction ? `${prompt}\n\n${recoveryInstruction}` : prompt;
+          },
           emit: (event, payload) => { this.emit(event, payload); },
           withPromptProvenanceMetadata: (dc) => this.withPromptProvenanceMetadata(dc),
           logAgentMessage: (...args) => this.logAgentMessage(...args),
@@ -708,6 +901,10 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
           sessions: this.sessions,
           config: this.config,
           abortController: this.abortController!,
+          mainRouteSnapshot,
+          subagentRouteSnapshot,
+          mainRouteCredential: routeCredentials?.main,
+          subagentRouteCredential: routeCredentials?.subagent,
           currentMode: this.currentMode,
           metaAgentAllowedTools: BaseAgentProvider.META_AGENT_ALLOWED_TOOLS,
           publishSdkResult: (result) => {
@@ -718,6 +915,13 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         state,
         { documentContext, sessionId, workspacePath, attachments, paths, prepared },
       );
+
+      if (sessionId && mainRouteSnapshot && !this.loggedRuntimeRouteReceipts.has(sessionId)) {
+        await this.logAgentMessage(sessionId, 'claude-code', 'output',
+          serializeProviderRuntimeRouteReceipt(mainRouteSnapshot.receipt),
+          { messageType: 'provider_runtime_route' });
+        this.loggedRuntimeRouteReceipts.add(sessionId);
+      }
 
       const queryCallStart = Date.now();
 
@@ -1195,13 +1399,56 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
                     }
                   }
 
+                  const stoppedTaskId = getClaudeTaskStopTarget(
+                    toolCall.name,
+                    toolCall.arguments,
+                    item.isError === true,
+                  );
+                  if (toolCall.name === 'SendMessage' || stoppedTaskId) {
+                    try {
+                      await observeClaudeBackgroundAgentRecoveryToolResult(
+                        this.backgroundAgentRecovery,
+                        {
+                          sessionId,
+                          turnId: recoveryTurnId,
+                          toolName: toolCall.name,
+                          toolUseId: item.toolUseId,
+                          isError: item.isError === true,
+                          toolArguments: toolCall.arguments,
+                          content: item.content,
+                        },
+                      );
+                    } catch (error) {
+                      console.error('[CLAUDE-CODE] Failed to persist native background-agent recovery tool result:', error);
+                    }
+                  }
+
                   this.processTeammateToolResult(sessionId, toolCall.name, toolCall.arguments, item.content, toolCall.isError === true, toolCall.id);
+                  this.teammateManager.recordNativeAgentToolResult(
+                    sessionId,
+                    toolCall.name,
+                    toolCall.arguments,
+                    item.content,
+                    toolCall.isError === true,
+                  );
 
                   // Mirror SDK-native task-list mutations into session metadata so
                   // the UI can show the tasks for this session (TaskCreate id is
                   // only available in the result, so capture happens here).
                   if (!toolCall.isError) {
                     this.captureTaskListMutation(sessionId, toolCall.name, toolCall.arguments, item.content);
+                  }
+
+                  if (toolCall.name === 'TaskStop' && !item.isError) {
+                    if (stoppedTaskId && this.activeTasks.has(stoppedTaskId)) {
+                      await this.handleSystemTask(
+                        'task_notification',
+                        { task_id: stoppedTaskId, status: 'stopped', summary: 'Stopped explicitly' },
+                        sessionId,
+                        workspacePath,
+                        recoveryTurnId,
+                      );
+                    }
                   }
 
                   if (item.toolUseId) {
@@ -1295,7 +1542,29 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
                 if (item.subtype === 'task_notification') {
                   state.sawTaskNotificationThisTurn = true;
                 }
-                this.handleSystemTask(item.subtype, item.chunk, sessionId);
+                {
+                  const launchToolCall = item.chunk?.tool_use_id
+                    ? state.toolCallsById.get(item.chunk.tool_use_id)
+                    : undefined;
+                  const launchArgs = launchToolCall?.arguments;
+                  const explicitBackground = typeof launchArgs?.run_in_background === 'boolean'
+                    ? launchArgs.run_in_background
+                    : typeof launchArgs?.runInBackground === 'boolean'
+                      ? launchArgs.runInBackground
+                      : undefined;
+                  await this.handleSystemTask(
+                    item.subtype,
+                    item.chunk,
+                    sessionId,
+                    workspacePath,
+                    recoveryTurnId,
+                    launchArgs ? {
+                      // Agent defaults to background execution in the current SDK.
+                      runInBackground: explicitBackground ?? (launchToolCall?.name === 'Agent'),
+                      name: typeof launchArgs.name === 'string' ? launchArgs.name : undefined,
+                    } : undefined,
+                  );
+                }
                 break;
 
               case 'system_compact':
@@ -1638,6 +1907,18 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         return;
       }
     } finally {
+      if (sessionId) {
+        try {
+          await this.backgroundAgentRecovery.finishRecoveryTurn({
+            sessionId,
+            turnId: recoveryTurnId,
+            plannedGenerations: plannedRecoveryGenerations,
+          });
+        } catch (error) {
+          console.error('[CLAUDE-CODE] Failed to finalize background-agent recovery turn:', error);
+        }
+      }
+
       // Don't stop MCP health checks or clear mcpQuery between turns -
       // the SDK subprocess stays alive for session resume, so MCP operations
       // (health checks, reconnect) should keep working between turns.
@@ -1688,7 +1969,36 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     }
   }
 
-  abort(): void {
+  private async persistExplicitUserStopBoundary(): Promise<void> {
+    if (this.destroying) return;
+    this.explicitUserStopThroughRecoveryTurnSequence = Math.max(
+      this.explicitUserStopThroughRecoveryTurnSequence,
+      this.recoveryTurnSequence,
+    );
+
+    for (const task of this.activeTasks.values()) {
+      if (task.status === 'running') task.status = 'stopped';
+    }
+
+    const recoverySessionId = this.recoverySessionId;
+    if (!recoverySessionId) return;
+
+    // Persist the provider's complete stopped task view first, then let the
+    // coordinator make the recovery ledger and currentTasks disposition the
+    // final authoritative write. Keeping suppression last prevents a later
+    // task snapshot from erasing the durable user-cancelled evidence.
+    await this.emitTaskUpdate(recoverySessionId);
+    await this.backgroundAgentRecovery.suppressRunning(
+      recoverySessionId,
+      'user-cancelled'
+    );
+    this.emit('message:logged', {
+      sessionId: recoverySessionId,
+      direction: 'output',
+    });
+  }
+
+  private abortProviderRuntime(): void {
     console.log('[CLAUDE-CODE] Abort called, abortController:', this.abortController ? 'exists' : 'NULL');
     this.streamClosedRetryCount = 0;
     this.abnormalExitRetryCount = 0;
@@ -1741,6 +2051,15 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     this.currentSessionId = undefined;
   }
 
+  abort(): void {
+    // AIProvider.abort() is synchronous, so keep its historical best-effort
+    // persistence behavior. Explicit renderer stops go through
+    // interruptCurrentTurn(), which awaits this same boundary before returning.
+    void this.persistExplicitUserStopBoundary().catch((error) => {
+      console.error('[CLAUDE-CODE] Failed to suppress background-agent recovery after user cancellation:', error);
+    });
+    this.abortProviderRuntime();
+  }
   // Per-session "transcript processing already scheduled" flag. The streaming
   // chunk loop fires scheduleTranscriptProcessing per chunk, so without this
   // we'd queue one processNewMessages run per chunk; the per-session lock
@@ -1826,49 +2145,73 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
    * and the AIService completion handler runs normally (including queue processing).
    * This is a graceful stop — unlike abort(), it doesn't kill the SDK subprocess.
    *
-   * If there is no active lead query, defer to the BaseAIProvider default
-   * (hard abort) so the caller still gets a sensible signal back, and report
-   * `hadActiveTurn: false` — with no query and (usually) no abortController
-   * that abort is a no-op, so the caller has to clear the session's live state
-   * itself or a stuck-running session strands its queue forever (NIM-2434).
+   * If there is no active lead query, persist the same user-stop boundary
+   * before applying the provider's hard-abort cleanup.
    */
   async interruptCurrentTurn(): Promise<InterruptTurnResult> {
-    if (!this.leadQuery) {
-      console.log('[CLAUDE-CODE] interruptCurrentTurn: no active lead query, falling back to abort');
-      const outcome = await super.interruptCurrentTurn();
-      return { ...outcome, hadActiveTurn: false };
+    const leadQuery = this.leadQuery;
+    const interruptResolve = this.interruptResolve;
+    if (leadQuery) {
+      // Mark the turn as explicitly interrupted immediately so a naturally
+      // closing stream cannot inject teammate follow-up while the durable stop
+      // boundary is being written.
+      this.wasInterrupted = true;
     }
 
-    console.log('[CLAUDE-CODE] interruptCurrentTurn: interrupting active lead query');
-    this.wasInterrupted = true;
-
-    // Resolve the interrupt promise so the Promise.race in the streaming loop
-    // settles immediately without waiting for the SDK subprocess.
-    if (this.interruptResolve) {
-      this.interruptResolve();
-      this.interruptResolve = null;
+    let persistenceFailed = false;
+    let persistenceError: unknown;
+    try {
+      await this.persistExplicitUserStopBoundary();
+    } catch (error) {
+      persistenceFailed = true;
+      persistenceError = error;
     }
 
     try {
-      await this.leadQuery.interrupt();
-    } catch (err) {
-      console.warn('[CLAUDE-CODE] interruptCurrentTurn: interrupt() failed (transport may be closed):', err);
-    }
+      if (!leadQuery) {
+        console.log('[CLAUDE-CODE] interruptCurrentTurn: no active lead query, falling back to abort');
+        this.abortProviderRuntime();
+        return { method: 'abort' };
+      }
 
-    // Background sub-agent tasks stream their task_notification on the query we
-    // just interrupted, and the streaming loop breaks on that interrupt, so a
-    // terminal status can no longer reach handleSystemTask -- the same reason
-    // abort() reaps them. Left 'running', they make the NEXT turn's `result`
-    // defer teardown to the drain loop: the session sits 'running' with its
-    // queued prompts stalled behind it, and a silent drain then tells the
-    // session a sub-agent was interrupted when none was. #1269.
-    const orphanedTasks = reapRunningTasks(this.activeTasks.values());
-    if (orphanedTasks.length > 0) {
-      console.warn(`[CLAUDE-CODE] SUBAGENT_TASK: interrupt orphaned ${orphanedTasks.length} running task(s); marking stopped. tasks=[${orphanedTasks.join(', ')}]`);
-      this.emitTaskUpdate(this.currentSessionId).catch(() => {});
-    }
+      console.log('[CLAUDE-CODE] interruptCurrentTurn: interrupting active lead query');
 
-    return { method: 'interrupt' };
+      if (interruptResolve) {
+        interruptResolve();
+        if (this.interruptResolve === interruptResolve) {
+          this.interruptResolve = null;
+        }
+      }
+
+      try {
+        await leadQuery.interrupt();
+      } catch (err) {
+        console.warn('[CLAUDE-CODE] interruptCurrentTurn: interrupt() failed (transport may be closed):', err);
+      }
+
+      // Background sub-agent tasks stream their task_notification on the query we
+      // just interrupted, and the streaming loop breaks on that interrupt, so a
+      // terminal status can no longer reach handleSystemTask -- the same reason
+      // abort() reaps them. Left 'running', they make the NEXT turn's `result`
+      // defer teardown to the drain loop: the session sits 'running' with its
+      // queued prompts stalled behind it, and a silent drain then tells the
+      // session a sub-agent was interrupted when none was. #1269.
+      const orphanedTasks = reapRunningTasks(this.activeTasks.values());
+      if (orphanedTasks.length > 0) {
+        console.warn(`[CLAUDE-CODE] SUBAGENT_TASK: interrupt orphaned ${orphanedTasks.length} running task(s); marking stopped. tasks=[${orphanedTasks.join(', ')}]`);
+        this.emitTaskUpdate(this.currentSessionId).catch(() => {});
+      }
+
+      return { method: 'interrupt' };
+    } finally {
+      if (persistenceFailed) {
+        console.error(
+          '[CLAUDE-CODE] Explicit user stop runtime cleanup was attempted, but durable recovery suppression failed:',
+          persistenceError,
+        );
+        throw persistenceError;
+      }
+    }
   }
 
   /**
@@ -2121,6 +2464,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
    */
   destroy(): void {
     console.log('[CLAUDE-CODE] Destroying provider');
+    this.destroying = true;
 
     // Clean up permission service
     if (this.permissionService) {
@@ -2194,29 +2538,6 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     sessionId: string | undefined,
     hideMessages: boolean,
   ): Generator<StreamChunk> {
-    // Clean up stale "running" tasks from previous sessions/restarts
-    if (sessionId && this.activeTasks.size === 0) {
-      (async () => {
-        try {
-          const { AISessionsRepository } = await import('../../../storage/repositories/AISessionsRepository');
-          const currentSession = await AISessionsRepository.get(sessionId);
-          const tasks = currentSession?.metadata?.currentTasks;
-          if (Array.isArray(tasks) && tasks.some((t: any) => t.status === 'running')) {
-            const cleaned = tasks.map((t: any) =>
-              t.status === 'running' ? { ...t, status: 'stopped' } : t
-            );
-            await AISessionsRepository.updateMetadata(sessionId, {
-              metadata: { ...currentSession?.metadata, currentTasks: cleaned }
-            });
-            this.emit('message:logged', { sessionId, direction: 'output' });
-            // console.log(`[CLAUDE-CODE] Cleaned up ${tasks.filter((t: any) => t.status === 'running').length} stale running tasks`);
-          }
-        } catch {
-          // Non-critical cleanup
-        }
-      })();
-    }
-
     // Hydrate the in-memory task-list map from persisted metadata so TaskUpdate
     // deltas in a resumed session merge onto the existing board instead of
     // creating stubs (the map is per-provider-instance and starts empty).
@@ -2340,7 +2661,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       this.emit('teammate:messageWhileIdle', {
         sessionId,
         message:
-          '[System: A sub-agent you launched did not finish — its process was interrupted before returning results. Do not keep waiting for it; continue without it, or retry the delegation if the work still matters.]',
+          '[System: A background agent process was interrupted before returning results. Continue this session; if durable recovery evidence is available, resume the original agent through SendMessage. Do not launch a replacement agent.]',
       });
       return;
     }
@@ -2379,7 +2700,30 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   }
 
   /** Handle system task chunks (task_started, task_progress, task_notification) */
-  private handleSystemTask(subtype: string, chunk: any, sessionId: string | undefined): void {
+  private async handleSystemTask(
+    subtype: string,
+    chunk: any,
+    sessionId: string | undefined,
+    workspacePath: string,
+    recoveryTurnId: string,
+    launch?: { runInBackground?: boolean; name?: string },
+  ): Promise<void> {
+    // Do not let late SDK chunks from a stopped turn recreate recoverable
+    // evidence after a newer turn starts. Recovery turn ids are provider-owned
+    // and monotonic, so the stopped high-water mark is constant-space and
+    // remains valid for as long as an older stream can still emit.
+    const recoveryTurnPrefix = `${this.recoveryInstanceId}:turn-`;
+    const recoveryTurnSequence = recoveryTurnId.startsWith(recoveryTurnPrefix)
+      ? Number(recoveryTurnId.slice(recoveryTurnPrefix.length))
+      : Number.NaN;
+    if (
+      Number.isSafeInteger(recoveryTurnSequence)
+      && recoveryTurnSequence > 0
+      && recoveryTurnSequence <= this.explicitUserStopThroughRecoveryTurnSequence
+    ) {
+      return;
+    }
+
     if (subtype === 'task_started') {
       this.activeTasks.set(chunk.task_id, {
         taskId: chunk.task_id,
@@ -2391,6 +2735,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         toolCount: 0,
         tokenCount: 0,
         durationMs: 0,
+        sourceTurnId: recoveryTurnId,
+        agentName: launch?.name,
+        isBackgrounded: launch?.runInBackground === true,
       });
       console.log(`[CLAUDE-CODE] SUBAGENT_TASK started: id=${chunk.task_id} type=${chunk.task_type ?? 'n/a'} desc="${(chunk.description || '').substring(0, 80)}"`);
       this.emitTaskUpdate(sessionId).catch(() => {});
@@ -2455,6 +2802,22 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         }
         if (typeof patch.error === 'string' && patch.error) existing.summary = patch.error;
         this.emitTaskUpdate(sessionId).catch(() => {});
+      }
+    }
+
+    const providerSessionId = sessionId ? this.sessions.getSessionId(sessionId) : null;
+    if (sessionId && providerSessionId) {
+      try {
+        await this.backgroundAgentRecovery.observeTaskEvent({
+          sessionId,
+          workspacePath,
+          providerSessionId,
+          turnId: recoveryTurnId,
+          launch,
+          event: { ...chunk, subtype },
+        });
+      } catch (error) {
+        console.error('[CLAUDE-CODE] Failed to persist background-agent task evidence:', error);
       }
     }
   }
@@ -2530,17 +2893,8 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       // Update session metadata with the current todos
       // This will trigger session reloads which will update the UI
 
-      // Import AISessionsRepository dynamically
-      const { AISessionsRepository } = await import('../../../storage/repositories/AISessionsRepository');
-
-      // Get current session to merge metadata
-      const currentSession = await AISessionsRepository.get(sessionId);
-
-      const currentMetadata = currentSession?.metadata || {};
-
       await AISessionsRepository.updateMetadata(sessionId, {
         metadata: {
-          ...currentMetadata,
           currentTodos: todos
         }
       });
@@ -2562,13 +2916,8 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     if (!sessionId) return;
 
     try {
-      const { AISessionsRepository } = await import('../../../storage/repositories/AISessionsRepository');
-      const currentSession = await AISessionsRepository.get(sessionId);
-      const currentMetadata = currentSession?.metadata || {};
-
       await AISessionsRepository.updateMetadata(sessionId, {
         metadata: {
-          ...currentMetadata,
           currentTasks: Array.from(this.activeTasks.values()),
         }
       });
@@ -2603,13 +2952,8 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   private async emitTaskListUpdate(sessionId: string | undefined): Promise<void> {
     if (!sessionId) return;
     try {
-      const { AISessionsRepository } = await import('../../../storage/repositories/AISessionsRepository');
-      const currentSession = await AISessionsRepository.get(sessionId);
-      const currentMetadata = currentSession?.metadata || {};
-
       await AISessionsRepository.updateMetadata(sessionId, {
         metadata: {
-          ...currentMetadata,
           // Sorted by numeric id so the board renders in creation order.
           currentTaskList: sortTaskList(this.taskListItems.values()),
         }
@@ -3595,12 +3939,18 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     // this loop the catalog entries exist and are launchable but never reach
     // the model list, so the only visible rows for these models come from a
     // user's opencode.json and launch as OpenCode sessions instead.
-    // CLAUDE_CODE_BACKENDS is the projection that already dropped catalog
-    // entries without a usable Claude-Agent main-session route.
-    for (const backend of CLAUDE_CODE_BACKENDS) {
+    // Enumerate the catalog itself, not the legacy CLAUDE_CODE_BACKENDS
+    // projection. That projection only ever accepted local-proxy routes, so
+    // Claudex, DeepSeek and OpenRouter were launchable by persisted id but
+    // invisible in the picker -- they never had a proxy interface to be
+    // projected from. Reading the resolution directly makes the picker show
+    // exactly the routes the runtime can resolve.
+    const catalogResolution =
+      ClaudeCodeDeps.providerCatalogResolutionLoader?.() ?? PROVIDER_CATALOG_RESOLUTION;
+    for (const entry of listLaunchableCatalogRoutes(catalogResolution)) {
       models.push({
-        id: backend.persistedModel,
-        name: `Claude Agent · ${backend.model} (${CATALOG_PROVIDER_LABELS[backend.provider] ?? backend.provider})`,
+        id: entry.model.persistedId,
+        name: `Claude Agent · ${entry.displayName} (${CATALOG_PROVIDER_LABELS[entry.provider] ?? entry.provider})`,
         provider: 'claude-code' as const,
         maxTokens: 8192
       });

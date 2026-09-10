@@ -21,12 +21,15 @@ import { ClaudeCodeDeps } from './dependencyInjection';
 import { resolveClaudeAgentCliPath } from './cliPathResolver';
 import { hasEnterpriseManagedMcpConfig } from './enterpriseMcpConfig';
 import { type ThinkingMode } from '../../effortLevels';
-// NOTE: the original commit also imported applyProviderRuntimeLaunchPlanEnv/
-// omitEnvironmentKeysCaseInsensitive (./customBackends) and
-// ProviderRuntimeRouteError/ProviderRuntimeSessionSnapshot
-// (./runtimeRouteResolver) for the route-pinning system (2ee794998), which
-// isn't carried in this release -- those files don't exist on this base.
 import type { ProviderControlSnapshot } from './providerControlContract';
+import {
+  applyProviderRuntimeLaunchPlanEnv,
+  omitEnvironmentKeysCaseInsensitive,
+} from './customBackends';
+import {
+  ProviderRuntimeRouteError,
+  type ProviderRuntimeSessionSnapshot,
+} from './runtimeRouteResolver';
 
 type SessionMode = 'planning' | 'agent' | 'auto' | undefined;
 
@@ -54,11 +57,21 @@ export interface BuildSdkOptionsDeps {
     lastUsedSessionId?: string | undefined;
     lastUsedPermissionsPath?: string | undefined;
     packagedBuildOptions?: any;
+    runtimeRouteOptions?: {
+      env: Record<string, string | undefined>;
+      exactModel: string;
+      routeReceipt: ProviderRuntimeSessionSnapshot['receipt'];
+      thinking?: Readonly<{ type: string }>;
+    };
     resolveTeamContext: (sessionId?: string) => Promise<string | undefined>;
   };
   sessions: { getSessionId: (sessionId: string) => string | null | undefined };
   config: { model?: string; apiKey?: string; effortLevel?: string; thinkingMode?: ThinkingMode; providerControlSnapshot?: Readonly<ProviderControlSnapshot> };
   abortController: AbortController;
+  mainRouteSnapshot?: Readonly<ProviderRuntimeSessionSnapshot>;
+  subagentRouteSnapshot?: Readonly<ProviderRuntimeSessionSnapshot>;
+  mainRouteCredential?: string;
+  subagentRouteCredential?: string;
   /**
    * True when an enterprise `managed-mcp.json` forbids passing MCP servers at
    * all (NIM-2372). Injectable for tests; defaults to the real filesystem probe.
@@ -115,6 +128,37 @@ function canDisableThinkingForModel(model: string | undefined): boolean {
     return false;
   }
   return normalized.includes('opus') || normalized.includes('sonnet');
+}
+
+function assertRuntimeRouteSnapshotForConsumer(
+  snapshot: Readonly<ProviderRuntimeSessionSnapshot>,
+  consumer: 'claude-agent-main' | 'claude-subagent',
+): void {
+  const { plan, receipt } = snapshot;
+  const identityMatches =
+    plan.requested.consumer === consumer &&
+    receipt.requested.consumer === consumer &&
+    plan.requested.catalogEntryId === receipt.requested.catalogEntryId &&
+    plan.requested.persistedModelId === receipt.requested.persistedModelId &&
+    plan.model.catalogEntryId === receipt.resolved.catalogEntryId &&
+    plan.model.persistedId === receipt.resolved.persistedModelId &&
+    plan.model.providerModelId === receipt.resolved.providerModelId &&
+    plan.selectedInterface.id === receipt.selectedInterface.id &&
+    plan.selectedInterface.modelAlias === receipt.selectedInterface.modelAlias &&
+    plan.selectedInterface.credentialRef === receipt.selectedInterface.credentialRef &&
+    plan.selectedInterface.credentialReferencePresent === true &&
+    receipt.selectedInterface.credentialReferencePresent === true &&
+    plan.confirmationState === 'confirmed' &&
+    receipt.confirmationState === 'confirmed' &&
+    plan.fallbackUsed === false &&
+    receipt.fallbackUsed === false;
+  if (!identityMatches) {
+    throw new ProviderRuntimeRouteError(
+      'identity-mismatch',
+      `Provider route ${plan.model.catalogEntryId} has an invalid immutable ${consumer} snapshot.`,
+      plan.model.catalogEntryId,
+    );
+  }
 }
 
 export function createPersistentPromptStream(
@@ -186,6 +230,10 @@ export async function buildSdkOptions(
     sessions,
     config,
     abortController,
+    mainRouteSnapshot,
+    subagentRouteSnapshot,
+    mainRouteCredential,
+    subagentRouteCredential,
     hasEnterpriseMcpLockdown = hasEnterpriseManagedMcpConfig,
   } = deps;
 
@@ -250,7 +298,50 @@ export async function buildSdkOptions(
   }
   const effectivePath = customPath || resolvedBinaryPath;
   // console.log(`[CLAUDE-CODE] Binary path: custom=${customPath || '(none)'} resolved=${resolvedBinaryPath ?? '(none)'} effective=${effectivePath ?? '(none)'}`);
-  const resolvedModel = resolveModelVariant();
+  const mainRoutePlan = mainRouteSnapshot?.plan;
+  const subagentRoutePlan = subagentRouteSnapshot?.plan;
+  if (mainRouteSnapshot) {
+    assertRuntimeRouteSnapshotForConsumer(
+      mainRouteSnapshot,
+      'claude-agent-main',
+    );
+  }
+  if (subagentRouteSnapshot) {
+    assertRuntimeRouteSnapshotForConsumer(
+      subagentRouteSnapshot,
+      'claude-subagent',
+    );
+  }
+  if (mainRoutePlan && !mainRouteCredential) {
+    throw new ProviderRuntimeRouteError(
+      'credential-unavailable',
+      `Provider route ${mainRoutePlan.model.catalogEntryId} has no confirmed lead credential.`,
+      mainRoutePlan.model.catalogEntryId
+    );
+  }
+  if (subagentRoutePlan && !subagentRouteCredential) {
+    throw new ProviderRuntimeRouteError(
+      'credential-unavailable',
+      `Provider route ${subagentRoutePlan.model.catalogEntryId} has no confirmed teammate credential.`,
+      subagentRoutePlan.model.catalogEntryId
+    );
+  }
+  if (
+    mainRoutePlan &&
+    subagentRoutePlan &&
+    (mainRoutePlan.selectedInterface.endpoint !==
+      subagentRoutePlan.selectedInterface.endpoint ||
+      mainRoutePlan.selectedInterface.credentialRef !==
+        subagentRoutePlan.selectedInterface.credentialRef)
+  ) {
+    throw new ProviderRuntimeRouteError(
+      'adapter-required',
+      `Provider route ${mainRoutePlan.model.catalogEntryId} requires an adapter for a teammate interface that differs from the lead process.`,
+      mainRoutePlan.model.catalogEntryId
+    );
+  }
+  const resolvedModel =
+    mainRoutePlan?.selectedInterface.modelAlias ?? resolveModelVariant();
 
   const options: ClaudeAgentSdkOptions = {
     pathToClaudeCodeExecutable: effectivePath,
@@ -324,18 +415,16 @@ export async function buildSdkOptions(
   };
 
   // A schema-driven provider-control override for sdk.thinking.type wins over
-  // the plain config.thinkingMode when present. NOTE: the original commit
-  // also skipped this block when a route plan owned thinking-mode resolution
-  // on its own path (`!mainRoutePlan &&`) -- that route-pinning system
-  // (2ee794998) isn't carried in this release, so there is no route plan to
-  // defer to; the schema-driven override still applies on its own.
+  // the plain config.thinkingMode when present. The route-plan guard below
+  // still applies to whichever mode this resolves to -- a route plan owning
+  // thinking-mode resolution on its own path pre-empts both sources.
   const thinkingParameter = config.providerControlSnapshot?.parameters.find(
     (parameter) => parameter.target === 'sdk.thinking.type'
   );
   const thinkingMode = thinkingParameter
     ? (thinkingParameter.operation === 'set' ? thinkingParameter.value : undefined)
     : config.thinkingMode;
-  if (thinkingMode === 'disabled') {
+  if (!mainRoutePlan && thinkingMode === 'disabled') {
     if (canDisableThinkingForModel(resolvedModel)) {
       options.thinking = { type: 'disabled' as const };
     } else {
@@ -390,9 +479,19 @@ export async function buildSdkOptions(
   // the Claude native binary treats the mere presence of that variable as an
   // API-key auth signal, which can shadow a valid OAuth/CLI login and produce
   // "Authentication failed" even though accountInfo() succeeds in settings.
-  const { ANTHROPIC_API_KEY: _envAnthropicKey, OPENAI_API_KEY: _envOpenaiKey, ...sanitizedProcessEnv } = process.env;
-  const { ANTHROPIC_API_KEY: _shellAnthropicKey, OPENAI_API_KEY: _shellOpenaiKey, ...sanitizedShellEnv } = shellEnv;
-  const { ANTHROPIC_API_KEY: _settingsAnthropicKey, OPENAI_API_KEY: _settingsOpenaiKey, ...sanitizedSettingsEnv } = settingsEnv;
+  const implicitApiKeyNames = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY'];
+  const sanitizedProcessEnv = omitEnvironmentKeysCaseInsensitive(
+    process.env,
+    implicitApiKeyNames
+  );
+  const sanitizedShellEnv = omitEnvironmentKeysCaseInsensitive(
+    shellEnv,
+    implicitApiKeyNames
+  );
+  const sanitizedSettingsEnv = omitEnvironmentKeysCaseInsensitive(
+    settingsEnv,
+    implicitApiKeyNames
+  );
 
   const enableAgentTeams = sanitizedSettingsEnv.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === '1';
   const effortParameter = config.providerControlSnapshot?.parameters.find(
@@ -531,12 +630,53 @@ export async function buildSdkOptions(
   }
 
   // Per-session API key
-  if (config.apiKey) {
+  if (config.apiKey && !mainRoutePlan) {
     env.ANTHROPIC_API_KEY = config.apiKey;
     if (teammateManager.packagedBuildOptions?.env) {
       teammateManager.packagedBuildOptions.env.ANTHROPIC_API_KEY = config.apiKey;
     }
   }
+
+  if (mainRoutePlan) {
+    applyProviderRuntimeLaunchPlanEnv(
+      env,
+      mainRoutePlan,
+      mainRouteCredential!
+    );
+    const thinking = mainRoutePlan.resolvedControls.find(
+      (mapping) => mapping.target === 'launch.thinking-mode'
+    );
+    if (thinking) {
+      // Catalog-validated: the resolved control's value for launch.thinking-mode
+      // is constrained to the SDK's own thinking.type union at the catalog
+      // layer, but that constraint isn't visible to this type -- narrow it
+      // here rather than widening the SDK option itself.
+      options.thinking = { type: String(thinking.value) as 'disabled' | 'enabled' | 'adaptive' };
+    }
+  }
+
+  const teammateEnv = { ...env };
+  if (subagentRoutePlan) {
+    applyProviderRuntimeLaunchPlanEnv(
+      teammateEnv,
+      subagentRoutePlan,
+      subagentRouteCredential!
+    );
+  }
+  const teammateThinking = subagentRoutePlan?.resolvedControls.find(
+    (mapping) => mapping.target === 'launch.thinking-mode'
+  );
+  teammateManager.runtimeRouteOptions =
+    subagentRoutePlan && subagentRouteSnapshot
+      ? {
+          env: teammateEnv,
+          exactModel: subagentRoutePlan.selectedInterface.modelAlias,
+          routeReceipt: subagentRouteSnapshot.receipt,
+          ...(teammateThinking && {
+            thinking: { type: String(teammateThinking.value) },
+          }),
+        }
+      : undefined;
 
   options.env = env;
   // Subagent/team consumers inherit the exact reviewed environment snapshot

@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Static dependency injection for ClaudeCodeProvider.
  *
@@ -5,6 +6,8 @@
  * to inject capabilities (ports, loaders, checkers) into the runtime package without
  * creating a direct dependency on Electron code.
  */
+
+import type { ProviderCatalogResolution } from "./providerCatalog";
 
 // ---- Type Definitions ----
 
@@ -62,6 +65,11 @@ export type HistoryManagerPort = {
  * whole session rather than retrying on a later turn (#1177).
  */
 export type GitContextLoader = (workspacePath: string) => Promise<string | null>;
+export type ProviderCredentialResolver = (
+  credentialRef: string,
+  context?: Readonly<{ workspacePath?: string }>
+) => string | undefined;
+export type ProviderCatalogResolutionLoader = () => ProviderCatalogResolution;
 
 // ---- Dependency Store ----
 
@@ -155,6 +163,15 @@ export const ClaudeCodeDeps = {
   // Snapshots and review tags for files the agent edits. Null on a host with no
   // document history, which the tool hooks handle by skipping snapshotting.
   historyManager: null as HistoryManagerPort | null,
+  // Resolves an already-reviewed named provider credential at the final
+  // per-spawn boundary. Catalogs, plans, receipts, and logs receive only the
+  // reference and presence bit, never the returned value.
+  providerCredentialResolver: null as ProviderCredentialResolver | null,
+
+  // Testable/process-reload boundary for the code-owned catalog snapshot.
+  // Production uses the module resolution when no loader is injected.
+  providerCatalogResolutionLoader:
+    null as ProviderCatalogResolutionLoader | null,
 
   // ---- Plan Tracking ----
 
@@ -238,6 +255,18 @@ export const ClaudeCodeDeps = {
 
   setHistoryManager(historyManager: HistoryManagerPort | null): void {
     this.historyManager = historyManager;
+  },
+
+  setProviderCredentialResolver(
+    resolver: ProviderCredentialResolver | null
+  ): void {
+    this.providerCredentialResolver = resolver;
+  },
+
+  setProviderCatalogResolutionLoader(
+    loader: ProviderCatalogResolutionLoader | null
+  ): void {
+    this.providerCatalogResolutionLoader = loader;
   },
 
   setPlanTrackingEnabled(enabled: boolean): void {

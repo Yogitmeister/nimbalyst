@@ -1,6 +1,11 @@
 // [ASTRA-ORCH]
 import { describe, it, expect } from 'vitest';
-import { CLAUDE_CODE_BACKENDS } from '@nimbalyst/runtime/ai/server';
+import { listLaunchableCatalogRoutes } from '@nimbalyst/runtime/ai/server';
+
+// The legacy CLAUDE_CODE_BACKENDS projection only ever held local-proxy routes
+// and is empty now that Ollama goes direct, so the picker gates are asserted
+// against the catalog routes they actually read.
+const CATALOG_ROUTES = listLaunchableCatalogRoutes();
 import { isModelEnabled } from '../modelEnablementFilter';
 import {
   claudeCodeCatalogModelIds,
@@ -33,21 +38,21 @@ describe('catalog brain-swap routes reach the Claude Agent picker', () => {
   ];
 
   it('exposes at least one catalog route to reconcile', () => {
-    expect(CLAUDE_CODE_BACKENDS.length).toBeGreaterThan(0);
+    expect(CATALOG_ROUTES.length).toBeGreaterThan(0);
   });
 
   it('includes every catalog route in the reconciliation catalog', () => {
     const catalog = claudeCodeCatalogModelIds();
-    for (const backend of CLAUDE_CODE_BACKENDS) {
-      expect(catalog).toContain(backend.persistedModel);
+    for (const backend of CATALOG_ROUTES) {
+      expect(catalog).toContain(backend.model.persistedId);
     }
   });
 
   it('back-fills catalog routes into an existing exclusive allow-list', () => {
     const result = reconcileClaudeCodeModels(EXISTING_INSTALL_ALLOWLIST, undefined);
     expect(result.changed).toBe(true);
-    for (const backend of CLAUDE_CODE_BACKENDS) {
-      expect(result.models).toContain(backend.persistedModel);
+    for (const backend of CATALOG_ROUTES) {
+      expect(result.models).toContain(backend.model.persistedId);
     }
     // A user's existing choices are never dropped.
     for (const id of EXISTING_INSTALL_ALLOWLIST) {
@@ -58,9 +63,9 @@ describe('catalog brain-swap routes reach the Claude Agent picker', () => {
   it('passes the enablement filter once reconciled', () => {
     const { models } = reconcileClaudeCodeModels(EXISTING_INSTALL_ALLOWLIST, undefined);
     const entry = { enabled: true, models };
-    for (const backend of CLAUDE_CODE_BACKENDS) {
+    for (const backend of CATALOG_ROUTES) {
       expect(
-        isModelEnabled({ id: backend.persistedModel, provider: 'claude-code' }, entry),
+        isModelEnabled({ id: backend.model.persistedId, provider: 'claude-code' }, entry),
       ).toBe(true);
     }
   });
@@ -69,15 +74,15 @@ describe('catalog brain-swap routes reach the Claude Agent picker', () => {
     // Guards the regression itself: with the pre-fix allow-list and no
     // back-fill, the enablement gate rejects all of them.
     const entry = { enabled: true, models: EXISTING_INSTALL_ALLOWLIST };
-    for (const backend of CLAUDE_CODE_BACKENDS) {
+    for (const backend of CATALOG_ROUTES) {
       expect(
-        isModelEnabled({ id: backend.persistedModel, provider: 'claude-code' }, entry),
+        isModelEnabled({ id: backend.model.persistedId, provider: 'claude-code' }, entry),
       ).toBe(false);
     }
   });
 
   it('respects a deliberate opt-out via the known snapshot', () => {
-    const removed = CLAUDE_CODE_BACKENDS[0].persistedModel;
+    const removed = CATALOG_ROUTES[0].model.persistedId;
     const known = claudeCodeCatalogModelIds();
     const result = reconcileClaudeCodeModels(EXISTING_INSTALL_ALLOWLIST, known);
     expect(result.models).not.toContain(removed);

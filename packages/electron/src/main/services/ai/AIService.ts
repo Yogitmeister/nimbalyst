@@ -25,8 +25,8 @@ import {
   getBuiltInProviderControlEntry,
   resolveProviderControlSnapshot,
 } from '@nimbalyst/runtime/ai/server';
-import { CLAUDE_CODE_SAFE_FALLBACK_MODEL } from '@nimbalyst/runtime/ai/modelConstants';
 import { reconcileClaudeCodeModels } from './claudeCodeModelReconcile';
+import { buildClaudeCodeRuntimeConfigForTurn } from './ClaudeCodeTurnLifecycle';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { parseContextUsageMessage } from '@nimbalyst/runtime/ai/server/utils/contextUsage';
 import { resolveEffortLevel, resolveThinkingMode } from '@nimbalyst/runtime/ai/server/effortLevels';
@@ -913,36 +913,18 @@ export class AIService {
   ): Promise<ProviderConfig> {
     const effectiveWorkspacePath = session.workspacePath || workspacePath;
     const apiKey = this.getApiKeyForProvider('claude-code', effectiveWorkspacePath);
-
-    const effortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
-    const config: ProviderConfig = {
-      maxTokens: (session.providerConfig as any)?.maxTokens,
-      temperature: (session.providerConfig as any)?.temperature,
-      ...(apiKey ? { apiKey } : {}),
-      ...(effortLevel && { effortLevel }),
-      thinkingMode: resolveThinkingMode((session.metadata as any)?.thinkingMode, getDefaultThinkingMode()),
-    };
-
-    const fullModel = session.model || session.providerConfig?.model;
-    if (fullModel) {
-      config.model = fullModel;
-    } else {
-      // Billing safety (#631 / NIM-848): a session with no resolved model must
-      // fall back to a STANDARD 200k model, never the 1M user-facing default
-      // (ModelRegistry.getDefaultModel('claude-code') is `opus-1m`). Sending the
-      // paid 1M beta for an empty/lost model silently bills the user.
-      config.model = CLAUDE_CODE_SAFE_FALLBACK_MODEL;
-    }
-
-    // Schema-driven provider controls (providerControlSnapshot) are a
-    // separate, later concern than the base config above -- merge them in
-    // rather than picking one source over the other. NOTE: the original
-    // commit merged onto a `buildClaudeCodeRuntimeConfigForTurn` route
-    // resolver that doesn't exist on this base (depends on a route-pinning
-    // refactor -- 2ee794998 -- not carried in this release); merging onto
-    // the inline config above instead, same override order (spread last).
+    // buildClaudeCodeRuntimeConfigForTurn resolves the session's route (catalog-
+    // owned vs. legacy backend, restored/persisted identity) and already carries
+    // the billing-safety fallback (#631 / NIM-848: an unresolved model falls back
+    // to CLAUDE_CODE_SAFE_FALLBACK_MODEL, never the 1M-token default) inside its
+    // own model resolution -- nothing is lost by delegating the base config to
+    // it. Schema-driven provider controls (providerControlSnapshot) are a
+    // separate, later concern layered on top, same override order as before
+    // (spread last): buildClaudeCodeRuntimeConfigForTurn deliberately omits
+    // effortLevel/thinkingMode for catalog-owned models, leaving that room for
+    // the schema-driven snapshot to fill.
     return {
-      ...config,
+      ...(await buildClaudeCodeRuntimeConfigForTurn(session, apiKey, effectiveWorkspacePath)),
       ...(await this.buildProviderControlRuntimeConfig(session)),
     };
   }

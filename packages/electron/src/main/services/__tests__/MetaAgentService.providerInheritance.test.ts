@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Mirrors the mock surface of MetaAgentService.workstreamSync.test.ts, with two
@@ -20,6 +21,9 @@ vi.mock('@nimbalyst/runtime/storage/repositories/SessionFilesRepository', () => 
 }));
 
 vi.mock('@nimbalyst/runtime/ai/server', () => ({
+  BUILT_IN_PROVIDER_CATALOG: [],
+  isCatalogPersistedModelId: () => false,
+  resolveProviderCatalog: () => ({ schemaVersion: 2, entries: [], disabledIds: [], errors: [], fatalErrors: [] }),
   ClaudeCodeProvider: { setMetaAgentServerPort: vi.fn() },
   OpenAICodexProvider: { setMetaAgentServerPort: vi.fn() },
   OpenAICodexACPProvider: { setMetaAgentServerPort: vi.fn() },

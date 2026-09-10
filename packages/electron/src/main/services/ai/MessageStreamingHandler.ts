@@ -55,6 +55,7 @@ import type { DriveReason } from './QueueDriveService';
 import { resolveExtensionAgentRef, usesHostSuppliedToolLoop } from './providerResolution';
 import { resolveProviderAuthRequirement } from './providerAuthRequirement';
 import { getAgentProviderRegistry } from '../../extensions/AgentProviderRegistry';
+import { prepareClaudeCodeProviderTurn } from './ClaudeCodeTurnLifecycle';
 
 /**
  * Resolve the human-readable model name (e.g. "Gemini 3.5 Flash (High)") for a
@@ -626,7 +627,12 @@ export class MessageStreamingHandler {
       let errorMessage = 'API key not configured';
       let requiresApiKey = true;
       const effectiveWorkspacePath = session.workspacePath || workspacePath;
-      apiKey = this.svc.getApiKeyForProvider(session.provider, effectiveWorkspacePath);
+      // Claude Code receives its provider configuration only at the turn
+      // lifecycle boundary below. Do not read a legacy host key before that
+      // boundary can re-read the persisted route identity.
+      if (!isProviderClaudeCode) {
+        apiKey = this.svc.getApiKeyForProvider(session.provider, effectiveWorkspacePath);
+      }
 
       // Resolve the extension-agent ref (null for built-in providers). The
       // built-in switch below is the legacy path; the registry lookup is the
@@ -691,6 +697,10 @@ export class MessageStreamingHandler {
       if (isProviderClaudeCode) {
       }
 
+      // Claude Code must not use this legacy initialization/restoration path.
+      // Its sole initializer and restorer is prepareClaudeCodeProviderTurn at
+      // the turn boundary, after durable-route and credential admission.
+      if (!isProviderClaudeCode) {
       const reinitEffortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
       const reinitConfig: any = {
         apiKey,
@@ -790,8 +800,7 @@ export class MessageStreamingHandler {
         return { content: '' };
       }
 
-      // CRITICAL: Restore provider session data from database
-      // This is essential for session resumption (e.g., Claude Code sessions)
+      // Restore provider session data for legacy non-Claude Code providers.
       if (session.providerSessionId && provider.setProviderSessionData) {
         provider.setProviderSessionData(session.id, {
           providerSessionId: session.providerSessionId,
@@ -800,18 +809,19 @@ export class MessageStreamingHandler {
           codexThreadId: session.providerSessionId,
         });
       }
+      }
 
       // Register tool handler - targetFilePath will be determined dynamically per tool call
       const toolHandler = this.svc.createToolHandler(event.sender, documentContext, session.id, effectiveWorkspacePath);
       provider.registerToolHandler(toolHandler);
     }
 
-    // CRITICAL: Restore provider session data unconditionally (even when the provider
+    // Restore provider session data for non-Claude Code providers, even when the provider
     // already exists in the factory cache). The `if (!provider)` block above only runs
     // on first creation, but the provider can outlive its in-memory session ID mapping
     // across Nimbalyst restarts (process restart -> empty map). Running this on every
     // message guarantees `options.resume` is populated.
-    if (session.providerSessionId && (provider as any).setProviderSessionData) {
+    if (!isProviderClaudeCode && session.providerSessionId && (provider as any).setProviderSessionData) {
       (provider as any).setProviderSessionData(session.id, {
         providerSessionId: session.providerSessionId,
         claudeSessionId: session.providerSessionId,
@@ -1417,9 +1427,13 @@ export class MessageStreamingHandler {
       const logPrefix = isClaudeCode ? '[CLAUDE-CODE-SERVICE]' : '[AIService]';
 
       if (isClaudeCode) {
-        // Refresh provider config every turn so auth/key changes in settings apply immediately.
-        const refreshedConfig = await this.svc.buildClaudeCodeRuntimeConfig(session, effectiveWorkspacePath);
-        await provider.initialize(refreshedConfig);
+        // The lifecycle boundary re-reads durable identity and finishes named
+        // credential admission before it can restore a provider session.
+        await prepareClaudeCodeProviderTurn(
+          provider,
+          session,
+          () => this.svc.buildClaudeCodeRuntimeConfig(session, effectiveWorkspacePath),
+        );
 
         //   messageLength: message.length,
         //   hasContext: !!documentContext,

@@ -2,6 +2,7 @@
 import { describe, it, expect } from 'vitest';
 import { CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES } from '../../../modelConstants';
 import { resolveClaudeCodeModelVariant } from '../../types';
+import { BUILT_IN_PROVIDER_CATALOG } from '../claudeCode/providerCatalogDefaults';
 
 const DEFAULT_MODEL = 'claude-code:opus-1m';
 
@@ -82,6 +83,22 @@ describe('resolveClaudeCodeModelVariant', () => {
         expect(resolveClaudeCodeModelVariant(identity.persistedModel, DEFAULT_MODEL)).toBe(
           identity.sdkAlias
         );
+      }
+    });
+
+    it('keeps every catalog-owned Ollama route on its reviewed SDK alias', () => {
+      // These two aliases used to be the same string and no longer are. The
+      // route now reaches ollama.com directly, so the interface alias is the
+      // exact Ollama model id that goes on the wire, while the SDK variant
+      // stays the reviewed Claude-shaped alias the harness needs when no route
+      // plan is in play. Asserting one equals the other would re-couple them.
+      for (const entry of BUILT_IN_PROVIDER_CATALOG.filter(
+        (candidate) => candidate.provider === 'ollama',
+      )) {
+        expect(entry.interfaces[0].modelAlias).toBe(entry.model.providerModelId);
+        expect(
+          resolveClaudeCodeModelVariant(entry.model.persistedId, DEFAULT_MODEL),
+        ).toMatch(/^claude-/);
       }
     });
 

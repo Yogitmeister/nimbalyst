@@ -14,7 +14,7 @@
  * resolves the one existing non-secret local-proxy reference for compatibility.
  */
 
-import { CLAUDE_CODE_OLLAMA_GLM_5_2_CLOUD_VARIANT } from "./providerCatalogDefaults";
+import { CLAUDE_CODE_OLLAMA_GLM_5_2_CLOUD_VARIANT } from "../../../modelConstants";
 import {
   isCatalogPersistedModelId,
   type ProviderCatalogEntry,
@@ -25,6 +25,11 @@ import {
   LOCAL_PROXY_CREDENTIAL_REF,
 } from "./providerCatalogDefaults";
 import { loadProviderCatalog } from "./providerCatalogLoader";
+import { LOCAL_PROXY_AUTH_TOKEN } from "./providerRouteCredentials";
+import {
+  ProviderRuntimeRouteError,
+  type ProviderRuntimeLaunchPlan,
+} from "./runtimeRouteResolver";
 
 export const OLLAMA_GLM_5_2_CLOUD_BACKEND_ID =
   CLAUDE_CODE_OLLAMA_GLM_5_2_CLOUD_VARIANT;
@@ -50,8 +55,6 @@ export const PROVIDER_CATALOG_LOAD = loadProviderCatalog(
   BUILT_IN_PROVIDER_CATALOG
 );
 export const PROVIDER_CATALOG_RESOLUTION = PROVIDER_CATALOG_LOAD.resolution;
-
-const LOCAL_PROXY_AUTH_TOKEN = "sk-nim-local-proxy";
 
 function toClaudeCodeBackend(
   entry: ProviderCatalogEntry
@@ -103,6 +106,35 @@ export function projectClaudeCodeBackends(
 
 export const CLAUDE_CODE_BACKENDS: readonly ClaudeCodeBackend[] =
   projectClaudeCodeBackends(PROVIDER_CATALOG_RESOLUTION);
+
+/**
+ * Catalog routes that can open a lead Claude Agent session.
+ *
+ * This is the picker's source of truth, and deliberately NOT
+ * `CLAUDE_CODE_BACKENDS`: that projection only ever accepted local-proxy
+ * routes, so direct-API brains were launchable by persisted id yet invisible
+ * in the model list and absent from the enabled-models allow-list. Both gates
+ * must agree, so both read this.
+ */
+export function listLaunchableCatalogRoutes(
+  resolution: ProviderCatalogResolution = PROVIDER_CATALOG_RESOLUTION
+): readonly ProviderCatalogEntry[] {
+  if (resolution.fatalErrors.length > 0) return Object.freeze([]);
+  const blockedIds = new Set(
+    resolution.errors.flatMap((error) => (error.id ? [error.id] : []))
+  );
+  return Object.freeze(
+    resolution.entries.filter(
+      (entry) =>
+        !blockedIds.has(entry.id) &&
+        !resolution.disabledIds.includes(entry.id) &&
+        entry.capabilities.mainSession &&
+        entry.interfaces.some((candidate) =>
+          candidate.consumers.includes("claude-agent-main")
+        )
+    )
+  );
+}
 
 function fatalCatalogError(
   resolution: ProviderCatalogResolution
@@ -190,6 +222,16 @@ export function resolveClaudeCodeBackendFromModelInCatalog(
     (candidate) => candidate.model.persistedId === model
   );
   if (catalogEntry) {
+    const fatalError = fatalCatalogError(resolution);
+    if (fatalError) throw fatalError;
+    const backend = backends.find(
+      (candidate) => candidate.id === catalogEntry.id
+    );
+    if (!backend) {
+      // Valid general catalog identities are consumed by the shared runtime
+      // resolver. Only the legacy Ollama projection needs a ClaudeCodeBackend.
+      return undefined;
+    }
     return resolveClaudeCodeBackendInCatalog(
       resolution,
       backends,
@@ -256,6 +298,12 @@ export function resolveClaudeCodeBackendForConfig(config: {
  * from the per-spawn environment; process.env is never mutated.
  */
 export const CLAUDE_CODE_AMBIENT_ROUTE_ENV_KEYS = [
+  // Primary route, authentication, and generic provider credentials.
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "OPENAI_API_KEY",
+
   // Alternate sockets, gateways, relays, and generic HTTP proxying.
   "ANTHROPIC_UNIX_SOCKET",
   "CLAUDE_CODE_API_BASE_URL",
@@ -373,6 +421,37 @@ export const CLAUDE_CODE_AMBIENT_ROUTE_ENV_KEYS = [
   "CLAUDE_CODE_NO_MODEL_FALLBACK",
 ] as const;
 
+const CANONICAL_AMBIENT_ROUTE_ENV_KEYS = new Set<string>(
+  CLAUDE_CODE_AMBIENT_ROUTE_ENV_KEYS.map((key) => key.toUpperCase())
+);
+
+/**
+ * Return a copy with the named keys removed using Windows environment-key
+ * semantics. JavaScript object keys remain case-sensitive on Windows even
+ * though the child process environment does not, so exact-property deletion
+ * is insufficient for inherited mixed-case selectors.
+ */
+export function omitEnvironmentKeysCaseInsensitive(
+  source: Readonly<Record<string, string | undefined>>,
+  deniedKeys: readonly string[]
+): Record<string, string | undefined> {
+  const denied = new Set(deniedKeys.map((key) => key.toUpperCase()));
+  return Object.fromEntries(
+    Object.entries(source).filter(([key]) => !denied.has(key.toUpperCase()))
+  );
+}
+
+/** Remove every ambient route selector using case-insensitive key matching. */
+export function scrubAmbientProviderRouteEnv(
+  env: Record<string, string | undefined>
+): void {
+  for (const key of Object.keys(env)) {
+    if (CANONICAL_AMBIENT_ROUTE_ENV_KEYS.has(key.toUpperCase())) {
+      delete env[key];
+    }
+  }
+}
+
 /**
  * Overlay one backend profile onto a per-spawn environment.
  *
@@ -387,11 +466,7 @@ export function applyClaudeCodeBackendEnv(
   // ANTHROPIC_API_KEY signals first-party API-key auth to the native binary and
   // can shadow gateway routing. It must be absent, even when configured in
   // Nimbalyst settings.
-  delete env.ANTHROPIC_API_KEY;
-  delete env.ANTHROPIC_AUTH_TOKEN;
-  for (const key of CLAUDE_CODE_AMBIENT_ROUTE_ENV_KEYS) {
-    delete env[key];
-  }
+  scrubAmbientProviderRouteEnv(env);
 
   env.ANTHROPIC_BASE_URL = backend.baseUrl;
   env.ANTHROPIC_AUTH_TOKEN = backend.authToken;
@@ -408,4 +483,50 @@ export function applyClaudeCodeBackendEnv(
   env.CLAUDE_CODE_SUBAGENT_MODEL = backend.claudeModelAlias;
   env.CLAUDE_CODE_NO_MODEL_FALLBACK = "1";
   env.NO_PROXY = "127.0.0.1,localhost";
+}
+
+/** Apply one already-confirmed immutable route at the final spawn boundary. */
+export function applyProviderRuntimeLaunchPlanEnv(
+  env: Record<string, string | undefined>,
+  plan: ProviderRuntimeLaunchPlan,
+  credential: string
+): void {
+  if (!credential) {
+    throw new ProviderRuntimeRouteError(
+      "credential-unavailable",
+      `Provider route ${plan.model.catalogEntryId} credential is unavailable before launch.`
+    );
+  }
+  scrubAmbientProviderRouteEnv(env);
+
+  const modelAlias = plan.selectedInterface.modelAlias;
+  env.ANTHROPIC_BASE_URL = plan.selectedInterface.endpoint;
+  env.ANTHROPIC_AUTH_TOKEN = credential;
+  env.ANTHROPIC_DEFAULT_OPUS_MODEL = modelAlias;
+  env.ANTHROPIC_DEFAULT_SONNET_MODEL = modelAlias;
+  env.ANTHROPIC_DEFAULT_HAIKU_MODEL = modelAlias;
+  env.ANTHROPIC_DEFAULT_FABLE_MODEL = modelAlias;
+  env.ANTHROPIC_SMALL_FAST_MODEL = modelAlias;
+  env.ANTHROPIC_MODEL = modelAlias;
+  env.ANTHROPIC_CUSTOM_MODEL_OPTION = modelAlias;
+  env.CLAUDE_CODE_BG_CLASSIFIER_MODEL = modelAlias;
+  env.CLAUDE_CODE_AUTO_MODE_MODEL = modelAlias;
+  env.CLAUDE_CONTEXT_COLLAPSE_MODEL = modelAlias;
+  env.CLAUDE_CODE_SUBAGENT_MODEL = modelAlias;
+  env.CLAUDE_CODE_NO_MODEL_FALLBACK = "1";
+
+  for (const mapping of plan.resolvedControls) {
+    if (mapping.target === "launch.effort-level") {
+      env.CLAUDE_CODE_EFFORT_LEVEL = String(mapping.value);
+    }
+  }
+
+  const endpoint = new URL(plan.selectedInterface.endpoint);
+  if (
+    endpoint.hostname === "127.0.0.1" ||
+    endpoint.hostname === "localhost" ||
+    endpoint.hostname === "[::1]"
+  ) {
+    env.NO_PROXY = "127.0.0.1,localhost";
+  }
 }

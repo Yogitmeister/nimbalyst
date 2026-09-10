@@ -16,11 +16,29 @@ import type { OrchestrationMessageKind } from '@nimbalyst/runtime/ai/server/type
 
 import { resolveProjectPath } from "../utils/workspaceDetection";
 import { resolveTargetWorkspaceBinding } from "./targetWorkspaceBinding";
+import {
+  BUILT_IN_PROVIDER_CATALOG,
+  resolveProviderCatalog,
+} from "@nimbalyst/runtime/ai/server";
+import { ClaudeCodeDeps } from "@nimbalyst/runtime/ai/server/providers/claudeCode/dependencyInjection";
+
+function claudeCodeBackendIds(): string[] {
+  const resolution = ClaudeCodeDeps.providerCatalogResolutionLoader?.()
+    ?? resolveProviderCatalog(BUILT_IN_PROVIDER_CATALOG, undefined);
+  const rejected = new Set([
+    ...resolution.disabledIds,
+    ...resolution.errors.flatMap((error) => error.id ? [error.id] : []),
+  ]);
+  return resolution.entries
+    .filter((entry) => !rejected.has(entry.id))
+    .map((entry) => entry.id);
+}
 
 type CreateSessionArgs = {
   title?: string;
   provider?: string;
   model?: string;
+  claudeCodeBackend?: string;
   prompt?: string;
   useWorktree?: boolean;
   worktreeId?: string;
@@ -32,7 +50,9 @@ type SpawnSessionArgs = {
   title?: string;
   prompt: string;
   useWorktree?: boolean;
+  provider?: string;
   model?: string;
+  claudeCodeBackend?: string;
   notifyOnComplete?: boolean;
   /**
    * When true, the new session is created at the top level — no parent,
@@ -223,6 +243,12 @@ export const META_AGENT_TOOL_DEFS: Array<{
           type: "string",
           description: "Optional explicit model identifier.",
         },
+        claudeCodeBackend: {
+          type: "string",
+          get enum() { return claudeCodeBackendIds(); },
+          description:
+            "Optional accepted provider-catalog backend identity for a claude-code child. The catalog supplies the canonical persisted model; unknown, disabled, wrong-provider, and backend/model mismatches fail before child mutation. Public results expose only safe catalog identity; route and credential material never escapes.",
+        },
         prompt: {
           type: "string",
           description: "Optional initial prompt to queue for the child session immediately after creation.",
@@ -277,10 +303,21 @@ export const META_AGENT_TOOL_DEFS: Array<{
           description:
             "Default false. By default the spawned session inherits the caller's working directory: if the caller is in a worktree, the new session runs in that same worktree; if the caller is in the main checkout, the new session runs there too. Set true only when the user explicitly asks for the new session to get its OWN new worktree (separate branch and working directory) — this creates a fresh worktree rather than inheriting the caller's.",
         },
+        provider: {
+          type: "string",
+          description:
+            "Optional explicit provider. When set, it must match the model provider; a catalog backend requires provider claude-code.",
+        },
         model: {
           type: "string",
           description:
             "Optional explicit model identifier (e.g. 'claude-code:opus'). When omitted, the new session uses the global default model unless inheritModel=true. Wins over inheritModel when both are set.",
+        },
+        claudeCodeBackend: {
+          type: "string",
+          get enum() { return claudeCodeBackendIds(); },
+          description:
+            "Optional accepted provider-catalog backend identity for a claude-code child. The catalog supplies the canonical persisted model; unknown, disabled, wrong-provider, and backend/model mismatches fail before workstream, worktree, session, metadata, queue, or prompt mutation. Public results expose only safe catalog identity; route and credential material never escapes.",
         },
         inheritModel: {
           type: "boolean",

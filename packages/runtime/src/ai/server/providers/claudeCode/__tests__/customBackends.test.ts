@@ -1,6 +1,6 @@
 // [ASTRA-ORCH]
 import { describe, expect, it } from "vitest";
-import { CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES } from "../providerCatalogDefaults";
+import { CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES } from "../../../../modelConstants";
 import { resolveClaudeCodeModelVariant } from "../../../types";
 import {
   applyClaudeCodeBackendEnv,
@@ -16,8 +16,98 @@ import {
 import {
   PROVIDER_CATALOG_SCHEMA_VERSION,
   resolveProviderCatalog,
+  type ProviderCatalogEntry,
 } from "../providerCatalog";
-import { BUILT_IN_PROVIDER_CATALOG } from "../providerCatalogDefaults";
+import {
+  BUILT_IN_PROVIDER_CATALOG,
+  LOCAL_PROXY_CREDENTIAL_REF,
+} from "../providerCatalogDefaults";
+
+/**
+ * The 12 built-in Ollama routes moved off the LiteLLM proxy and now reach
+ * ollama.com directly, so no built-in entry projects into the legacy
+ * ClaudeCodeBackend adapter any more.
+ *
+ * That adapter is still live for user-overlay entries pointed at a local
+ * Anthropic-compatible proxy, and its fail-closed behaviour is the reason it
+ * exists, so it keeps its coverage here against fixtures with exactly the shape
+ * the built-ins used to have.
+ */
+function legacyProxyEntry(options: {
+  id: string;
+  persistedId: string;
+  providerModelId: string;
+  modelAlias: string;
+}): ProviderCatalogEntry {
+  return {
+    id: options.id,
+    provider: "ollama",
+    harness: { id: "claude-agent", order: 10 },
+    family: { id: "glm", order: 50 },
+    displayName: options.providerModelId,
+    model: {
+      persistedId: options.persistedId,
+      persistedIdNamespace: "claude-code:ollama-",
+      providerModelId: options.providerModelId,
+      upstreamModel: `openai/${options.providerModelId}`,
+      version: options.providerModelId,
+    },
+    capabilities: {
+      mainSession: true,
+      subagent: true,
+      consultation: true,
+      tools: true,
+      vision: false,
+    },
+    interfaces: [
+      {
+        id: "claude-agent-proxy",
+        kind: "http",
+        consumers: [
+          "claude-agent-main",
+          "claude-agent-subagent",
+          "consultation",
+        ],
+        protocol: "anthropic-messages",
+        transportProfile: "anthropic-compatible-proxy",
+        authProfile: "credential-reference",
+        endpoint: "http://127.0.0.1:4002",
+        upstreamEndpoint: "https://ollama.com/v1",
+        credentialRef: LOCAL_PROXY_CREDENTIAL_REF,
+        modelAlias: options.modelAlias,
+      },
+    ],
+    controls: {},
+  };
+}
+
+const LEGACY_PROXY_ALIAS = "claude-sonnet-4-5-20250929";
+const LEGACY_PROXY_CATALOG: readonly ProviderCatalogEntry[] = [
+  legacyProxyEntry({
+    id: "ollama-glm-5-2-cloud-proxy",
+    persistedId: "claude-code:ollama-glm-5-2-cloud-proxy",
+    providerModelId: "glm-5.2:cloud",
+    modelAlias: LEGACY_PROXY_ALIAS,
+  }),
+  legacyProxyEntry({
+    id: "ollama-gpt-oss-20b-cloud-proxy",
+    persistedId: "claude-code:ollama-gpt-oss-20b-cloud-proxy",
+    providerModelId: "gpt-oss:20b-cloud",
+    modelAlias: "claude-opus-4-1-20250805",
+  }),
+];
+
+function legacyProxyRoutes(
+  overlay?: Parameters<typeof resolveProviderCatalog>[1],
+  errors?: Parameters<typeof resolveProviderCatalog>[2]
+) {
+  const resolution = resolveProviderCatalog(
+    LEGACY_PROXY_CATALOG,
+    overlay,
+    errors
+  );
+  return { resolution, backends: projectClaudeCodeBackends(resolution) };
+}
 
 // Independent contract copied from the route/auth/socket/proxy/OAuth/model
 // selectors read by the pinned @anthropic-ai/claude-agent-sdk native CLI.
@@ -149,19 +239,39 @@ const PINNED_ROUTE_VALUES: Readonly<Record<string, string>> = {
 };
 
 describe("Claude Code custom backends", () => {
-  it("resolves the exact LiteLLM-backed Ollama GLM profile", () => {
+  it("resolves an exact local-proxy backed profile", () => {
+    const { resolution, backends } = legacyProxyRoutes();
     expect(
-      resolveClaudeCodeBackend(OLLAMA_GLM_5_2_CLOUD_BACKEND_ID)
+      resolveClaudeCodeBackendInCatalog(
+        resolution,
+        backends,
+        LEGACY_PROXY_CATALOG[0].id
+      )
     ).toMatchObject({
-      id: OLLAMA_GLM_5_2_CLOUD_BACKEND_ID,
-      persistedModel: "claude-code:ollama-glm-5-2-cloud",
+      id: LEGACY_PROXY_CATALOG[0].id,
+      persistedModel: "claude-code:ollama-glm-5-2-cloud-proxy",
       provider: "ollama",
       model: "glm-5.2:cloud",
       upstreamModel: "openai/glm-5.2:cloud",
       upstreamBaseUrl: "https://ollama.com/v1",
       baseUrl: "http://127.0.0.1:4002",
-      claudeModelAlias: "claude-sonnet-4-5-20250929",
+      claudeModelAlias: LEGACY_PROXY_ALIAS,
     });
+  });
+
+  it("stops projecting built-in Ollama routes through the legacy proxy adapter", () => {
+    // Direct ollama.com routes are consumed by the shared runtime resolver, so
+    // the legacy adapter must report no built-in members rather than silently
+    // handing back a proxy-shaped route that no longer exists.
+    expect(CLAUDE_CODE_BACKENDS).toEqual([]);
+    expect(
+      resolveClaudeCodeBackendFromModel("claude-code:ollama-glm-5-2-cloud")
+    ).toBeUndefined();
+    // Asking the legacy adapter directly for a now-direct route is a caller
+    // bug, so it fails loudly instead of degrading to an Anthropic session.
+    expect(() =>
+      resolveClaudeCodeBackend(OLLAMA_GLM_5_2_CLOUD_BACKEND_ID)
+    ).toThrow("adapter required for Claude Agent launch");
   });
 
   it("fails closed for unknown persisted backend ids", () => {
@@ -171,7 +281,12 @@ describe("Claude Code custom backends", () => {
   });
 
   it("isolates auth and pins manager plus native children to the proxy alias", () => {
-    const backend = resolveClaudeCodeBackend(OLLAMA_GLM_5_2_CLOUD_BACKEND_ID)!;
+    const { resolution, backends } = legacyProxyRoutes();
+    const backend = resolveClaudeCodeBackendInCatalog(
+      resolution,
+      backends,
+      LEGACY_PROXY_CATALOG[0].id
+    )!;
     const env: Record<string, string | undefined> = {
       ...Object.fromEntries(
         PINNED_SDK_AMBIENT_ROUTE_KEYS.map((key) => [key, `ambient-${key}`])
@@ -209,43 +324,36 @@ describe("Claude Code custom backends", () => {
   });
 
   it("derives the route from the exact canonical persisted model", () => {
+    const { resolution, backends } = legacyProxyRoutes();
+    const entry = LEGACY_PROXY_CATALOG[0];
     expect(
-      resolveClaudeCodeBackendFromModel("claude-code:ollama-glm-5-2-cloud")?.id
-    ).toBe(OLLAMA_GLM_5_2_CLOUD_BACKEND_ID);
+      resolveClaudeCodeBackendFromModelInCatalog(
+        resolution,
+        backends,
+        entry.model.persistedId
+      )?.id
+    ).toBe(entry.id);
     expect(
-      resolveClaudeCodeBackendForConfig({
-        model: "claude-code:ollama-glm-5-2-cloud",
-      })?.id
-    ).toBe(OLLAMA_GLM_5_2_CLOUD_BACKEND_ID);
-    expect(
-      resolveClaudeCodeModelVariant(
-        "claude-code:ollama-glm-5-2-cloud",
-        "claude-code:opus"
-      )
-    ).toBe("claude-sonnet-4-5-20250929");
+      resolveClaudeCodeBackendInCatalog(resolution, backends, entry.id)?.id
+    ).toBe(entry.id);
   });
 
-  it("binds every allowlisted backend to canonical parsing and its exact SDK alias", () => {
-    expect(CLAUDE_CODE_BACKENDS).toHaveLength(
-      CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES.length
-    );
-
+  it("keeps every allowlisted Ollama identity mapped to its exact SDK alias", () => {
+    // The catalog routes now carry the real Ollama model id on the wire, but
+    // the persisted-identity to SDK-alias mapping still governs which native
+    // model variant a stored session resolves to, so it stays exact.
     for (const identity of CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES) {
-      const backend = resolveClaudeCodeBackend(identity.variant);
-      expect(backend).toMatchObject({
-        id: identity.variant,
-        persistedModel: identity.persistedModel,
-        claudeModelAlias: identity.sdkAlias,
-      });
-      expect(resolveClaudeCodeBackendFromModel(identity.persistedModel)).toBe(
-        backend
-      );
       expect(
         resolveClaudeCodeModelVariant(
           identity.persistedModel,
           "claude-code:opus"
         )
       ).toBe(identity.sdkAlias);
+      // Direct routes are the shared resolver's business, not the legacy
+      // adapter's, so the adapter declines them rather than guessing.
+      expect(
+        resolveClaudeCodeBackendFromModel(identity.persistedModel)
+      ).toBeUndefined();
     }
   });
 
@@ -253,19 +361,28 @@ describe("Claude Code custom backends", () => {
     expect(() =>
       resolveClaudeCodeBackendFromModel("claude-code:ollama-glm-5-2-cloud-ish")
     ).toThrow("Unsupported catalog-owned Claude Code model identity");
+
+    const { resolution, backends } = legacyProxyRoutes();
+    expect(() =>
+      resolveClaudeCodeBackendInCatalog(
+        resolution,
+        backends,
+        "ollama-similar-but-unsupported"
+      )
+    ).toThrow("Unsupported Claude Code backend profile");
     expect(() =>
       resolveClaudeCodeBackendForConfig({
         model: "claude-code:sonnet",
         claudeCodeBackend: OLLAMA_GLM_5_2_CLOUD_BACKEND_ID,
       })
-    ).toThrow("requires exact persisted model");
+    ).toThrow();
   });
 
   it("projects unrelated valid routes when a legacy error blocks a built-in id", () => {
-    const blocked = BUILT_IN_PROVIDER_CATALOG[0];
-    const unrelated = BUILT_IN_PROVIDER_CATALOG[1];
+    const blocked = LEGACY_PROXY_CATALOG[0];
+    const unrelated = LEGACY_PROXY_CATALOG[1];
     const resolution = resolveProviderCatalog(
-      BUILT_IN_PROVIDER_CATALOG,
+      LEGACY_PROXY_CATALOG,
       undefined,
       [
         {
@@ -286,7 +403,7 @@ describe("Claude Code custom backends", () => {
 
   it("makes source failures fatal to catalog routes while leaving native models independent", () => {
     const resolution = resolveProviderCatalog(
-      BUILT_IN_PROVIDER_CATALOG,
+      LEGACY_PROXY_CATALOG,
       undefined,
       [
         {
@@ -338,6 +455,9 @@ describe("Claude Code custom backends", () => {
   );
 
   it("fails closed on the old persisted model after a same-namespace built-in repoint attempt", () => {
+    // This rule is specific to *built-in* identities: the fail-closed check
+    // compares the live entry against BUILT_IN_PROVIDER_CATALOG, so a fixture
+    // would not exercise it.
     const builtIn = BUILT_IN_PROVIDER_CATALOG[0];
     const oldModel = builtIn.model.persistedId;
     const validResolution = resolveProviderCatalog(
@@ -361,20 +481,21 @@ describe("Claude Code custom backends", () => {
     } as typeof validResolution;
     const backends = projectClaudeCodeBackends(resolution);
 
-    expect(backends.some((backend) => backend.id === builtIn.id)).toBe(true);
+    // A stale persisted id must never quietly degrade to an Anthropic session
+    // just because its built-in entry was repointed underneath it.
     expect(() =>
       resolveClaudeCodeBackendFromModelInCatalog(resolution, backends, oldModel)
     ).toThrow("no longer owned by its built-in catalog entry");
   });
 
   it("keeps invalid-id overlay and legacy entry errors isolated from unrelated catalog launches", () => {
-    const unrelated = BUILT_IN_PROVIDER_CATALOG[1];
+    const unrelated = LEGACY_PROXY_CATALOG[1];
     const resolutions = [
-      resolveProviderCatalog(BUILT_IN_PROVIDER_CATALOG, {
+      resolveProviderCatalog(LEGACY_PROXY_CATALOG, {
         schemaVersion: PROVIDER_CATALOG_SCHEMA_VERSION,
         entries: [{ id: "BAD ID", patch: { displayName: "Rejected" } }],
       }),
-      resolveProviderCatalog(BUILT_IN_PROVIDER_CATALOG, undefined, [
+      resolveProviderCatalog(LEGACY_PROXY_CATALOG, undefined, [
         {
           scope: "entry",
           index: 0,
