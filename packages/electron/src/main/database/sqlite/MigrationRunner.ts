@@ -73,12 +73,16 @@ interface ForkLaneRule {
    */
   schemaPresent: (db: SqliteDatabase) => boolean;
   /**
-   * The upstream migration that now owns a vacated legacy version, if any. It is
-   * applied inside the SAME transaction as the relocation so no other process can
-   * ever observe that version absent ג€” an older build that snapshotted the ledger
-   * mid-repair would otherwise re-run its own migration and die.
+   * Per-legacy-version upstream migration that now owns that vacated slot, if
+   * any — keyed by the legacy version it collides with, because different
+   * legacy versions can be reclaimed by different upstream migrations at
+   * different points in upstream's history (32 by feedback_request_cache,
+   * later 35 by github_issues once v0.75.5 minted it). Applied inside the SAME
+   * transaction as the relocation so no other process can ever observe that
+   * version absent — an older build that snapshotted the ledger mid-repair
+   * would otherwise re-run its own migration and die.
    */
-  upstreamSuccessor?: { version: number; name: string; file: string };
+  upstreamSuccessors?: Partial<Record<number, { version: number; name: string; file: string }>>;
 }
 
 function hasColumns(db: SqliteDatabase, table: string, required: string[]): boolean {
@@ -126,10 +130,17 @@ const FORK_LANE_RULES: ReadonlyArray<ForkLaneRule> = [
         'idx_queued_prompts_control_idempotency',
         'idx_queued_prompts_priority_pending',
       ]),
-    upstreamSuccessor: {
-      version: 32,
-      name: 'feedback_request_cache',
-      file: '0032_feedback_request_cache.sql',
+    upstreamSuccessors: {
+      32: {
+        version: 32,
+        name: 'feedback_request_cache',
+        file: '0032_feedback_request_cache.sql',
+      },
+      35: {
+        version: 35,
+        name: 'github_issues',
+        file: '0035_github_issues.sql',
+      },
     },
   },
 ];
@@ -179,8 +190,8 @@ export function repairForkLedger(db: SqliteDatabase, schemaDir: string): ForkLan
         return;
       }
 
-      const successor = rule.upstreamSuccessor;
-      if (successor && legacy.version === successor.version) {
+      const successor = rule.upstreamSuccessors?.[legacy.version];
+      if (successor) {
         // Vacate and immediately refill the number in one transaction. Readers see
         // either the old state or the repaired one, never a hole at this version.
         move.run(rule.canonical, legacy.version, rule.name);
@@ -229,6 +240,19 @@ export function findLedgerNameMismatches(
   for (const m of migrations) {
     const recorded = recordedByVersion.get(m.version);
     if (recorded !== undefined && recorded !== m.name) {
+      // A row still sitting under a known fork-lane legacy identity is not an
+      // unknown disagreement — repairForkLedger already decided, via
+      // schemaPresent, whether it was safe to relocate. If it declined (the
+      // claim was not backed by real schema), the normal apply loop below
+      // reconciles what it can: a narrower, more informative outcome (or a
+      // clean re-apply) than failing this whole build closed over a row the
+      // repair system already recognizes and has deliberately left alone.
+      const isKnownLegacyIdentity = FORK_LANE_RULES.some(
+        (rule) => rule.legacyVersions.includes(m.version) && rule.name === recorded,
+      );
+      if (isKnownLegacyIdentity) {
+        continue;
+      }
       mismatches.push({ version: m.version, recorded, expected: m.name });
     }
   }

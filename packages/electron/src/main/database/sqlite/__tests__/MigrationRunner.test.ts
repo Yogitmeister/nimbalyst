@@ -412,23 +412,46 @@ describe('fork-lane migration numbering', () => {
     try {
       // The state any database reaches when the first v0.74.3 fold build — which
       // numbered the carry 35 — migrated successfully. Upstream 32-34 are intact;
-      // only the carry sits at the wrong number.
+      // only the carry sits at the wrong number. Upstream did not yet own 35 at
+      // that point in history (it does now, as github_issues, v0.75.5) -- undo
+      // that real migration first so the fixture is a faithful v0.74.3-era
+      // database, same as the pre-fold test above does for 32-34.
       runMigrations(db, schemaDir);
-      db.exec('DELETE FROM _migrations WHERE version = 1001');
+      db.exec('DROP TABLE IF EXISTS github_issue_poll_state');
+      db.exec('DROP TABLE IF EXISTS github_issue_events');
+      db.exec('DROP TABLE IF EXISTS github_issue_comments');
+      db.exec('DROP TABLE IF EXISTS github_issues');
+      db.exec('DROP INDEX IF EXISTS idx_tracker_github_issue_overlay_url');
+      db.exec('DELETE FROM _migrations WHERE version IN (35, 1001)');
       db.prepare("INSERT INTO _migrations (version, name) VALUES (35, 'queued_prompt_priority_control')").run();
 
       const before = db.prepare('PRAGMA table_info(queued_prompts)').all() as Array<{ name: string }>;
 
-      // Without the 35 alias this reruns the carry and dies on ADD COLUMN.
+      // Without the 35 alias this reruns the carry and dies on ADD COLUMN. The
+      // vacated slot is also now a real upstream migration (github_issues,
+      // v0.75.5), so the repair must backfill it in the same transaction —
+      // same as the 32 case above — or github_issues silently never runs.
       const result = runMigrations(db, schemaDir);
 
       expect(result.relocated).toEqual([
-        { from: 35, to: 1001, name: 'queued_prompt_priority_control' },
+        {
+          from: 35,
+          to: 1001,
+          name: 'queued_prompt_priority_control',
+          backfilled: { version: 35, name: 'github_issues' },
+        },
       ]);
-      expect(result.applied).toEqual([]);
+      expect(result.applied).not.toContain(35);
+      expect(result.applied).not.toContain(1001);
       const after = db.prepare('PRAGMA table_info(queued_prompts)').all() as Array<{ name: string }>;
       expect(after.map((c) => c.name)).toEqual(before.map((c) => c.name));
-      expect(db.prepare('SELECT name FROM _migrations WHERE version = 35').get()).toBeUndefined();
+      expect(db.prepare('SELECT name FROM _migrations WHERE version = 35').get()).toEqual({
+        name: 'github_issues',
+      });
+      const tables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='github_issues'")
+        .all();
+      expect(tables).toHaveLength(1);
     } finally {
       db.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -446,8 +469,15 @@ describe('fork-lane migration numbering', () => {
       // A ledger row claiming the carry ran, on a database whose queued_prompts
       // never got the columns — reachable through adoption or hand repair.
       // Canonicalizing on the name alone would record it applied forever and
-      // leave the schema missing: the silent defect, recreated.
-      db.exec('DELETE FROM _migrations WHERE version = 1001');
+      // leave the schema missing: the silent defect, recreated. Undo upstream's
+      // real 35 (github_issues, v0.75.5) first so 35 is free for the fixture,
+      // same as the "recorded as 35" test above.
+      db.exec('DROP TABLE IF EXISTS github_issue_poll_state');
+      db.exec('DROP TABLE IF EXISTS github_issue_events');
+      db.exec('DROP TABLE IF EXISTS github_issue_comments');
+      db.exec('DROP TABLE IF EXISTS github_issues');
+      db.exec('DROP INDEX IF EXISTS idx_tracker_github_issue_overlay_url');
+      db.exec('DELETE FROM _migrations WHERE version IN (35, 1001)');
       db.exec('DROP INDEX IF EXISTS idx_queued_prompts_control_idempotency');
       db.exec('DROP INDEX IF EXISTS idx_queued_prompts_priority_pending');
       for (const col of [
@@ -481,7 +511,14 @@ describe('fork-lane migration numbering', () => {
     const db = new Database(dbPath);
     try {
       runMigrations(db, schemaDir);
-      db.exec('DELETE FROM _migrations WHERE version = 1001');
+      // Undo upstream's real 35 (github_issues, v0.75.5) first so 35 is free
+      // for the fixture, same as the other "recorded as 35" tests above.
+      db.exec('DROP TABLE IF EXISTS github_issue_poll_state');
+      db.exec('DROP TABLE IF EXISTS github_issue_events');
+      db.exec('DROP TABLE IF EXISTS github_issue_comments');
+      db.exec('DROP TABLE IF EXISTS github_issues');
+      db.exec('DROP INDEX IF EXISTS idx_tracker_github_issue_overlay_url');
+      db.exec('DELETE FROM _migrations WHERE version IN (35, 1001)');
       db.exec('ALTER TABLE queued_prompts DROP COLUMN delivery_class');
       db.prepare("INSERT INTO _migrations (version, name) VALUES (35, 'queued_prompt_priority_control')").run();
 
