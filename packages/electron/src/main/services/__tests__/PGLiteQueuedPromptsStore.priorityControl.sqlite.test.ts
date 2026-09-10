@@ -1,21 +1,32 @@
 // [ASTRA-ORCH]
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { SQLiteDatabase } from '../../database/sqlite/SQLiteDatabase';
 import { createSQLiteStoreAdapter } from '../../database/sqlite/SQLiteStoreAdapter';
 import { createPGLiteQueuedPromptsStore } from '../PGLiteQueuedPromptsStore';
+import {
+  createPriorityPromptDeliveryService,
+  type PriorityControlPrompt,
+} from '../PriorityPromptDeliveryService';
+
+const ORPHANED_PRIORITY_INTERRUPT_ERROR =
+  'Priority interrupt outcome is unknown after restart. Inspect the session, then reissue the control operation.';
 
 describe('PGLiteQueuedPromptsStore priority control rows on SQLite', () => {
   let tmpDir: string;
   let database: SQLiteDatabase;
-  beforeEach(async () => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-priority-queue-'));
-    database = new SQLiteDatabase({
+  function createDatabase() {
+    return new SQLiteDatabase({
       dbDir: tmpDir, schemaDir: path.resolve(__dirname, '../../database/sqlite/schemas'),
       slowQueryThresholdMs: 1000, sampleRate: 0,
     });
+  }
+  beforeEach(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-priority-queue-'));
+    database = createDatabase();
     await database.initialize();
     await database.query(`INSERT INTO ai_sessions (id, workspace_id, provider, title) VALUES ($1, $2, $3, $4)`,
       ['session-1', 'D:\\repo', 'openai-codex', 'Target']);
@@ -23,8 +34,12 @@ describe('PGLiteQueuedPromptsStore priority control rows on SQLite', () => {
   afterEach(async () => { await database.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
   function input() {
+    const requestDigest = createHash('sha256').update(JSON.stringify({
+      sessionId: 'session-1', prompt: 'priority', producer: 'send_prompt_now:caller',
+      controlOperation: 'operator_directive',
+    })).digest('hex');
     return { id: 'control-1', sessionId: 'session-1', prompt: 'priority', producer: 'send_prompt_now:caller',
-      idempotencyKey: 'priority:key-1', requestDigest: 'digest-1', controlOperation: 'operator_directive' };
+      idempotencyKey: 'priority:key-1', requestDigest, controlOperation: 'operator_directive' };
   }
 
   it('keeps ordinary FIFO while a released control row sorts first', async () => {
@@ -58,6 +73,83 @@ describe('PGLiteQueuedPromptsStore priority control rows on SQLite', () => {
     const receipt = { generation: 'running:10:20', attempted: true, success: true, method: 'interrupt', error: null, nativeEntered: true, recordedAt: 30 };
     await expect(store.recordPriorityInterruptReceipt({ promptId: 'control-1', generation: receipt.generation, receipt })).resolves.toMatchObject({ interruptReceipt: receipt });
     await expect(store.listPending('session-1')).resolves.toMatchObject([{ id: 'control-1', deliveryReady: true }]);
+  });
+
+  it('fails a receipt-less interrupt reservation once on restart without retrying native interrupt or dispatch', async () => {
+    const initialStore = createPGLiteQueuedPromptsStore(createSQLiteStoreAdapter(database));
+    await initialStore.create({ id: 'ordinary-1', sessionId: 'session-1', prompt: 'ordinary' });
+    await initialStore.createPriorityControlPrompt(input());
+    await initialStore.reservePriorityInterrupt({
+      promptId: 'control-1', generation: 'running:10:20', owner: 'dead-process',
+    });
+
+    const receiptedInput = {
+      ...input(), id: 'control-receipted', idempotencyKey: 'priority:key-receipted', requestDigest: 'digest-receipted',
+    };
+    await initialStore.createPriorityControlPrompt(receiptedInput);
+    await initialStore.reservePriorityInterrupt({
+      promptId: receiptedInput.id, generation: 'idle:10:20', owner: 'completed-process',
+    });
+    await initialStore.recordPriorityInterruptReceipt({
+      promptId: receiptedInput.id, generation: 'idle:10:20', receipt: {
+        generation: 'idle:10:20', attempted: false, success: true, method: 'not-required',
+        error: null, nativeEntered: false, recordedAt: 30,
+      },
+    });
+
+    await database.close();
+    database = createDatabase();
+    await database.initialize();
+    const restartedStore = createPGLiteQueuedPromptsStore(createSQLiteStoreAdapter(database));
+
+    await expect(restartedStore.sweepExecutingOnBoot()).resolves.toEqual({
+      completed: 0, failed: 1, rolledBack: 0,
+    });
+    await expect(restartedStore.get('control-1')).resolves.toMatchObject({
+      status: 'failed', completedAt: expect.any(Number), deliveryReady: false,
+      errorMessage: ORPHANED_PRIORITY_INTERRUPT_ERROR,
+      interruptReservationOwner: 'dead-process', interruptReceipt: undefined,
+    });
+    await expect(restartedStore.get('ordinary-1')).resolves.toMatchObject({ status: 'pending' });
+    await expect(restartedStore.get('control-receipted')).resolves.toMatchObject({
+      status: 'pending', deliveryReady: true, interruptReceipt: { success: true },
+    });
+    await expect(restartedStore.sweepExecutingOnBoot()).resolves.toEqual({
+      completed: 0, failed: 0, rolledBack: 0,
+    });
+
+    const getTargetState = vi.fn();
+    const reserveInterrupt = vi.fn();
+    const recordInterruptReceipt = vi.fn();
+    const interruptCurrentTurn = vi.fn();
+    const triggerProcessing = vi.fn();
+    const service = createPriorityPromptDeliveryService({
+      createControlPrompt: async (request) => {
+        const replay = await restartedStore.createPriorityControlPrompt(request);
+        return { row: replay.row as unknown as PriorityControlPrompt, replayed: replay.replayed };
+      },
+      getTargetState,
+      hasStructuredPendingPrompt: vi.fn(),
+      reserveInterrupt,
+      recordInterruptReceipt,
+      interruptCurrentTurn,
+      triggerProcessing,
+      getControlPrompt: vi.fn(),
+      createControlPromptId: () => 'ignored-on-replay',
+    });
+    const repeat = () => service.deliver({
+      sessionId: 'session-1', workspacePath: 'D:\\repo', prompt: 'priority',
+      idempotencyKey: 'priority:key-1', producer: 'send_prompt_now:caller',
+      controlOperation: 'operator_directive', interruptWaitingForInput: false,
+    });
+
+    await expect(repeat()).rejects.toThrow(ORPHANED_PRIORITY_INTERRUPT_ERROR);
+    await expect(repeat()).rejects.toThrow(ORPHANED_PRIORITY_INTERRUPT_ERROR);
+    expect(getTargetState).not.toHaveBeenCalled();
+    expect(reserveInterrupt).not.toHaveBeenCalled();
+    expect(recordInterruptReceipt).not.toHaveBeenCalled();
+    expect(interruptCurrentTurn).not.toHaveBeenCalled();
+    expect(triggerProcessing).not.toHaveBeenCalled();
   });
 
   it('creates one durable row when same-ID mobile ingestion races', async () => {

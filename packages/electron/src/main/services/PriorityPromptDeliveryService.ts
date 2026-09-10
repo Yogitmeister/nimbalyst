@@ -38,6 +38,7 @@ export interface PriorityControlPrompt {
   interruptTargetGeneration: string | null;
   interruptReservationOwner: string | null;
   interruptReceipt: PriorityInterruptReceipt | null;
+  errorMessage?: string;
 }
 
 interface CreateControlPromptInput {
@@ -127,6 +128,9 @@ export function createPriorityPromptDeliveryService(deps: Dependencies) {
         requestDigest: digest({ sessionId, prompt, producer, controlOperation }), controlOperation,
       });
       let row = created.row;
+      if (row.status === 'failed' && !row.interruptReceipt) {
+        throw new Error(row.errorMessage ?? 'Priority control prompt failed before its interrupt outcome was recorded');
+      }
       const targetBefore = await deps.getTargetState(sessionId, workspacePath);
       const result = (action: PriorityPromptDeliveryReceipt['action'], targetAfter: PriorityTargetState, called: boolean, accepted: boolean): PriorityPromptDeliveryReceipt => ({
         sessionId, queuedPromptId: row.id, deliveryClass: 'control', priorityRank: row.priorityRank,

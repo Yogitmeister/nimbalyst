@@ -239,6 +239,9 @@ type EnsureReadyFn = () => Promise<void>;
 const SWEEP_UNANSWERED_ERROR =
   'Prompt was delivered but the turn was interrupted before a response was recorded. Send it again to retry.';
 
+const ORPHANED_PRIORITY_INTERRUPT_ERROR =
+  'Priority interrupt outcome is unknown after restart. Inspect the session, then reissue the control operation.';
+
 function rowToQueuedPrompt(row: any): QueuedPrompt {
   // Parse JSONB fields
   let attachments = row.attachments;
@@ -386,7 +389,7 @@ export function createPGLiteQueuedPromptsStore(
         `INSERT INTO queued_prompts (
            id, session_id, prompt, delivery_class, priority_rank, delivery_ready, producer,
            idempotency_key, request_digest, control_operation
-         ) VALUES ($1, $2, $3, 'control', 100, FALSE, $4, $5, $6, $7)
+         ) VALUES ($1, $2, $3, 'control', 100, 0, $4, $5, $6, $7)
          ON CONFLICT (session_id, idempotency_key)
            WHERE idempotency_key IS NOT NULL DO NOTHING
          RETURNING *`,
@@ -440,7 +443,7 @@ export function createPGLiteQueuedPromptsStore(
 
       const { rows } = await db.query<any>(
         `SELECT * FROM queued_prompts
-         WHERE session_id = $1 AND status = 'pending' AND delivery_ready = TRUE
+         WHERE session_id = $1 AND status = 'pending' AND delivery_ready = 1
          ORDER BY priority_rank DESC, created_at ASC, id ASC`,
         [sessionId]
       );
@@ -462,8 +465,8 @@ export function createPGLiteQueuedPromptsStore(
       await ensureReady();
       const { rows } = await db.query<{ session_id: string }>(
         `SELECT session_id FROM queued_prompts
-         WHERE status = 'pending' AND delivery_ready = TRUE
-           AND ($1 IS NULL OR delivery_class = $1)
+         WHERE status = 'pending' AND delivery_ready = 1
+           AND ($1::text IS NULL OR delivery_class = $1::text)
          GROUP BY session_id ORDER BY MIN(created_at) ASC, session_id ASC`,
         [options?.deliveryClass ?? null],
       );
@@ -490,7 +493,7 @@ export function createPGLiteQueuedPromptsStore(
         `UPDATE queued_prompts SET interrupt_receipt = $3, delivery_ready = $4
          WHERE id = $1 AND interrupt_target_generation = $2 AND interrupt_receipt IS NULL
          RETURNING *`,
-        [input.promptId, input.generation, JSON.stringify(input.receipt), input.receipt.success],
+        [input.promptId, input.generation, JSON.stringify(input.receipt), input.receipt.success ? 1 : 0],
       );
       if (rows.length > 0) return rowToQueuedPrompt(rows[0]);
       const existing = await db.query<any>(`SELECT * FROM queued_prompts WHERE id = $1 LIMIT 1`, [input.promptId]);
@@ -530,7 +533,7 @@ export function createPGLiteQueuedPromptsStore(
       const { rows } = await db.query<any>(
         `UPDATE queued_prompts
          SET status = 'executing', claimed_at = CURRENT_TIMESTAMP
-         WHERE id = $1 AND status = 'pending' AND delivery_ready = TRUE
+         WHERE id = $1 AND status = 'pending' AND delivery_ready = 1
          RETURNING *`,
         [id]
       );
@@ -640,10 +643,32 @@ export function createPGLiteQueuedPromptsStore(
 
     async sweepExecutingOnBoot(): Promise<{ completed: number; failed: number; rolledBack: number }> {
       await ensureReady();
-      const inboxResult = await db.query(
-        `UPDATE queued_prompts SET status = 'failed', completed_at = CURRENT_TIMESTAMP, error_message = $1
-         WHERE status = 'executing' AND document_context->'inboxDelivery' IS NOT NULL RETURNING id`,
-        ['Inbox reports were recorded during an interrupted turn; delivery is uncertain and will not be replayed automatically.'],
+      // A reservation is durable but its owning process is not. If boot finds
+      // one without a receipt, the old process may have died on either side of
+      // native interrupt entry. Retrying could interrupt a second turn, while
+      // releasing the row could dispatch without a proven interrupt. Fail the
+      // row atomically and require an inspected, explicit reissue instead.
+      const bootTerminalResult = await db.query(
+        `UPDATE queued_prompts
+         SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+             error_message = CASE
+               WHEN status = 'pending' AND delivery_class = 'control'
+                 AND interrupt_reservation_owner IS NOT NULL AND interrupt_receipt IS NULL THEN $1
+               ELSE $2
+             END,
+             delivery_ready = CASE
+               WHEN status = 'pending' AND delivery_class = 'control'
+                 AND interrupt_reservation_owner IS NOT NULL AND interrupt_receipt IS NULL THEN 0
+               ELSE delivery_ready
+             END
+         WHERE (status = 'executing' AND document_context->'inboxDelivery' IS NOT NULL)
+            OR (status = 'pending' AND delivery_class = 'control'
+                AND interrupt_reservation_owner IS NOT NULL AND interrupt_receipt IS NULL)
+         RETURNING id`,
+        [
+          ORPHANED_PRIORITY_INTERRUPT_ERROR,
+          'Inbox reports were recorded during an interrupted turn; delivery is uncertain and will not be replayed automatically.',
+        ],
       );
 
 
@@ -747,12 +772,12 @@ export function createPGLiteQueuedPromptsStore(
       );
 
       const completed = completedResult.rows.length;
-      const failed = failedResult.rows.length + inboxResult.rows.length;
+      const failed = failedResult.rows.length + bootTerminalResult.rows.length;
       const rolledBack = rolledBackResult.rows.length;
 
       if (completed > 0 || failed > 0 || rolledBack > 0) {
         console.log(
-          `[QueuedPromptsStore] Boot sweep: marked ${completed} answered prompt(s) completed, ${failed} delivered-but-unanswered prompt(s) failed, rolled back ${rolledBack} undelivered prompt(s)`
+          `[QueuedPromptsStore] Boot sweep: marked ${completed} answered prompt(s) completed, ${failed} uncertain-or-unanswered prompt(s) failed, rolled back ${rolledBack} undelivered prompt(s)`
         );
       }
 

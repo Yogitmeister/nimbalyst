@@ -114,4 +114,36 @@ describe('PriorityPromptDeliveryService', () => {
     expect(interruptCurrentTurn).not.toHaveBeenCalled();
     expect(result.action).toBe('interrupt_receipt_replayed');
   });
+
+  it('re-drives a pending row with a successful receipt without interrupting twice', async () => {
+    createControlPrompt.mockResolvedValue({ row: row({
+      status: 'pending', deliveryReady: true, interruptTargetGeneration: 'running:10:20',
+      interruptReservationOwner: 'owner', interruptReceipt: {
+        generation: 'running:10:20', attempted: true, success: true, method: 'interrupt',
+        error: null, nativeEntered: true, recordedAt: 20,
+      },
+    }), replayed: true });
+
+    const result = await deliver();
+
+    expect(reserveInterrupt).not.toHaveBeenCalled();
+    expect(interruptCurrentTurn).not.toHaveBeenCalled();
+    expect(triggerProcessing).toHaveBeenCalledWith(sessionId, workspacePath);
+    expect(result.action).toBe('interrupt_receipt_replayed');
+    expect(result.processingTriggerAccepted).toBe(true);
+  });
+
+  it('surfaces a boot-failed receipt-less reservation before lifecycle reads or side effects', async () => {
+    const recoveryError = 'Priority interrupt outcome is unknown after restart. Inspect the session, then reissue the control operation.';
+    createControlPrompt.mockResolvedValue({ row: row({
+      status: 'failed', interruptTargetGeneration: 'running:10:20',
+      interruptReservationOwner: 'dead-process', errorMessage: recoveryError,
+    }), replayed: true });
+
+    await expect(deliver()).rejects.toThrow(recoveryError);
+    expect(getTargetState).not.toHaveBeenCalled();
+    expect(reserveInterrupt).not.toHaveBeenCalled();
+    expect(interruptCurrentTurn).not.toHaveBeenCalled();
+    expect(triggerProcessing).not.toHaveBeenCalled();
+  });
 });
