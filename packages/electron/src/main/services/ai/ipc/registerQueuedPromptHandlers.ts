@@ -7,6 +7,7 @@ import { type DriveReason } from '.././QueueDriveService';
 import { getFileExtensionForAnalytics, safeSend } from '.././aiServiceUtils';
 import { flushNextClaudeCliQueuedPromptForSession } from '.././claudeCliQueueFlushSingleton';
 import { type AIServiceContext } from './AIServiceContext';
+import { shouldDriveNewlyQueuedPrompt } from '../queuedPromptDrivePolicy';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 
 /**
@@ -204,7 +205,7 @@ export function registerQueuedPromptHandlers(ctx: AIServiceContext): void {
 
     // Every provider needs the durable queue-drive edge after persistence.
     // Keep the CLI live-PID idle kick above; DB claims make the paths race-safe.
-    if (queuedSession?.workspacePath) {
+    if (shouldDriveNewlyQueuedPrompt(queuedSession)) {
       ctx.requestQueueDrive(sessionId, queuedSession.workspacePath, 'renderer-trigger');
     }
 
