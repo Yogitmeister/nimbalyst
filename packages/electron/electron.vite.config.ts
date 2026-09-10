@@ -279,7 +279,7 @@ export default defineConfig({
       // a future build by someone who doesn't know this note exists; a flag
       // doesn't. Bump this default alongside the next release label.
       'process.env.BUILD_IDENTITY': JSON.stringify(
-        process.env.NIMBALYST_BUILD_IDENTITY || (isOfficialBuild ? '' : 'v16')
+        process.env.NIMBALYST_BUILD_IDENTITY || (isOfficialBuild ? '' : 'v16c')
       ),
       // Note: RUN_ONE_DEV_MODE is intentionally NOT defined here.
       // The main process reads it from the actual runtime environment via process.env.
