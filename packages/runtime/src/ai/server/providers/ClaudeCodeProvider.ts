@@ -47,7 +47,7 @@ import {
 import {
   CLAUDE_CODE_VARIANT_VERSIONS,
   CLAUDE_CODE_MODEL_LABELS,
-  CLAUDE_CODE_VARIANTS_WITH_1M,
+  CLAUDE_CODE_SDK_VARIANTS_WITH_1M,
   CLAUDE_CODE_SAFE_FALLBACK_MODEL,
   baseContextWindowForVariant,
 } from '../../modelConstants';
@@ -3576,7 +3576,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       // Add a separate 1M (`-1m`) row only for variants that still gate 1M
       // behind the suffix. Current-gen variants are excluded — their base row is
       // already 1M, so a `-1m` row would be a redundant duplicate.
-      if ((CLAUDE_CODE_VARIANTS_WITH_1M as readonly string[]).includes(variant)) {
+      if ((CLAUDE_CODE_SDK_VARIANTS_WITH_1M as readonly string[]).includes(variant)) {
         models.push({
           id: ModelIdentifier.create('claude-code', `${variant}-1m`).combined,
           name: `Claude Agent · ${CLAUDE_CODE_MODEL_LABELS[variant]} ${CLAUDE_CODE_VARIANT_VERSIONS[variant]} (1M)`,

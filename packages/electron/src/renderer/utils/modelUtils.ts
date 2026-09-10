@@ -23,6 +23,7 @@ import {
   type ClaudeCodeVariant,
 } from '@nimbalyst/runtime/ai/modelConstants';
 import { CLAUDE_CODE_VARIANTS, ModelIdentifier, isClaudeCodeFamily } from '@nimbalyst/runtime/ai/server/types';
+import { BUILT_IN_PROVIDER_CATALOG } from '@nimbalyst/runtime/ai/server/providers/claudeCode/providerCatalogDefaults';
 
 export {
   type EffortLevel,
@@ -97,8 +98,29 @@ function getClaudeCodeFamilyPrefix(modelId?: string): string {
   return parsed?.provider === 'claude-code-cli' ? 'Claude Code CLI' : 'Claude Agent';
 }
 
+/**
+ * Display name for a catalog-owned brain-swap route, or null if the id is not
+ * one.
+ *
+ * Without this, every non-Anthropic route fell through to the `?? 'sonnet'`
+ * fallback below and the picker announced "Claude Agent · Sonnet 5" for a
+ * DeepSeek or Ollama session until the dropdown was opened. Labelling a model
+ * as a different vendor's model is worse than showing a raw id, so an unknown
+ * catalog id now renders itself rather than borrowing a name.
+ */
+function getCatalogRouteLabel(modelId?: string): string | null {
+  if (!modelId) return null;
+  const entry = BUILT_IN_PROVIDER_CATALOG.find(
+    (candidate) => candidate.model.persistedId.toLowerCase() === modelId.toLowerCase(),
+  );
+  return entry ? entry.displayName : null;
+}
+
 export function getClaudeCodeModelLabel(modelId?: string): string {
-  const variant = extractClaudeCodeVariant(modelId) ?? 'sonnet';
+  const catalogLabel = getCatalogRouteLabel(modelId);
+  if (catalogLabel) return catalogLabel;
+  const variant = extractClaudeCodeVariant(modelId);
+  if (!variant) return modelId ?? '';
   const parsed = modelId ? ModelIdentifier.tryParse(modelId) : null;
   const version = CLAUDE_CODE_VARIANT_VERSIONS[variant];
   const suffix = parsed?.isExtendedContext ? ' (1M)' : '';
@@ -106,7 +128,10 @@ export function getClaudeCodeModelLabel(modelId?: string): string {
 }
 
 export function getClaudeCodeModelShortLabel(modelId?: string): string {
-  const variant = extractClaudeCodeVariant(modelId) ?? 'sonnet';
+  const catalogLabel = getCatalogRouteLabel(modelId);
+  if (catalogLabel) return catalogLabel;
+  const variant = extractClaudeCodeVariant(modelId);
+  if (!variant) return modelId ?? '';
   const parsed = modelId ? ModelIdentifier.tryParse(modelId) : null;
   const version = CLAUDE_CODE_VARIANT_VERSIONS[variant];
   const suffix = parsed?.isExtendedContext ? ' (1M)' : '';

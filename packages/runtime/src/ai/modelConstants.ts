@@ -560,6 +560,27 @@ export const CLAUDE_CODE_NATIVE_1M_VARIANTS: readonly ClaudeCodeVariant[] = [
 export const CLAUDE_CODE_VARIANTS_WITH_1M: readonly ClaudeCodeVariant[] = ['opus', 'fable'];
 
 /**
+ * Variants that get a `-1m` row on the **Agent SDK** path: none.
+ *
+ * The reasoning above is CLI-specific. It holds because Nimbalyst's own CLI
+ * observation proxy sets `ANTHROPIC_BASE_URL`, which suppresses the plan-based
+ * 1M upgrade — so on that path the `-1m` row is the only way to reach 1M and
+ * must stay. The Agent SDK path has no such proxy: its plain `opus` and `fable`
+ * rows are already 1M, which is exactly what the emitting code's own comment
+ * says ("a `-1m` row would be a redundant duplicate"). It nonetheless read the
+ * CLI list and shipped the duplicate anyway.
+ *
+ * Removing the rows is safe for existing sessions: a persisted
+ * `claude-code:opus-1m` still parses to the `opus` base variant and still sends
+ * the explicit `[1m]` form, so it keeps running at 1M. The row simply stops
+ * being offered for new sessions.
+ *
+ * Do not "simplify" this back into one list — commit abadd3c3b already reverted
+ * a blanket removal because it broke the CLI path.
+ */
+export const CLAUDE_CODE_SDK_VARIANTS_WITH_1M: readonly ClaudeCodeVariant[] = [];
+
+/**
  * The base (non-`-1m`) context window for a Claude Agent variant, used to seed
  * the context-fill meter before any real signal arrives and as the fallback when
  * the SDK doesn't report a per-model window. Haiku is 200k; see
