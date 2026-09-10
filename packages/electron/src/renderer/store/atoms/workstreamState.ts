@@ -1226,7 +1226,17 @@ const persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
  */
 function schedulePersist(workstreamId: string): void {
   if (!currentWorkspacePath) {
-    throw new Error('[workstreamState] Cannot persist - initWorkstreamState not called');
+    // A write that lands before AgentMode's mount effect has supplied the
+    // workspace path used to be fatal, which surfaced as a "Something went
+    // wrong" renderer crash on first open. Skipping is safe: the write stays in
+    // the atom, and the next state change for this workstream schedules a
+    // persist that captures it. Draining it here instead would risk writing
+    // pre-load defaults over saved state, since loadWorkstreamStates has not
+    // run yet.
+    console.warn(
+      `[workstreamState] Skipping persist for ${workstreamId} - initWorkstreamState not called yet`
+    );
+    return;
   }
   const workspacePath = currentWorkspacePath;
 
