@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import React from 'react';
 import { act, cleanup, render } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -15,7 +16,7 @@ vi.mock('../../../store', () => ({
   sessionProcessingAtom: () => false, sessionUnreadAtom: () => false, createChildSessionAtom: null,
 }));
 vi.mock('../../../store/atoms/appSettings', () => ({ defaultAgentModelAtom: null }));
-vi.mock('../../../store/atoms/workstreamState', () => ({ workstreamHasChildrenAtom: () => true }));
+vi.mock('../../../store/atoms/workstreamState', () => ({ workstreamHasChildrenAtom: () => true, workstreamTypeAtom: () => null }));
 vi.mock('../AgentSessionPanel', () => ({ AgentSessionPanel: () => null }));
 vi.mock('../../AgenticCoding/SessionContextMenu', () => ({ SessionContextMenu: () => null }));
 

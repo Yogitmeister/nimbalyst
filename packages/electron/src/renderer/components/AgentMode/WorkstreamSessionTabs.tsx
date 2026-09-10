@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * WorkstreamSessionTabs - Manages session tabs + displays active session panel.
  *
@@ -26,9 +27,13 @@ import {
 } from '../../store';
 import { defaultAgentModelAtom } from '../../store/atoms/appSettings';
 import { convertToWorkstreamAtom } from '../../store/atoms/sessions';
-import { workstreamHasChildrenAtom } from '../../store/atoms/workstreamState';
+import {
+  workstreamHasChildrenAtom,
+  workstreamTypeAtom,
+} from '../../store/atoms/workstreamState';
 import { SessionContextMenu } from '../AgenticCoding/SessionContextMenu';
 import type { SerializableDocumentContext } from '../../hooks/useDocumentContext';
+import { isStructuralWorkstreamContainer } from '../../../shared/sessionHierarchy';
 
 export interface WorkstreamSessionTabsProps {
   workspacePath: string;
@@ -292,6 +297,7 @@ export const WorkstreamSessionTabs: React.FC<WorkstreamSessionTabsProps> = React
   collapseTranscript = false,
 }) => {
   const hasChildren = useAtomValue(workstreamHasChildrenAtom(workstreamId));
+  const storedWorkstreamType = useAtomValue(workstreamTypeAtom(workstreamId));
   const createChildSession = useSetAtom(createChildSessionAtom);
   const convertToWorkstream = useSetAtom(convertToWorkstreamAtom);
   const defaultModel = useAtomValue(defaultAgentModelAtom);
@@ -308,9 +314,11 @@ export const WorkstreamSessionTabs: React.FC<WorkstreamSessionTabsProps> = React
     const registry = store.get(sessionRegistryAtom);
     const sessionMeta = registry.get(workstreamId);
     const resolvedParentId = sessionMeta?.parentSessionId || workstreamId;
+    const isStructuralContainer = isStructuralWorkstreamContainer(sessionMeta)
+      || storedWorkstreamType === 'workstream';
 
     // Regular workstream logic
-    if (hasChildren || resolvedParentId !== workstreamId) {
+    if (hasChildren || isStructuralContainer || resolvedParentId !== workstreamId) {
       // Already a workstream (has children, or we resolved to a parent) - create a child
       await createChildSession({
         parentSessionId: resolvedParentId,
@@ -325,21 +333,34 @@ export const WorkstreamSessionTabs: React.FC<WorkstreamSessionTabsProps> = React
         model: defaultModel,
       });
     }
-  }, [workstreamId, workspacePath, hasChildren, worktreeId, onAddSessionToWorktree, createChildSession, convertToWorkstream, defaultModel]);
+  }, [workstreamId, workspacePath, hasChildren, storedWorkstreamType, worktreeId, onAddSessionToWorktree, createChildSession, convertToWorkstream, defaultModel]);
 
-  if (!activeSessionId) {
+  const routableActiveSessionId = activeSessionId && sessions.includes(activeSessionId)
+    ? activeSessionId
+    : sessions[0] ?? null;
+
+  if (sessions.length === 0) {
     return (
-      <div className="workstream-session-tabs-empty flex items-center justify-center h-full text-[var(--nim-text-muted)] text-sm">
-        <p>Loading sessions...</p>
+      <div className="workstream-session-tabs flex flex-col overflow-hidden h-full">
+        <SessionTabBar
+          sessions={[]}
+          activeSessionId={null}
+          onSessionSelect={onSessionSelect}
+          onNewSession={handleNewSession}
+        />
       </div>
     );
+  }
+
+  if (!routableActiveSessionId) {
+    return null;
   }
 
   return (
     <div className={`workstream-session-tabs flex flex-col overflow-hidden ${collapseTranscript ? '' : 'h-full'}`}>
       <SessionTabBar
         sessions={sessions}
-        activeSessionId={activeSessionId}
+        activeSessionId={routableActiveSessionId}
         onSessionSelect={onSessionSelect}
         onNewSession={handleNewSession}
         onSessionArchive={onSessionArchive}
@@ -349,8 +370,8 @@ export const WorkstreamSessionTabs: React.FC<WorkstreamSessionTabsProps> = React
 
       <div className={`workstream-session-tabs-content overflow-hidden ${collapseTranscript ? '' : 'flex-1 min-h-0'}`}>
         <AgentSessionPanel
-          key={activeSessionId}
-          sessionId={activeSessionId}
+          key={routableActiveSessionId}
+          sessionId={routableActiveSessionId}
           workspacePath={workspacePath}
           onFileClick={onFileClick}
           onClearAgentSession={handleNewSession}

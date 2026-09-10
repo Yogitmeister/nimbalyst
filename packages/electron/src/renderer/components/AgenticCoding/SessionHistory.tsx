@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { activeFileRepoPathAtom } from '../../store/atoms/workspaceRepos';
@@ -190,6 +191,28 @@ function mapsHaveEqualEntries(a: Map<string, number>, b: Map<string, number>): b
     if (b.get(key) !== value) return false;
   }
   return true;
+}
+
+export function shouldAcceptWorkstreamChildrenResponse(
+  sessionId: string,
+  requestGeneration: number,
+  currentGeneration: number,
+  registrySnapshot: ReadonlyMap<string, Pick<SessionMeta, 'childCount'>>,
+): boolean {
+  const currentParent = registrySnapshot.get(sessionId);
+  return (
+    requestGeneration === currentGeneration &&
+    currentParent !== undefined &&
+    (currentParent.childCount ?? 0) > 0
+  );
+}
+
+export function shouldRetryWorkstreamChildrenResponse(
+  requestGeneration: number,
+  currentGeneration: number,
+  currentChildCount: number | undefined,
+): boolean {
+  return requestGeneration !== currentGeneration && (currentChildCount ?? 0) > 0;
 }
 
 function compareNumbersDesc(a: number, b: number): number {
@@ -431,6 +454,44 @@ const SessionHistoryComponent: React.FC = () => {
   const [workstreamChildrenCache, setWorkstreamChildrenCache] = useState<Map<string, SessionItem[]>>(new Map()); // Cache workstream children
   const [blitzCache, setBlitzCache] = useState<Map<string, BlitzData>>(new Map()); // Cache blitz data
   const pendingWorkstreamChildrenFetchesRef = useRef<Set<string>>(new Set());
+  const workstreamChildrenGenerationRef = useRef<Map<string, number>>(new Map());
+  const workstreamChildrenStructureRef = useRef<Map<string, string>>(new Map());
+  const [workstreamChildrenFetchRetry, setWorkstreamChildrenFetchRetry] = useState(0);
+  useEffect(() => {
+    const syncWorkstreamStructure = () => {
+      const registry = store.get(sessionRegistryAtom);
+      const previousStructures = workstreamChildrenStructureRef.current;
+      const nextStructures = new Map<string, string>();
+      const currentWorkstreamIds = new Set<string>();
+
+      for (const session of registry.values()) {
+        if (session.sessionType !== 'workstream' && (session.childCount ?? 0) <= 0) {
+          continue;
+        }
+        const childIds = [...registry.values()]
+          .filter(child => child.parentSessionId === session.id)
+          .map(child => child.id)
+          .sort();
+        const structure = `${session.childCount ?? 0}:${childIds.join('|')}`;
+        currentWorkstreamIds.add(session.id);
+        if (previousStructures.has(session.id) && previousStructures.get(session.id) !== structure) {
+          const currentGeneration = workstreamChildrenGenerationRef.current.get(session.id) ?? 0;
+          workstreamChildrenGenerationRef.current.set(session.id, currentGeneration + 1);
+        }
+        nextStructures.set(session.id, structure);
+      }
+
+      for (const sessionId of previousStructures.keys()) {
+        if (currentWorkstreamIds.has(sessionId)) continue;
+        const currentGeneration = workstreamChildrenGenerationRef.current.get(sessionId) ?? 0;
+        workstreamChildrenGenerationRef.current.set(sessionId, currentGeneration + 1);
+      }
+      workstreamChildrenStructureRef.current = nextStructures;
+    };
+
+    syncWorkstreamStructure();
+    return store.sub(sessionRegistryAtom, syncWorkstreamStructure);
+  }, []);
   // Mirrors `workstreamChildrenCache` so the workstream-children fetch
   // effect below can read the current cache without putting it in deps
   // (which previously formed a self-trigger loop: setCache -> dep change ->
@@ -2363,11 +2424,15 @@ const SessionHistoryComponent: React.FC = () => {
       if (metaAgentSessionIds.has(session.id) || metaAgentChildSessionIds.has(session.id)) continue;
 
       if (!session.worktreeId) {
-        // Check if this is a workstream (has children)
-        const isWorkstream = (session.childCount ?? 0) > 0;
+        // Typed workstream containers remain structural even when empty.
+        const isWorkstream = isWorkstreamParentSession(session);
         if (isWorkstream) {
           // Create workstream item with cached children (or empty array if not loaded yet)
-          const cachedChildren = workstreamChildrenCache.get(session.id) || [];
+          // A zero-count typed root must not render a departed child retained by
+          // the cache while the session-list update propagates.
+          const cachedChildren = session.sessionType === 'workstream' && (session.childCount ?? 0) === 0
+            ? []
+            : workstreamChildrenCache.get(session.id) || [];
 
           // For workstreams, use the maximum updatedAt from all children for sorting
           // This ensures workstreams appear based on their most recent activity
@@ -2741,12 +2806,34 @@ const SessionHistoryComponent: React.FC = () => {
   // Instead we read them via refs (`workstreamChildrenCacheRef`) and
   // `store.get(sessionRegistryAtom)`. The effect now only re-runs on
   // structural changes -- when the workstream `sessions` list, the
-  // `collapsedGroups` user preference, the workspace, or the archive
-  // filter change -- which is what actually matters for "do we need to
-  // fetch more children right now".
+  // `collapsedGroups` user preference, the workspace, the archive filter, or
+  // an explicit stale-response retry changes -- which is what actually
+  // matters for "do we need to fetch more children right now".
   useEffect(() => {
     const cache = workstreamChildrenCacheRef.current;
     const registrySnapshot = store.get(sessionRegistryAtom);
+
+    // Drop cached children as soon as a typed root reports zero children. The
+    // grouped-items guard above prevents stale presentation during the same
+    // render; this cleanup keeps the cache from resurrecting departed children.
+    const emptyTypedWorkstreamIds = sessions
+      .filter(session => session.sessionType === 'workstream' && (session.childCount ?? 0) === 0)
+      .map(session => session.id);
+    for (const sessionId of emptyTypedWorkstreamIds) {
+      const currentGeneration = workstreamChildrenGenerationRef.current.get(sessionId) ?? 0;
+      workstreamChildrenGenerationRef.current.set(sessionId, currentGeneration + 1);
+    }
+    const cachedEmptyTypedWorkstreamIds = emptyTypedWorkstreamIds
+      .filter(sessionId => cache.has(sessionId));
+    if (cachedEmptyTypedWorkstreamIds.length > 0) {
+      setWorkstreamChildrenCache(prev => {
+        const updated = new Map(prev);
+        for (const sessionId of cachedEmptyTypedWorkstreamIds) {
+          updated.delete(sessionId);
+        }
+        return updated;
+      });
+    }
 
     // Find workstream sessions that are expanded
     const workstreamSessionsNeedingFetch = sessions.filter(s =>
@@ -2767,6 +2854,13 @@ const SessionHistoryComponent: React.FC = () => {
 
     const fetchChildren = async () => {
       const sessionIds = workstreamSessionsNeedingFetch.map(session => session.id);
+      const requestGenerations = new Map(
+        sessionIds.map(sessionId => [
+          sessionId,
+          workstreamChildrenGenerationRef.current.get(sessionId) ?? 0,
+        ]),
+      );
+      let retryAfterStaleResponse = false;
       sessionIds.forEach(sessionId => pendingWorkstreamChildrenFetchesRef.current.add(sessionId));
 
       try {
@@ -2819,9 +2913,31 @@ const SessionHistoryComponent: React.FC = () => {
           return;
         }
 
+        const currentRegistry = store.get(sessionRegistryAtom);
+        const acceptedResults = successfulResults.filter(result =>
+          shouldAcceptWorkstreamChildrenResponse(
+            result.sessionId,
+            requestGenerations.get(result.sessionId) ?? -1,
+            workstreamChildrenGenerationRef.current.get(result.sessionId) ?? 0,
+            currentRegistry,
+          ),
+        );
+        const acceptedSessionIds = new Set(acceptedResults.map(result => result.sessionId));
+        retryAfterStaleResponse = successfulResults.some(result =>
+          !acceptedSessionIds.has(result.sessionId) &&
+          shouldRetryWorkstreamChildrenResponse(
+            requestGenerations.get(result.sessionId) ?? -1,
+            workstreamChildrenGenerationRef.current.get(result.sessionId) ?? 0,
+            currentRegistry.get(result.sessionId)?.childCount,
+          ),
+        );
+        if (acceptedResults.length === 0) {
+          return;
+        }
+
         setWorkstreamChildrenCache(prev => {
           const updated = new Map(prev);
-          for (const result of successfulResults) {
+          for (const result of acceptedResults) {
             updated.set(result.sessionId, result.children);
           }
           return updated;
@@ -2832,9 +2948,8 @@ const SessionHistoryComponent: React.FC = () => {
         // keep existing entries in sync, and unconditionally re-setting the
         // atom Map every fetch makes every subscriber re-render -- which
         // brought the renderer back into a re-render loop here.
-        const currentRegistry = store.get(sessionRegistryAtom);
         let nextRegistry: Map<string, SessionMeta> | null = null;
-        for (const result of successfulResults) {
+        for (const result of acceptedResults) {
           for (const child of result.children) {
             if (!currentRegistry.has(child.id)) {
               if (!nextRegistry) nextRegistry = new Map(currentRegistry);
@@ -2847,6 +2962,9 @@ const SessionHistoryComponent: React.FC = () => {
         }
       } finally {
         sessionIds.forEach(sessionId => pendingWorkstreamChildrenFetchesRef.current.delete(sessionId));
+        if (retryAfterStaleResponse) {
+          setWorkstreamChildrenFetchRetry(retry => retry + 1);
+        }
       }
     };
 
@@ -2855,7 +2973,7 @@ const SessionHistoryComponent: React.FC = () => {
     // omitted from deps — they're read via refs / store.get inside the
     // effect. Including them caused a self-trigger loop (this effect both
     // sets the cache and writes the registry atom).
-  }, [sessions, collapsedGroups, workspacePath, showArchived]);
+  }, [sessions, collapsedGroups, workspacePath, showArchived, workstreamChildrenFetchRetry]);
 
   if (loading) {
     return (
