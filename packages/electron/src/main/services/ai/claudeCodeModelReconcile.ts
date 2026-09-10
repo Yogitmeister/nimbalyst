@@ -1,14 +1,25 @@
+// [ASTRA-ORCH]
 import { CLAUDE_CODE_VARIANTS, ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
+import { CLAUDE_CODE_BACKENDS } from '@nimbalyst/runtime/ai/server';
 
 /**
- * The full set of shipped Claude Code base-variant model ids, derived from the
- * single source of truth (`CLAUDE_CODE_VARIANTS`). This is the canonical enabled
- * list for a fresh install, and the catalog the saved allow-list is reconciled
- * against — so a newly-added variant can never be silently dropped from the
- * picker again (the drift that hid Fable 5 and sonnet-4-6).
+ * The full set of shipped Claude Code model ids: the base variants from
+ * `CLAUDE_CODE_VARIANTS`, plus the catalog-backed brain-swap routes exposed by
+ * `CLAUDE_CODE_BACKENDS`. This is the canonical enabled list for a fresh
+ * install, and the catalog the saved allow-list is reconciled against — so a
+ * newly-added model can never be silently dropped from the picker again (the
+ * drift that hid Fable 5 and sonnet-4-6).
+ *
+ * The catalog routes belong here for the same reason the variants do. They are
+ * `claude-code` picker rows, an explicit allow-list is exclusive, and there is
+ * no per-model UI to re-enable one — so without this an existing install never
+ * sees a newly-shipped brain swap.
  */
 export function claudeCodeCatalogModelIds(): string[] {
-  return CLAUDE_CODE_VARIANTS.map((v) => ModelIdentifier.create('claude-code', v).combined);
+  return [
+    ...CLAUDE_CODE_VARIANTS.map((v) => ModelIdentifier.create('claude-code', v).combined),
+    ...CLAUDE_CODE_BACKENDS.map((backend) => backend.persistedModel),
+  ];
 }
 
 /** Default enabled claude-code models for a fresh install (whole catalog). */
