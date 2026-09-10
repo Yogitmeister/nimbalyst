@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import type { PluggableList } from 'unified';
@@ -22,6 +23,7 @@ import {
   dispatchAppActionHref,
   isAppActionHref,
 } from '../../../utils/appActionLinks';
+import { copyToClipboard } from '../../../utils/clipboard';
 
 // Inject MarkdownRenderer styles once (for syntax highlighting, scrollbar, and overflow wrapper)
 const injectMarkdownRendererStyles = () => {
@@ -514,6 +516,27 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
     [messageId],
   );
 
+  // Right-clicking a file link copies its path. Without this the only way to
+  // get a path that is already on screen is to click the link, wait for the
+  // file to open, right-click its tab and Copy Path -- five steps and a file
+  // open, worst exactly during a handover that references a dozen files.
+  const [copiedFilePath, setCopiedFilePath] = useState<string | null>(null);
+  const copiedResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (copiedResetRef.current) clearTimeout(copiedResetRef.current);
+  }, []);
+  const copyFilePath = useCallback(async (filePath: string) => {
+    try {
+      await copyToClipboard(filePath);
+    } catch {
+      // Clipboard denial is the user's environment, not a transcript error.
+      return;
+    }
+    setCopiedFilePath(filePath);
+    if (copiedResetRef.current) clearTimeout(copiedResetRef.current);
+    copiedResetRef.current = setTimeout(() => setCopiedFilePath(null), 1500);
+  }, []);
+
   // Extension-contributed markdown plugins/components are merged on top of
   // the core baseline. The transcript registry handles deduping styles and
   // keeps the React tree subscribed to extension enable/disable events.
@@ -809,6 +832,15 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
                     onOpenFile(filePath, transcriptFileLocation(fileTarget));
                   }
                 }}
+                onContextMenu={(event) => {
+                  // Only file links are hijacked. Web links and tracker chips
+                  // keep the native browser menu.
+                  if (!filePath) return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  void copyFilePath(filePath);
+                }}
+                title={filePath ? `${filePath}\nRight-click to copy path` : undefined}
                 style={{
                   color: 'var(--nim-primary)',
                   textDecoration: 'underline',
@@ -817,6 +849,23 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
                 }}
               >
                 {children}
+                {filePath && copiedFilePath === filePath && (
+                  <span
+                    style={{
+                      marginLeft: '0.4em',
+                      padding: '0 0.35em',
+                      borderRadius: '0.5em',
+                      fontSize: '0.75em',
+                      verticalAlign: 'baseline',
+                      color: 'var(--nim-text-muted)',
+                      background: 'var(--nim-bg-secondary)',
+                      border: '1px solid var(--nim-border)',
+                      textDecoration: 'none',
+                    }}
+                  >
+                    Path copied
+                  </span>
+                )}
               </a>
             );
           },
