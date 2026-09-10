@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -123,6 +124,7 @@ import {
   notificationIconFileName,
   resolveNotificationIcon,
 } from '../notificationIcons';
+import { logger } from '../../utils/logger';
 
 interface FakeWindow {
   isDestroyed: () => boolean;
@@ -164,14 +166,14 @@ function makeFakeWindow(): FakeWindow {
 
 async function clickNotification(options: {
   sessionId?: string;
-  workspacePath: string;
+  workspacePath?: string;
   sourceLabel?: string;
 }): Promise<void> {
   await notificationService.showNotification({
     title: 'Response Ready',
     body: 'Ready for review',
     ...options,
-  });
+  } as Parameters<typeof notificationService.showNotification>[0]); // Deliberately tests malformed runtime payloads too.
   mocks.notificationListeners.get('click')?.();
 }
 
@@ -409,6 +411,33 @@ describe('NotificationService agent notifications', () => {
     });
 
     expect(mocks.createWindow).toHaveBeenCalledWith(false, true, '/workspace/unreadable');
+  });
+
+  it('warns instead of throwing when a clicked notification has no workspace path', async () => {
+    await clickNotification({ sessionId: 'session-missing-workspace' });
+
+    expect(logger.main.warn).toHaveBeenCalledWith(
+      '[NotificationService] Cannot route notification click without workspacePath:',
+      { sessionId: 'session-missing-workspace' },
+    );
+  });
+
+  it('warns instead of propagating a notification-click send failure', async () => {
+    const targetWindow = makeFakeWindow();
+    targetWindow.webContents.send.mockImplementation(() => {
+      throw new Error('webContents destroyed');
+    });
+    mocks.findWindowByWorkspace.mockReturnValue(targetWindow);
+
+    await clickNotification({
+      sessionId: 'session-send-failure',
+      workspacePath: '/workspace/alpha',
+    });
+
+    expect(logger.main.warn).toHaveBeenCalledWith(
+      '[NotificationService] Failed to route notification click to window:',
+      expect.any(Error),
+    );
   });
 
   it('queues navigation and opens an unloaded workspace once', async () => {

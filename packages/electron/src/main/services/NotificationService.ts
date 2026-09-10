@@ -384,7 +384,10 @@ class NotificationService {
 
     // REQUIRED: workspacePath must be provided - sessions are tied to workspaces
     if (!options.workspacePath) {
-      throw new Error('workspacePath is required for notification routing');
+      logger.main.warn('[NotificationService] Cannot route notification click without workspacePath:', {
+        sessionId: options.sessionId,
+      });
+      return;
     }
 
     // Find window by workspace path (the only stable identifier). This matches
@@ -433,7 +436,11 @@ class NotificationService {
     // logger.main.info('[NotificationService] Found window for workspace:', options.workspacePath);
 
     focusExisting();
-    targetWindow.webContents.send('notification-clicked', navigation);
+    try {
+      targetWindow.webContents.send('notification-clicked', navigation);
+    } catch (error) {
+      logger.main.warn('[NotificationService] Failed to route notification click to window:', error);
+    }
   }
 
   /**
