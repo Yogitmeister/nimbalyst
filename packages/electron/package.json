@@ -1,4 +1,4 @@
-{
+{ "_author": "[ASTRA-ORCH]",
   "name": "@nimbalyst/electron",
   "version": "0.77.5",
   "private": true,
@@ -249,6 +249,10 @@
     ],
     "extraResources": [
       {
+        "from": "resources/yogi-icon.ico",
+        "to": "yogi-icon.ico"
+      },
+      {
         "from": "../../node_modules/node-pty",
         "to": "node-pty"
       },
@@ -487,6 +491,7 @@
       ]
     },
     "win": {
+      "icon": "resources/yogi-icon.ico",
       "target": [
         {
           "target": "nsis"

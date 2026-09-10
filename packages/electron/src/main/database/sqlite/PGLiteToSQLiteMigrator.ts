@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * PGLiteToSQLiteMigrator
  *
@@ -231,6 +232,32 @@ const APP_SERVER_NOTIFICATION_METHODS_TO_KEEP = [
   'error',
 ] as const;
 
+/**
+ * `document_history` carries a UNIQUE partial index the SQLite schema declares
+ * but PGLite does not enforce the same way:
+ *
+ *   CREATE UNIQUE INDEX idx_history_one_pending_per_file
+ *     ON document_history(file_path)
+ *     WHERE json_extract(metadata, '$.status') = 'pending-review';
+ *
+ * Note what it is NOT keyed on: `workspace_id`. One pending-review row per
+ * file_path GLOBALLY, so PGLite can legally hold several where SQLite accepts
+ * one, and the copy dies on INSERT.
+ *
+ * This is handled on the TARGET (drop the index, copy, collapse to the newest
+ * row per file_path, recreate) rather than by filtering the source. A source
+ * filter was tried first and is the wrong tool twice over:
+ *
+ *   1. During adopt the duplicate is SPLIT ACROSS source and target -- the old
+ *      row is already in the dry-run SQLite, the new one is arriving -- so no
+ *      predicate over the source alone can see the pair.
+ *   2. Worse, it breaks catch-up silently. `catchUp` decides what to copy by
+ *      comparing current source counts against the manifest's. A filter that
+ *      hides rows makes the count look unchanged, so catch-up concludes there is
+ *      nothing new and skips the table -- data loss dressed as success. Caught
+ *      only because the regression test asserted WHICH row survived, not merely
+ *      that the copy stopped throwing.
+ */
 function getSourceTableFilterSql(table: string): string {
   if (table !== 'ai_agent_messages') {
     return '';
@@ -307,6 +334,13 @@ export class PGLiteToSQLiteMigrator {
     sqliteHandle.exec('DROP TRIGGER IF EXISTS ai_agent_messages_ai');
     sqliteHandle.exec('DROP TRIGGER IF EXISTS ai_agent_messages_ad');
     sqliteHandle.exec('DROP TRIGGER IF EXISTS ai_agent_messages_au');
+
+    // Same reasoning, different constraint: idx_history_one_pending_per_file is
+    // UNIQUE on document_history(file_path) WHERE status = 'pending-review' and
+    // is not keyed on workspace_id, so PGLite can legally hold several rows that
+    // SQLite accepts one of. Correct for live writes, wrong mid-copy. Dropped
+    // here and restored after the collapse below.
+    sqliteHandle.exec('DROP INDEX IF EXISTS idx_history_one_pending_per_file');
 
     const manifestPerTable: DryRunManifest['perTable'] = [];
     for (let i = 0; i < pgliteCounts.length; i++) {
@@ -498,6 +532,35 @@ export class PGLiteToSQLiteMigrator {
       });
     }
 
+    // Validate every captured copied row before the intentional review-queue
+    // collapse. Integrity and foreign-key checks still inspect the final target.
+    // Collapse pending-review duplicates, then restore the index the copy ran
+    // without. Order matters: a UNIQUE index cannot be created over duplicate
+    // rows, so the DELETE has to land first. Keeping MAX(id) per file_path is
+    // exactly what "one pending-review tag per file at a time" means -- the
+    // newest tag wins. The superseded rows are stale review-queue entries; their
+    // content survives in the other document_history rows and the files on disk
+    // are untouched.
+    const collapsedRows = sqliteHandle
+      .prepare(
+        `DELETE FROM document_history
+          WHERE json_extract(metadata, '$.status') = 'pending-review'
+            AND id NOT IN (
+              SELECT MAX(id) FROM document_history
+              WHERE json_extract(metadata, '$.status') = 'pending-review'
+              GROUP BY file_path
+            )`,
+      )
+      .run();
+    if (collapsedRows.changes > 0) {
+      log('info', `[migrator] collapsed ${collapsedRows.changes} superseded pending-review row(s)`);
+    }
+    sqliteHandle.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_history_one_pending_per_file
+         ON document_history(file_path)
+         WHERE json_extract(metadata, '$.status') = 'pending-review'`,
+    );
+
     // Integrity + FK checks.
     opts.onProgress?.({
       phase: 'verifying-integrity',
@@ -591,6 +654,23 @@ export class PGLiteToSQLiteMigrator {
     if (!sqliteHandle) throw new Error('SQLiteDatabase must be initialized before catchUp');
 
     sqliteHandle.pragma('foreign_keys = OFF');
+
+    // Same reason the FTS triggers come off during migrate(): a per-row
+    // constraint that is correct for LIVE writes is wrong during a bulk copy.
+    //
+    // `idx_history_one_pending_per_file` is UNIQUE on document_history(file_path)
+    // WHERE status = 'pending-review'. Catch-up inserts rows PGLite gained since
+    // the dry run, into a SQLite that already holds the dry-run's pending-review
+    // row for the same file -- so the duplicate is split across source and
+    // target, and no source-side filter can see it. Live 2026-08-14: adopt kept
+    // failing with "UNIQUE constraint failed: document_history.file_path" even
+    // with the source dedupe in place, because the older row was already sitting
+    // in the target.
+    //
+    // Drop it, copy, collapse to the newest row per file_path, recreate. The
+    // The index is restored after a successful copy. A failed migration target
+    // must remain ineligible for adoption.
+    sqliteHandle.exec('DROP INDEX IF EXISTS idx_history_one_pending_per_file');
 
     const perTable: Array<{ name: string; added: number }> = [];
     const manifestPerTable: DryRunManifest['perTable'] = [];
@@ -692,6 +772,35 @@ export class PGLiteToSQLiteMigrator {
       totalAdded += Math.max(0, added);
       log('info', `[catchUp] ${name}: +${added} rows`);
     }
+
+    // Collapse pending-review duplicates, then restore the index the copy ran
+    // without. Order matters: recreating a UNIQUE index over duplicate rows
+    // fails, so the DELETE has to land first.
+    //
+    // Keeping MAX(id) per file_path is the same rule the source filter applies,
+    // and it is what "one pending-review tag per file at a time" means: the
+    // newest tag wins. Nothing is lost that the app can act on -- the older rows
+    // are superseded entries in a review queue, their content survives in the
+    // other document_history rows, and the files are untouched on disk.
+    const collapsed = sqliteHandle
+      .prepare(
+        `DELETE FROM document_history
+          WHERE json_extract(metadata, '$.status') = 'pending-review'
+            AND id NOT IN (
+              SELECT MAX(id) FROM document_history
+              WHERE json_extract(metadata, '$.status') = 'pending-review'
+              GROUP BY file_path
+            )`,
+      )
+      .run();
+    if (collapsed.changes > 0) {
+      log('info', `[catchUp] collapsed ${collapsed.changes} superseded pending-review row(s)`);
+    }
+    sqliteHandle.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_history_one_pending_per_file
+         ON document_history(file_path)
+         WHERE json_extract(metadata, '$.status') = 'pending-review'`,
+    );
 
     sqliteHandle.pragma('foreign_keys = ON');
     const fkViolations = sqliteHandle.prepare('PRAGMA foreign_key_check').all() as unknown[];

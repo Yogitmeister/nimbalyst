@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 // @vitest-environment node
 /**
  * End-to-end migration test against a real PGLite store and a real SQLite
@@ -532,6 +533,129 @@ describe('PGLiteToSQLiteMigrator', () => {
       ],
     );
   }
+
+  it('collapses duplicate pending-review rows that SQLite would reject', async () => {
+    // The SQLite schema declares idx_history_one_pending_per_file: UNIQUE on
+    // document_history(file_path) WHERE status = 'pending-review'. It is NOT
+    // keyed on workspace_id, so a workspace reachable under two path spellings
+    // (a junction, a mapped drive, a renamed folder) accumulates one
+    // pending-review row per spelling for the SAME file. PGLite accepts that;
+    // SQLite rejects it at INSERT.
+    //
+    // Live failure 2026-08-14: both adopt-dry-run and the full switch aborted
+    // with "UNIQUE constraint failed: document_history.file_path" on a store
+    // whose files are reachable as both 'D:\!! CLAUDE' and 'D:\CLAUDE'.
+    // Without the dedupe filter this test reproduces that abort.
+    await seedPgliteSchema();
+
+    const shared = 'src/shared.ts';
+    for (const [ws, body] of [['D:\!! CLAUDE', 'older'], ['D:\CLAUDE', 'newer']] as const) {
+      await pglite.query(
+        `INSERT INTO document_history(workspace_id, file_path, content, size_bytes, timestamp, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+        [ws, shared, Buffer.from(body, 'utf-8'), body.length, Date.now(), JSON.stringify({ status: 'pending-review' })],
+      );
+    }
+    // A non-pending row for the same file must survive untouched -- the filter
+    // narrows the review queue, it does not prune file history.
+    await pglite.query(
+      `INSERT INTO document_history(workspace_id, file_path, content, size_bytes, timestamp, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+      ['D:\CLAUDE', shared, Buffer.from('archived', 'utf-8'), 8, Date.now(), JSON.stringify({ status: 'archived' })],
+    );
+
+    const migrator = new PGLiteToSQLiteMigrator();
+    const summary = await migrator.migrate({
+      pglite: pglite as unknown as Parameters<PGLiteToSQLiteMigrator['migrate']>[0]['pglite'],
+      sqlite,
+      batchSize: 1000,
+      spotCheckPerTable: 1,
+    });
+    expect(summary.integrityCheck).toBe('ok');
+
+    const db = sqlite.getRawHandle()!;
+    const pending = db
+      .prepare(
+        "SELECT content FROM document_history WHERE file_path = ? AND json_extract(metadata,'$.status') = 'pending-review'",
+      )
+      .all(shared) as { content: Buffer }[];
+    expect(pending).toHaveLength(1);
+    // The survivor is the NEWEST by id, not an arbitrary one.
+    expect(pending[0].content.toString('utf-8')).toBe('newer');
+
+    const archived = db
+      .prepare(
+        "SELECT COUNT(*) AS c FROM document_history WHERE file_path = ? AND json_extract(metadata,'$.status') = 'archived'",
+      )
+      .get(shared) as { c: number };
+    expect(archived.c).toBe(1);
+  });
+
+  it('adopts a dry-run whose target already holds a pending-review row for the same file', async () => {
+    // The 2026-08-14 adopt failure, reproduced. idx_history_one_pending_per_file
+    // is UNIQUE on document_history(file_path) WHERE status = 'pending-review',
+    // and is NOT keyed on workspace_id. Catch-up inserts rows PGLite gained
+    // since the dry run into a SQLite that already holds the dry-run's
+    // pending-review row for that same file. The duplicate is therefore SPLIT
+    // ACROSS source and target, which is why the source-side dedupe filter --
+    // correct on its own terms -- could not prevent it, and adopt died three
+    // times on "UNIQUE constraint failed: document_history.file_path".
+    await seedPgliteSchema();
+    await seedRows();
+
+    const contested = '/workspace/contested-review.md';
+    const pending = JSON.stringify({ status: 'pending-review' });
+
+    // Present at dry-run time, so it gets copied into the target.
+    await pglite.query(
+      `INSERT INTO document_history (workspace_id, file_path, content, timestamp, metadata)
+       VALUES ($1, $2, $3, $4, $5)`,
+      ['/ws-a', contested, Buffer.from('older'), Date.now(), pending],
+    );
+
+    const migrator = new PGLiteToSQLiteMigrator();
+    const dryRun = await migrator.migrate({
+      pglite: pglite as unknown as Parameters<PGLiteToSQLiteMigrator['migrate']>[0]['pglite'],
+      sqlite,
+      batchSize: 5000,
+      spotCheckPerTable: 1,
+    });
+    expect(dryRun.manifest).toBeDefined();
+
+    // PGLite then gains a NEWER pending-review row for the SAME file, exactly as
+    // a live app does in the window between the dry run and the adopt click.
+    await pglite.query(
+      `INSERT INTO document_history (workspace_id, file_path, content, timestamp, metadata)
+       VALUES ($1, $2, $3, $4, $5)`,
+      ['/ws-b', contested, Buffer.from('newer'), Date.now() + 1000, pending],
+    );
+
+    // Must not throw.
+    await migrator.catchUp({
+      pglite: pglite as unknown as Parameters<PGLiteToSQLiteMigrator['migrate']>[0]['pglite'],
+      sqlite,
+      manifest: dryRun.manifest!,
+      batchSize: 5000,
+    });
+
+    const handle = sqlite.getRawHandle()!;
+    const rows = handle
+      .prepare(
+        `SELECT content FROM document_history
+          WHERE file_path = ? AND json_extract(metadata, '$.status') = 'pending-review'`,
+      )
+      .all(contested) as Array<{ content: Buffer | string }>;
+    // Exactly one survives -- the invariant the schema declares -- and it is the
+    // NEWER row, not whichever happened to be copied first.
+    expect(rows).toHaveLength(1);
+    expect(String(rows[0].content)).toBe('newer');
+
+    // The index is restored afterwards, so live writes stay constrained.
+    const idx = handle
+      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name=?")
+      .get('idx_history_one_pending_per_file');
+    expect(idx, 'catchUp must restore idx_history_one_pending_per_file').toBeDefined();
+  });
 
   it('round-trips every table type-by-type with zero verification failures', async () => {
     await seedPgliteSchema();
