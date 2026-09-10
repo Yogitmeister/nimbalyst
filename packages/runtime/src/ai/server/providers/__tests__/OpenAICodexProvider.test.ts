@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -249,6 +250,11 @@ describe('OpenAICodexProvider', () => {
         id: 'openai-codex:gpt-5.4-mini',
         provider: 'openai-codex',
       }),
+      expect.objectContaining({
+        id: 'openai-codex:gpt-5.3-codex-spark',
+        provider: 'openai-codex',
+        contextWindow: 128000,
+      }),
     ]));
   });
 
@@ -261,6 +267,7 @@ describe('OpenAICodexProvider', () => {
       'gpt-5.5',
       'gpt-5.4',
       'gpt-5.4-mini',
+      'gpt-5.3-codex-spark',
     ];
     // The ACP transport is deprecated for OpenAI and runs a separate, much
     // older codex build with no gpt-6-astra catalog entry, so offering Astra
@@ -354,7 +361,10 @@ describe('OpenAICodexProvider', () => {
         provider: 'openai-codex',
       }),
     ]));
-    expect(models).toHaveLength(7);
+    // Upstream added Astra; the carry adds Spark without dropping that row.
+    expect(models.map((model) => model.id)).toContain('openai-codex:gpt-6-astra');
+    expect(models.map((model) => model.id)).toContain('openai-codex:gpt-5.3-codex-spark');
+    expect(models).toHaveLength(8);
   });
 
   it('preserves CLI auth when initialized without an API key', async () => {
