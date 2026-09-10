@@ -153,8 +153,6 @@ export const HOST_TOOLS: readonly string[] = [
   'list_recent_sessions',
   'schedule_wakeup',
   'update_session_board',
-  'session_get_visibility',
-  'session_set_visibility',
   // Child-session orchestration (was nimbalyst-meta-agent)
   'create_session',
   'spawn_session',
