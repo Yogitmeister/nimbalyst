@@ -270,8 +270,17 @@ export default defineConfig({
       'process.env.IS_DEV_MODE': JSON.stringify(isDevMode ? 'true' : 'false'),
       // Optional label identifying a custom (non-official) build, shown in
       // About next to the version. Empty for official builds, so their About
-      // text is unchanged. Set NIMBALYST_BUILD_IDENTITY at build time.
-      'process.env.BUILD_IDENTITY': JSON.stringify(process.env.NIMBALYST_BUILD_IDENTITY || ''),
+      // text is unchanged. Override with NIMBALYST_BUILD_IDENTITY at build time.
+      //
+      // Defaults to 'v16' rather than '' for non-official builds: v16 shipped
+      // with a candidate whose About window was silently blank because nobody
+      // exporting NIMBALYST_BUILD_IDENTITY is a flag a human has to remember,
+      // not a fix (see G4 evidence, 2026-08-30). A hardcoded default survives
+      // a future build by someone who doesn't know this note exists; a flag
+      // doesn't. Bump this default alongside the next release label.
+      'process.env.BUILD_IDENTITY': JSON.stringify(
+        process.env.NIMBALYST_BUILD_IDENTITY || (isOfficialBuild ? '' : 'v16')
+      ),
       // Note: RUN_ONE_DEV_MODE is intentionally NOT defined here.
       // The main process reads it from the actual runtime environment via process.env.
       // This allows crystal-run.sh to set it at runtime without affecting normal dev mode.
