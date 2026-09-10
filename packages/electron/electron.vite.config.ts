@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { resolve } from 'path'
 import { defineConfig } from 'electron-vite'
 import react from '@vitejs/plugin-react'
@@ -267,6 +268,10 @@ export default defineConfig({
     define: {
       'process.env.OFFICIAL_BUILD': JSON.stringify(isOfficialBuild ? 'true' : 'false'),
       'process.env.IS_DEV_MODE': JSON.stringify(isDevMode ? 'true' : 'false'),
+      // Optional label identifying a custom (non-official) build, shown in
+      // About next to the version. Empty for official builds, so their About
+      // text is unchanged. Set NIMBALYST_BUILD_IDENTITY at build time.
+      'process.env.BUILD_IDENTITY': JSON.stringify(process.env.NIMBALYST_BUILD_IDENTITY || ''),
       // Note: RUN_ONE_DEV_MODE is intentionally NOT defined here.
       // The main process reads it from the actual runtime environment via process.env.
       // This allows crystal-run.sh to set it at runtime without affecting normal dev mode.

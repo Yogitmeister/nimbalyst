@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /** Mirrors the main-process `git:status-changed` payload. */
 interface GitStatusChangedPayload {
   workspacePath: string;
@@ -352,6 +353,7 @@ interface ElectronAPI {
   getResolvedThemeSync: () => string;
   getThemeBackgroundColorSync: () => string | null;
   getAppVersion: () => Promise<string>;
+  getBuildIdentity: () => Promise<string>;
   setTheme: (theme: string) => Promise<void>;
 
   // File operations

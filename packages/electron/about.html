@@ -1,3 +1,4 @@
+<!-- [ASTRA-ORCH] -->
 <!DOCTYPE html>
 <html>
   <head>
@@ -331,8 +332,15 @@
         try {
           const version = await window.electronAPI?.getAppVersion?.();
           if (version) {
+            // Custom builds identify themselves here so About distinguishes
+            // them from an official release carrying the same version.
+            const buildIdentity = await window.electronAPI?.getBuildIdentity?.();
             const el = document.getElementById('about-version');
-            if (el) el.textContent = `Version ${version}`;
+            if (el) {
+              el.textContent = buildIdentity
+                ? `Version ${version} (${buildIdentity})`
+                : `Version ${version}`;
+            }
           }
         } catch {}
       })();

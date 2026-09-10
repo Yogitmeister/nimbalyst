@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { registerProviderCredentialHandlers } from './ProviderCredentialHandlers';
 import { BrowserWindow, safeStorage, session, dialog } from 'electron';
 import { applyAnalyticsEnabled } from '../services/analytics/applyAnalyticsEnabled';
@@ -366,6 +367,11 @@ export function registerSettingsHandlers() {
         const { app } = require('electron');
         return app.getVersion();
     });
+
+    // Label identifying a custom (non-official) build, empty on official ones.
+    // Kept separate from get-app-version so the analytics `nimbalyst_version`
+    // property and any version comparison stay a bare version string.
+    safeHandle('get-build-identity', () => (process.env.BUILD_IDENTITY || '').trim());
 
     // AI Chat state has been moved to unified workspace state
     // Use workspace:get-state and workspace:update-state instead

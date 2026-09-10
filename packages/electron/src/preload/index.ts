@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { createIpcSubscriber } from './ipcSubscriptions.ts';
 import {ClaudeForWindowsInstallation} from "../main/services/CLIManager.ts";
@@ -306,6 +307,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }
   },
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
+  getBuildIdentity: () => ipcRenderer.invoke('get-build-identity'),
   setTheme: (theme: string) => ipcRenderer.invoke('set-theme', theme),
   setTitleBarOverlayColors: (colors: { color: string; symbolColor: string; backgroundColor?: string }) =>
     ipcRenderer.send('window-chrome:set-overlay-colors', colors),
