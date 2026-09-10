@@ -199,4 +199,21 @@ describe('MetaAgentService catalog child projection', () => {
     expect(createSessionMock).toHaveBeenCalledTimes(1);
     expect(result.claudeCodeBackend.id).toBe(CATALOG_ENTRY.id);
   });
+  it('preserves queued prompt whitespace, provenance and the meta-agent drive edge', async () => {
+    const service = MetaAgentService.getInstance() as any;
+    const payload = '  exact payload\n';
+    const queue = vi.fn(async () => ({ id: 'queued-truth', prompt: payload }));
+    const drive = vi.fn(async () => {});
+    service.shouldBypassChildAgentExecutionForTests = () => false;
+    service.aiService = { queuePromptForSession: queue, triggerQueuedPromptProcessingForSession: drive };
+    getSessionMock.mockResolvedValue({ id: 'target', workspacePath: '/workspace', worktreePath: '/worktree' });
+    databaseQueryMock.mockResolvedValue({ rows: [{ status: 'idle' }] });
+    const result = JSON.parse(await service.sendPromptToSession('origin', 'target', '/workspace', payload));
+    expect(queue).toHaveBeenCalledWith('target', payload, undefined, {
+      promptProvenance: expect.objectContaining({ originSessionId: 'origin', origin: 'session-orchestration' }),
+    });
+    expect(result).toMatchObject({ queuedPromptId: 'queued-truth', prompt: payload, processingTriggered: true });
+    expect(drive).toHaveBeenCalledWith('target', '/worktree', 'meta-agent');
+  });
+
 });

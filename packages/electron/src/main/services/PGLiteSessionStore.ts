@@ -3,6 +3,7 @@
  * PGLite implementation of SessionStore interface from runtime package
  */
 
+import { isDeepStrictEqual } from 'node:util';
 import { toMillis } from '../utils/timestampUtils';
 import { parseJsonObjectColumn } from '../utils/jsonColumn';
 import {
@@ -542,19 +543,24 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
         );
         if (transition.changed) merged.activity = transition.metadata.activity;
       }
+      // JSONB object key order is not meaningful, and JSON serialization drops
+      // undefined object properties. Compare the actual persisted JSON value so
+      // repeated token/context/task snapshots do not create another dead tuple.
+      const persistedMerged = JSON.parse(JSON.stringify(merged)) as Record<string, any>;
       const expected =
         rawMetadata === null || rawMetadata === undefined
           ? null
           : typeof rawMetadata === 'string'
             ? rawMetadata
             : JSON.stringify(rawMetadata);
+      if (isDeepStrictEqual(existingMetadata, persistedMerged)) return;
       const updated = await db.query(
         `UPDATE ai_sessions
          SET metadata = $3::jsonb
          WHERE id = $1
            AND ((metadata IS NULL AND $2::jsonb IS NULL) OR metadata = $2::jsonb)
          RETURNING metadata`,
-        [sessionId, expected, JSON.stringify(merged)],
+        [sessionId, expected, JSON.stringify(persistedMerged)],
       );
       if (updated.rows.length > 0) return;
     }
@@ -741,8 +747,11 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
             );
             if (transition.changed) merged.activity = transition.metadata.activity;
           }
-          updates.push(`metadata = $${values.length + 1}`);
-          values.push(JSON.stringify(merged));
+          const persistedMerged = JSON.parse(JSON.stringify(merged)) as Record<string, unknown>;
+          if (!isDeepStrictEqual(existingMetadata, persistedMerged)) {
+            updates.push(`metadata = $${values.length + 1}`);
+            values.push(JSON.stringify(persistedMerged));
+          }
         }
 
         // NOTE: We intentionally do NOT update updated_at here. The updated_at timestamp

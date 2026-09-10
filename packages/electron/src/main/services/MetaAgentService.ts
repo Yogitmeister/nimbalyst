@@ -1223,7 +1223,8 @@ export class MetaAgentService {
       throw new Error(`Session ${sessionId} not found`);
     }
 
-    const normalizedPrompt = prompt.trim();
+    // Whitespace validation is not payload normalization (CReq36).
+    const normalizedPrompt = prompt;
     const shouldBypassExecution = this.shouldBypassChildAgentExecutionForTests();
     const statusRow = await this.getSessionStatusRow(sessionId, workspaceId);
     const statusBeforeQueue = (statusRow?.status || 'idle') as SessionStatusValue;

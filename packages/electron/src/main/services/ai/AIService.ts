@@ -28,7 +28,7 @@ import {
 import { reconcileClaudeCodeModels } from './claudeCodeModelReconcile';
 import { buildClaudeCodeRuntimeConfigForTurn } from './ClaudeCodeTurnLifecycle';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
-import { parseContextUsageMessage } from '@nimbalyst/runtime/ai/server/utils/contextUsage';
+import { parseContextUsageMessage, type ParsedContextUsage } from '@nimbalyst/runtime/ai/server/utils/contextUsage';
 import { resolveEffortLevel, resolveThinkingMode } from '@nimbalyst/runtime/ai/server/effortLevels';
 import type { SessionStore } from '@nimbalyst/runtime';
 import {
@@ -107,6 +107,36 @@ import {
 import { drainPendingOrdinaryPromptsOnStartup } from './startupQueuedPromptDrain';
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Build the durable /context snapshot without retaining provider markdown.
+ * Parsed counters/categories are sufficient to rehydrate the context meter;
+ * raw command output is transient and can otherwise amplify every metadata
+ * rewrite and backup.
+ */
+export function buildPersistedContextTokenUsage(
+  currentUsage: SessionData['tokenUsage'],
+  parsedUsage: ParsedContextUsage,
+): NonNullable<SessionData['tokenUsage']> {
+  const usage = currentUsage ?? {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+  };
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    totalTokens: usage.totalTokens,
+    costUSD: usage.costUSD,
+    contextWindow: parsedUsage.contextWindow,
+    categories: parsedUsage.categories,
+    currentContext: {
+      tokens: parsedUsage.totalTokens,
+      contextWindow: parsedUsage.contextWindow,
+      categories: parsedUsage.categories,
+    },
+  };
+}
 
 /**
  * Catalogs that survive the provider instance that discovered them.
@@ -1324,30 +1354,10 @@ export class AIService {
           if (parsedUsage) {
             // Get current session to preserve cumulative tokens
             const currentSession = await this.sessionManager.loadSession(session.id, workspacePath);
-            const currentUsage = currentSession?.tokenUsage ?? {
-              inputTokens: 0,
-              outputTokens: 0,
-              totalTokens: 0
-            };
-
-            // Store /context data in currentContext (snapshot of context window)
-            // Preserve cumulative input/output tokens from modelUsage
-            const tokenUsage = {
-              inputTokens: currentUsage.inputTokens,
-              outputTokens: currentUsage.outputTokens,
-              totalTokens: currentUsage.totalTokens,
-              costUSD: currentUsage.costUSD,
-              // Legacy fields for backward compatibility
-              contextWindow: parsedUsage.contextWindow,
-              categories: parsedUsage.categories,
-              // New field for context window snapshot
-              currentContext: {
-                tokens: parsedUsage.totalTokens,
-                contextWindow: parsedUsage.contextWindow,
-                categories: parsedUsage.categories,
-                rawResponse: contextResponse  // Store raw markdown for display on session reload
-              }
-            };
+            const tokenUsage = buildPersistedContextTokenUsage(
+              currentSession?.tokenUsage,
+              parsedUsage,
+            );
 
             // Persist token usage to session metadata
             await this.sessionManager.updateSessionTokenUsage(session.id, tokenUsage);

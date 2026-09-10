@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * IPC channels that drive the PGLite → SQLite migration UI from Settings.
  *
@@ -45,6 +46,8 @@ import {
 } from '../database/databaseOperationLock';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
 import { randomUUID } from 'crypto';
+import { legacyPgliteDatabase } from '../database/PGLiteDatabaseWorker';
+import type { BackupPhysicalGrowthAssessment } from '../services/database/DatabaseBackupService';
 import * as fs from 'fs';
 
 /**
@@ -86,6 +89,17 @@ export function registerMigrationHandlers(): void {
       const migratedDirs = fs
         .readdirSync(userDataPath)
         .filter((d) => d.startsWith('pglite-db.migrated-'));
+      let storageHealth: BackupPhysicalGrowthAssessment | null = null;
+      if (resolved.backend === 'pglite') {
+        const backupService = legacyPgliteDatabase.getBackupService();
+        if (backupService) {
+          try {
+            storageHealth = await backupService.assessPhysicalGrowth();
+          } catch (err) {
+            logger.main.warn('[Migration] Failed to read PGlite storage health:', err);
+          }
+        }
+      }
       return {
         success: true,
         activeBackend: resolved.backend,
@@ -98,6 +112,7 @@ export function registerMigrationHandlers(): void {
         // Typed durable refusal, so Settings can name the reason and offer a
         // retry instead of showing a boot that silently did nothing.
         migrationBlocked: getMigrationBlockedState(userDataPath),
+        storageHealth,
       };
     } catch (err) {
       return { success: false, error: (err as Error).message };
