@@ -7,6 +7,7 @@
  * info. Mirrors GeminiUsagePopover.tsx's structure.
  */
 
+import { CostPeriodSection } from './CostPeriodSection';
 import React, { useEffect, RefObject } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime';
@@ -153,11 +154,13 @@ export const OllamaUsagePopover: React.FC<OllamaUsagePopoverProps> = ({
               {usage.weekly && (
                 <UsageSection title="Weekly" window={usage.weekly} color={weeklyColor as 'green' | 'yellow' | 'red' | 'muted'} />
               )}
-              {usage.costUSD !== undefined && (
+              {usage.costPeriod ? (
+                <CostPeriodSection costPeriod={usage.costPeriod} costUSD={usage.costUSD} />
+              ) : usage.costUSD !== undefined ? (
                 <div className="text-[11px] text-nim-muted mt-1">
                   Metered cost this period: ${usage.costUSD.toFixed(5)}
                 </div>
-              )}
+              ) : null}
             </>
           )}
           <div className="mt-3 pt-3 border-t border-nim text-[11px] text-nim-muted">
@@ -172,7 +175,7 @@ export const OllamaUsagePopover: React.FC<OllamaUsagePopoverProps> = ({
           <div className="flex items-center justify-between">
             {usage.lastUpdated && (
               <span className="text-[10px] text-nim-faint">
-                Updated {formatLastUpdated(usage.lastUpdated)}
+                Observed {formatLastUpdated(usage.lastUpdated)}
               </span>
             )}
             <button
