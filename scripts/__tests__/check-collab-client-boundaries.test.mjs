@@ -45,6 +45,7 @@ test('current headless entry graphs satisfy the boundary', () => {
 });
 
 test('derives future headless domains from package exports and excludes UI entries', () => {
+  const packageRoot = '/repo/packages/collab-client';
   const entries = deriveCollabClientHeadlessEntryPoints({
     './core': { default: './src/core/index.ts' },
     './docs': { default: './src/docs/index.ts' },
@@ -52,7 +53,7 @@ test('derives future headless domains from package exports and excludes UI entri
     './trackers': { default: './src/trackers/index.ts' },
     './trackers-ui': { default: './src/trackers-ui/index.ts' },
     './trackers-ui/board.css': './src/trackers-ui/board/TrackerBoardCard.css',
-  }, '/repo/packages/collab-client');
+  }, packageRoot);
 
   // Compare relative to the synthetic root, normalized to POSIX separators,
   // rather than the absolute paths directly -- path.* resolves a leading
