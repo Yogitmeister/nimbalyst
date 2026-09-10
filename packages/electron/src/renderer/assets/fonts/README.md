@@ -1,3 +1,4 @@
+[ASTRA-ORCH]
 # Material Symbols Outlined
 
 `material-symbols-outlined.woff2` is the variable Material Symbols Outlined font bundled with the renderer so application chrome does not depend on Google Fonts during startup.
@@ -6,3 +7,15 @@
 - SHA-256: `dc34a2cf67e3e88050caf3abdf588b8eca88e32d2eaef3b39fdde07f77d8f573`
 - Retrieved: 2026-07-30
 - License: Apache License 2.0; see `LICENSE.txt`
+
+## Noto Color Emoji fallback
+
+`NotoColorEmoji_WindowsCompatible.ttf` is bundled only as the final fallback for
+session-title emoji. The platform UI and emoji fonts remain first in the title
+font stack, so this file only supplies glyphs that the host renderer cannot.
+
+- Source: `https://github.com/googlefonts/noto-emoji`
+- Revision: `8998f5dd683424a73e2314a8c1f1e359c19e8742`
+- SHA-256: `19473341d23f8fdf90e91ffca381d727c43f7bc05b2758dec9687a58fbb81150`
+- Retrieved: 2026-08-15
+- License: SIL Open Font License 1.1; see `NotoColorEmoji-LICENSE.txt`

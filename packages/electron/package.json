@@ -352,6 +352,10 @@
         ]
       },
       {
+        "from": "src/renderer/assets/fonts/NotoColorEmoji-LICENSE.txt",
+        "to": "legal/NotoColorEmoji-LICENSE.txt"
+      },
+      {
         "from": "resources/trayTemplate.png",
         "to": "trayTemplate.png"
       },

@@ -1,3 +1,4 @@
+/* [ASTRA-ORCH] */
 /* Import theme CSS - editor class styles and unified CSS variables (--nim-* prefix) */
 @import '../../../runtime/src/editor/themes/NimbalystEditorTheme.css';
 @import '../../../runtime/src/editor/themes/NimbalystTheme.css';
@@ -9,6 +10,17 @@
   font-weight: 100 700;
   font-display: block;
   src: url('./assets/fonts/material-symbols-outlined.woff2') format('woff2');
+}
+
+/* Session titles may carry a deliberately scarce visual anchor. Keep the host
+   platform's emoji first, then cover emoji it does not ship (for example
+   U+1FAAA Identification Card) without changing the normal UI typeface. */
+@font-face {
+  font-family: 'Nimbalyst Noto Color Emoji';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/fonts/NotoColorEmoji_WindowsCompatible.ttf') format('truetype');
 }
 
 /* Tailwind CSS - comes after theme variables so it can reference them */
@@ -39,6 +51,17 @@ body {
      tray-panel window overrides this below; it must stay see-through. */
   background: var(--nim-bg);
   color: var(--nim-text);
+}
+
+/* Do not make Noto the app font: it is an emoji fallback only. `Segoe UI Emoji`
+   remains ahead of it, preserving the platform rendering for glyphs it has. */
+.session-list-item-title,
+.workstream-session-item-title,
+.session-tab-title,
+.session-history-card-title {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    'Segoe UI Emoji', 'Nimbalyst Noto Color Emoji', sans-serif;
 }
 
 #root {
