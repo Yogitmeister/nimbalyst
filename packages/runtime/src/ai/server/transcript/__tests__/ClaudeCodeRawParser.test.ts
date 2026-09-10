@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Contract tests for ClaudeCodeRawParser.
  *
@@ -344,6 +345,7 @@ describe('ClaudeCodeRawParser', () => {
         filename: 'report.txt',
         mode: 'temp',
       });
+      const registeredPath = stagedAttachmentRegistry.find(SESSION_ID, stagedPath)!.path;
 
       await parser.parseMessage(makeRawMessage({
         content: JSON.stringify({
@@ -379,7 +381,7 @@ describe('ClaudeCodeRawParser', () => {
         type: 'system_message',
         systemType: 'permission_denied',
         isAttachmentStagingDenied: true,
-        attachmentPath: stagedPath,
+        attachmentPath: registeredPath,
         attachmentFilename: 'report.txt',
         attachmentStagingMode: 'temp',
         attachmentDetection: 'reactive',
@@ -973,6 +975,107 @@ describe('ClaudeCodeRawParser', () => {
       const started = descriptors.find(d => d.type === 'subagent_started') as any;
       expect(started).toBeDefined();
       expect(started.agentType).toBe('Explore');
+    });
+
+    it('attaches the complete safe model launch configuration to Claude sub-agents', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const msg = makeRawMessage({
+        metadata: {
+          subagentLaunchConfig: {
+            provider: 'claude-code',
+            parameters: [
+              { key: 'model', label: 'Untrusted label', value: 'claude-sonnet-4-6', source: 'effective_session' },
+              { key: 'reasoningEffort', label: 'Reasoning effort', value: 'high', source: 'effective_session' },
+              { key: 'extendedThinking', label: 'Extended reasoning', value: 'on', source: 'requested' },
+              { key: 'permissionMode', label: 'Permission mode', value: 'auto', source: 'effective_session' },
+              { key: 'systemPrompt', label: 'System prompt', value: 'must-not-appear', source: 'requested' },
+            ],
+          },
+        },
+        content: JSON.stringify({
+          type: 'assistant',
+          message: {
+            id: 'msg_launch_config',
+            role: 'assistant',
+            content: [{
+              type: 'tool_use',
+              id: 'toolu_launch_config',
+              name: 'Agent',
+              input: {
+                subagent_type: 'Explore',
+                prompt: 'Audit the provider path',
+                run_in_background: true,
+                resume: 'agent-session-1',
+                max_turns: 12,
+              },
+            }],
+          },
+        }),
+      });
+
+      const descriptors = await parser.parseMessage(msg, makeContext());
+      const started = descriptors.find(d => d.type === 'subagent_started') as any;
+
+      expect(started).toMatchObject({
+        type: 'subagent_started',
+        subagentId: 'toolu_launch_config',
+        provider: 'claude-code',
+        model: 'claude-sonnet-4-6',
+        reasoningEffort: 'high',
+        extendedThinking: 'on',
+      });
+      expect(started.launchParameters).toEqual(expect.arrayContaining([
+        { key: 'model', label: 'Model', value: 'claude-sonnet-4-6', source: 'effective_session' },
+        { key: 'reasoningEffort', label: 'Reasoning effort', value: 'high', source: 'effective_session' },
+        { key: 'extendedThinking', label: 'Extended reasoning', value: 'on', source: 'requested' },
+        { key: 'permissionMode', label: 'Permission mode', value: 'auto', source: 'effective_session' },
+        { key: 'agentType', label: 'Agent type', value: 'Explore', source: 'tool_argument' },
+        { key: 'background', label: 'Background', value: true, source: 'tool_argument' },
+        { key: 'resume', label: 'Resume', value: 'agent-session-1', source: 'tool_argument' },
+        { key: 'maximumTurns', label: 'Maximum turns', value: 12, source: 'tool_argument' },
+      ]));
+      expect(JSON.stringify(started.launchParameters)).not.toContain('must-not-appear');
+    });
+
+    it('emits an audit update from the child assistant model and thinking block', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const msg = makeRawMessage({
+        metadata: {
+          subagentLaunchConfig: {
+            provider: 'claude-code',
+            parameters: [
+              { key: 'model', label: 'Model', value: 'sonnet', source: 'requested' },
+              { key: 'reasoningEffort', label: 'Reasoning effort', value: 'high', source: 'effective_session' },
+            ],
+          },
+        },
+        content: JSON.stringify({
+          type: 'assistant',
+          parent_tool_use_id: 'toolu_child',
+          message: {
+            id: 'msg_child',
+            model: 'claude-sonnet-4-6-20260801',
+            role: 'assistant',
+            content: [{ type: 'thinking', thinking: 'Checking the evidence.' }],
+          },
+        }),
+      });
+
+      const descriptors = await parser.parseMessage(msg, makeContext());
+      const updated = descriptors.find(d => d.type === 'subagent_updated') as any;
+
+      expect(updated).toMatchObject({
+        type: 'subagent_updated',
+        subagentId: 'toolu_child',
+        provider: 'claude-code',
+        model: 'claude-sonnet-4-6-20260801',
+        reasoningEffort: 'high',
+        extendedThinking: 'on',
+      });
+      expect(updated.launchParameters).toEqual(expect.arrayContaining([
+        { key: 'model', label: 'Model', value: 'claude-sonnet-4-6-20260801', source: 'observed' },
+        { key: 'extendedThinking', label: 'Extended reasoning', value: 'on', source: 'observed' },
+      ]));
     });
   });
 

@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * ClaudeCodeRawParser -- parses Claude Code SDK raw messages into
  * canonical event descriptors.
@@ -20,6 +21,11 @@ import type {
 } from './IRawMessageParser';
 import { stagedAttachmentRegistry } from '../../attachments/stagedAttachmentRegistry';
 import { isBackgroundedToolAck, isInteractiveWidgetTool } from '../../interactivePromptTools';
+import type {
+  SubagentLaunchParameter,
+  SubagentLaunchParameterSource,
+  SubagentLaunchParameterValue,
+} from '../types';
 
 const ATTACHMENT_DENY_MESSAGE = 'File is in a directory that is denied by your permission settings.';
 
@@ -33,6 +39,192 @@ const SUBAGENT_TOOLS = new Set(['Task', 'Agent']);
 // sync truncator replaced an oversized message); it is a sync artifact, not
 // model output, and must not render as an assistant bubble.
 const WHOLE_MESSAGE_ELISION_MARKER = /^\[Full .+ message elided from mobile sync:.*\]$/;
+
+const SUBAGENT_PARAMETER_SOURCES = new Set<SubagentLaunchParameterSource>([
+  'observed',
+  'effective_session',
+  'requested',
+  'tool_argument',
+  'default',
+]);
+
+const SUBAGENT_PARAMETER_LABELS = {
+  provider: 'Provider',
+  modelRequested: 'Requested model',
+  model: 'Model',
+  fallbackModel: 'Fallback model',
+  agent: 'Agent persona',
+  agentType: 'Agent type',
+  agentName: 'Agent name',
+  reasoningEffortRequested: 'Requested reasoning effort',
+  reasoningEffort: 'Reasoning effort',
+  extendedThinkingRequested: 'Requested extended reasoning',
+  extendedThinking: 'Extended reasoning',
+  thinkingBudgetTokens: 'Thinking budget (tokens)',
+  maximumThinkingTokens: 'Maximum thinking tokens',
+  maximumTurns: 'Maximum turns',
+  maximumBudgetUsd: 'Maximum budget (USD)',
+  permissionMode: 'Permission mode',
+  betas: 'Model betas',
+  background: 'Background',
+  resume: 'Resume',
+  mode: 'Mode',
+  teamName: 'Team',
+} as const;
+
+type SafeSubagentParameterKey = keyof typeof SUBAGENT_PARAMETER_LABELS;
+
+function isSafeSubagentParameterKey(value: unknown): value is SafeSubagentParameterKey {
+  return typeof value === 'string'
+    && Object.prototype.hasOwnProperty.call(SUBAGENT_PARAMETER_LABELS, value);
+}
+
+function isLaunchParameterValue(value: unknown): value is SubagentLaunchParameterValue {
+  return value === null
+    || typeof value === 'string'
+    || typeof value === 'number'
+    || typeof value === 'boolean';
+}
+
+function upsertLaunchParameter(
+  parameters: SubagentLaunchParameter[],
+  parameter: SubagentLaunchParameter,
+): void {
+  const index = parameters.findIndex(item => item.key === parameter.key);
+  if (index === -1) {
+    parameters.push(parameter);
+  } else {
+    parameters[index] = parameter;
+  }
+}
+
+function readSubagentLaunchConfig(metadata: Record<string, unknown> | undefined): {
+  provider: string | null;
+  parameters: SubagentLaunchParameter[];
+} {
+  const raw = metadata?.subagentLaunchConfig;
+  if (!raw || typeof raw !== 'object') return { provider: null, parameters: [] };
+
+  const config = raw as Record<string, unknown>;
+  const provider = config.provider === 'claude-code'
+    ? config.provider
+    : null;
+  const parameters: SubagentLaunchParameter[] = [];
+
+  if (Array.isArray(config.parameters)) {
+    for (const candidate of config.parameters) {
+      if (!candidate || typeof candidate !== 'object') continue;
+      const parameter = candidate as Record<string, unknown>;
+      if (
+        !isSafeSubagentParameterKey(parameter.key)
+        || !isLaunchParameterValue(parameter.value)
+        || typeof parameter.source !== 'string'
+        || !SUBAGENT_PARAMETER_SOURCES.has(parameter.source as SubagentLaunchParameterSource)
+        || (parameter.key === 'provider' && parameter.value !== 'claude-code')
+      ) {
+        continue;
+      }
+      upsertLaunchParameter(parameters, {
+        key: parameter.key,
+        label: SUBAGENT_PARAMETER_LABELS[parameter.key],
+        value: parameter.value,
+        source: parameter.source as SubagentLaunchParameterSource,
+      });
+    }
+  }
+
+  if (provider) {
+    const providerParameter: SubagentLaunchParameter = {
+      key: 'provider',
+      label: 'Provider',
+      value: provider,
+      source: 'effective_session',
+    };
+    const existingProviderIndex = parameters.findIndex(parameter => parameter.key === 'provider');
+    if (existingProviderIndex !== -1) parameters.splice(existingProviderIndex, 1);
+    parameters.unshift(providerParameter);
+  }
+
+  return { provider, parameters };
+}
+
+function launchParameterText(
+  parameters: SubagentLaunchParameter[],
+  key: string,
+): string | null | undefined {
+  const parameter = parameters.find(item => item.key === key);
+  if (!parameter) return undefined;
+  return parameter.value === null ? null : String(parameter.value);
+}
+
+function normalizeThinkingArgument(value: unknown): SubagentLaunchParameterValue | undefined {
+  if (isLaunchParameterValue(value)) {
+    if (typeof value === 'boolean') return value ? 'on' : 'off';
+    return value;
+  }
+  if (value && typeof value === 'object') {
+    const type = (value as Record<string, unknown>).type;
+    if (type === 'disabled') return 'off';
+    if (type === 'enabled') return 'on';
+    if (type === 'adaptive') return 'adaptive';
+  }
+  return undefined;
+}
+
+function addSubagentToolArguments(
+  parameters: SubagentLaunchParameter[],
+  args: Record<string, unknown>,
+  agentType: string,
+  isBackground: boolean,
+): void {
+  upsertLaunchParameter(parameters, {
+    key: 'agentType',
+    label: 'Agent type',
+    value: agentType,
+    source: typeof args.subagent_type === 'string' ? 'tool_argument' : 'default',
+  });
+  upsertLaunchParameter(parameters, {
+    key: 'background',
+    label: 'Background',
+    value: isBackground,
+    source: Object.prototype.hasOwnProperty.call(args, 'run_in_background')
+      ? 'tool_argument'
+      : 'default',
+  });
+
+  const argumentParameters: Array<[string, string, string]> = [
+    ['model', 'model', 'Model'],
+    ['effort', 'reasoningEffort', 'Reasoning effort'],
+    ['reasoning_effort', 'reasoningEffort', 'Reasoning effort'],
+    ['resume', 'resume', 'Resume'],
+    ['mode', 'mode', 'Mode'],
+    ['name', 'agentName', 'Agent name'],
+    ['team_name', 'teamName', 'Team'],
+    ['max_turns', 'maximumTurns', 'Maximum turns'],
+    ['max_budget_usd', 'maximumBudgetUsd', 'Maximum budget (USD)'],
+  ];
+
+  for (const [argumentKey, parameterKey, label] of argumentParameters) {
+    const value = args[argumentKey];
+    if (!isLaunchParameterValue(value) || value === null || value === '') continue;
+    upsertLaunchParameter(parameters, {
+      key: parameterKey,
+      label,
+      value,
+      source: 'tool_argument',
+    });
+  }
+
+  const thinking = normalizeThinkingArgument(args.thinking);
+  if (thinking !== undefined) {
+    upsertLaunchParameter(parameters, {
+      key: 'extendedThinking',
+      label: 'Extended reasoning',
+      value: thinking,
+      source: 'tool_argument',
+    });
+  }
+}
 
 export class ClaudeCodeRawParser implements IRawMessageParser {
   private readonly toolInputsById = new Map<string, { toolName: string; input: Record<string, unknown> }>();
@@ -207,6 +399,46 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
           typeof parsed.message.model === 'string' ? parsed.message.model : undefined;
 
         if (Array.isArray(parsed.message.content)) {
+          if (parentToolUseId) {
+            const launchConfig = readSubagentLaunchConfig(msg.metadata);
+            const launchParameters = [...launchConfig.parameters];
+            const hasObservedThinking = parsed.message.content.some((block: any) =>
+              block?.type === 'thinking' && (block.thinking || block.text)
+            );
+
+            if (turnModel) {
+              upsertLaunchParameter(launchParameters, {
+                key: 'model',
+                label: 'Model',
+                value: turnModel,
+                source: 'observed',
+              });
+            }
+            if (hasObservedThinking) {
+              upsertLaunchParameter(launchParameters, {
+                key: 'extendedThinking',
+                label: 'Extended reasoning',
+                value: 'on',
+                source: 'observed',
+              });
+            }
+
+            const model = launchParameterText(launchParameters, 'model');
+            const reasoningEffort = launchParameterText(launchParameters, 'reasoningEffort');
+            const extendedThinking = launchParameterText(launchParameters, 'extendedThinking');
+            if (launchParameters.length > 0 || model !== undefined || hasObservedThinking) {
+              descriptors.push({
+                type: 'subagent_updated',
+                subagentId: parentToolUseId,
+                ...(launchConfig.provider ? { provider: launchConfig.provider } : {}),
+                ...(model !== undefined ? { model } : {}),
+                ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+                ...(extendedThinking !== undefined ? { extendedThinking } : {}),
+                ...(launchParameters.length > 0 ? { launchParameters } : {}),
+              });
+            }
+          }
+
           for (const block of parsed.message.content) {
             if (block.type === 'text' && block.text) {
               // Deduplicate text:
@@ -444,6 +676,12 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
         typeof args.subagent_type === 'string' && args.subagent_type
           ? args.subagent_type
           : toolName;
+      const launchConfig = readSubagentLaunchConfig(msg.metadata);
+      const launchParameters = [...launchConfig.parameters];
+      addSubagentToolArguments(launchParameters, args, agentType, isBackground);
+      const model = launchParameterText(launchParameters, 'model');
+      const reasoningEffort = launchParameterText(launchParameters, 'reasoningEffort');
+      const extendedThinking = launchParameterText(launchParameters, 'extendedThinking');
 
       descriptors.push({
         type: 'subagent_started',
@@ -452,6 +690,11 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
         teammateName,
         teamName,
         teammateMode,
+        ...(launchConfig.provider ? { provider: launchConfig.provider } : {}),
+        ...(model !== undefined ? { model } : {}),
+        ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+        ...(extendedThinking !== undefined ? { extendedThinking } : {}),
+        ...(launchParameters.length > 0 ? { launchParameters } : {}),
         isBackground,
         prompt,
         createdAt: msg.createdAt,

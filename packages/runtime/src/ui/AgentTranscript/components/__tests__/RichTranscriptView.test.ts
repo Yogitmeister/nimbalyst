@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import type { TranscriptViewMessage } from '../../../../ai/server/transcript/TranscriptProjector';
@@ -538,5 +539,16 @@ describe('sub-agent audit labels', () => {
   it('omits the label when metadata is absent and does not add placeholders', () => {
     expect(formatSubagentAuditLabel(null, undefined)).toBeNull();
     expect(formatSubagentAuditLabel('gpt-5.4', null)).toBe('Model: gpt-5.4');
+  });
+
+  it('includes provider and extended reasoning state when supplied', () => {
+    expect(formatSubagentAuditLabel(
+      'claude-sonnet-4-6-20260801',
+      'high',
+      'on',
+      'claude-code',
+    )).toBe(
+      'Provider: claude-code; Model: claude-sonnet-4-6-20260801; Reasoning effort: high; Extended reasoning: on',
+    );
   });
 });

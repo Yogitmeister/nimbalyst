@@ -171,6 +171,11 @@ import {
   observeClaudeBackgroundAgentRecoveryToolResult,
   prepareClaudeBackgroundAgentRecoveryTurn,
 } from './claudeCode/backgroundTaskRecoveryLifecycle';
+import {
+  applyClaudeInitToSubagentLaunchConfig,
+  createSubagentLaunchConfigMetadata,
+  shouldAttachSubagentLaunchConfig,
+} from './claudeCode/subagentLaunchAudit';
 
 
 let claudeProviderInstanceSequence = 0;
@@ -917,6 +922,8 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         { documentContext, sessionId, workspacePath, attachments, paths, prepared },
       );
 
+      const subagentLaunchConfig = createSubagentLaunchConfigMetadata(options as Record<string, any>, this.config);
+
       if (sessionId && mainRouteSnapshot && !this.loggedRuntimeRouteReceipts.has(sessionId)) {
         await this.logAgentMessage(sessionId, 'claude-code', 'output',
           serializeProviderRuntimeRouteReceipt(mainRouteSnapshot.receipt),
@@ -1192,6 +1199,9 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
           // reacted to them, and the persistent reparse path (ClaudeCodeRawParser)
           // ignores them, so persisting just inflates ai_agent_messages + sync churn.
           if (sessionId && !isTransientClaudeCodeChunk(chunk)) {
+            if (chunk?.type === 'system' && chunk?.subtype === 'init') {
+              applyClaudeInitToSubagentLaunchConfig(subagentLaunchConfig, chunk);
+            }
             // Two storage passes, both on clones -- the live dispatch loop below
             // still uses the untouched `chunk`:
             //   1. slim: drop dead-weight fields (tool_use_result.originalFile/
@@ -1208,7 +1218,24 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
             // Only assistant messages with text content (no tool_use/tool_result) are searchable
             const isSearchable = isSearchableAssistantChunk(chunk);
 
-            this.logAgentMessageNonBlocking(sessionId, 'claude-code', 'output', rawChunkJson, undefined, hideMessages, providerMessageId, isSearchable);
+            const launchMetadata = shouldAttachSubagentLaunchConfig(chunk)
+              ? {
+                  subagentLaunchConfig: {
+                    provider: subagentLaunchConfig.provider,
+                    parameters: subagentLaunchConfig.parameters.map(parameter => ({ ...parameter })),
+                  },
+                }
+              : undefined;
+            this.logAgentMessageNonBlocking(
+              sessionId,
+              'claude-code',
+              'output',
+              rawChunkJson,
+              launchMetadata,
+              hideMessages,
+              providerMessageId,
+              isSearchable,
+            );
             // Drive incremental transcript transformation. Without this, the
             // canonical store only advances on the next aiLoadSession from
             // the renderer, which never fires when the user's active session

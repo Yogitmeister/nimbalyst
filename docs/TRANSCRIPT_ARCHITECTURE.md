@@ -1,3 +1,4 @@
+<!-- [ASTRA-ORCH] -->
 # Transcript Architecture
 
 How AI session transcripts are stored, transformed, and rendered.
@@ -69,17 +70,19 @@ The watermark + parser pipeline driver. Same contract as before, but its `transc
 
 ### Per-provider parsers
 
-Located in `packages/runtime/src/ai/server/transcript/parsers/`. Unchanged.
+Located in `packages/runtime/src/ai/server/transcript/parsers/`.
 
 | Parser | Provider(s) | Handles |
 |--------|-------------|---------|
-| `ClaudeCodeRawParser` | `claude-code` | SDK chunks: `assistant`, `text`, `tool_use`, `tool_result`, `error`, `nimbalyst_tool_use/result`, subagent spawns |
-| `CodexRawParserDispatcher` -> `CodexRawParser` / `CodexAppServerRawParser` | `openai-codex` | Per-message dispatch based on `metadata.transport` |
+| `ClaudeCodeRawParser` | `claude-code` | SDK chunks: `assistant`, `text`, `tool_use`, `tool_result`, `error`, `nimbalyst_tool_use/result`, subagent spawns and safe launch-configuration audit metadata |
+| `CodexRawParserDispatcher` -> `CodexRawParser` / `CodexAppServerRawParser` | `openai-codex` | Per-message dispatch based on `metadata.transport`, including observed model and reasoning effort for app-server subagents |
 | `CodexACPRawParser` | `openai-codex-acp` | ACP wire format |
 | `CopilotRawParser` | `copilot-cli` | Copilot CLI |
 | `OpenCodeRawParser` | `opencode` | AgentProtocol events |
 
 Parsers implement `IRawMessageParser` and are **pure functions** over a single raw message. They return canonical descriptors; they never write to storage.
+
+Subagent descriptors may carry an allowlisted launch configuration with provenance (`requested`, `effective_session`, `tool_argument`, `observed`, or `default`). `TranscriptWriter` merges later observations into the existing root subagent event; observed child values outrank inherited session settings. Prompts, credentials, environment values, paths, and MCP configuration are never copied into this audit payload.
 
 ### searchableTextExtractor
 

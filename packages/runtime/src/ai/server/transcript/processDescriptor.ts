@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Descriptor processor -- maps CanonicalEventDescriptor values to TranscriptWriter
  * calls and maintains the tool/subagent ID tracking maps.
@@ -38,6 +39,22 @@ function isDuplicateToolStart(
  */
 function isSyntheticCodexLookupId(id: string): boolean {
   return id.startsWith('nimtc|');
+}
+
+async function resolveSubagentEventId(
+  store: ITranscriptEventStore,
+  sessionId: string,
+  subagentId: string,
+  subagentEventIds: Map<string, number>,
+): Promise<number | null> {
+  const cached = subagentEventIds.get(subagentId);
+  if (cached !== undefined) return cached;
+
+  const events = await store.getSubagentEvents(subagentId, sessionId);
+  const root = events.find(event => event.eventType === 'subagent');
+  if (!root) return null;
+  subagentEventIds.set(subagentId, root.id);
+  return root.id;
 }
 
 export async function processDescriptor(
@@ -178,8 +195,11 @@ export async function processDescriptor(
         teammateName: desc.teammateName,
         teamName: desc.teamName,
         teammateMode: desc.teammateMode,
+        provider: desc.provider,
         model: desc.model,
         reasoningEffort: desc.reasoningEffort,
+        extendedThinking: desc.extendedThinking,
+        launchParameters: desc.launchParameters,
         isBackground: desc.isBackground,
         prompt: desc.prompt,
         createdAt: desc.createdAt,
@@ -189,15 +209,42 @@ export async function processDescriptor(
       return event;
     }
 
+    case 'subagent_updated': {
+      const eventId = await resolveSubagentEventId(
+        store,
+        sessionId,
+        desc.subagentId,
+        subagentEventIds,
+      );
+      if (!eventId) return null;
+
+      await writer.updateSubagent(eventId, {
+        provider: desc.provider,
+        model: desc.model,
+        reasoningEffort: desc.reasoningEffort,
+        extendedThinking: desc.extendedThinking,
+        launchParameters: desc.launchParameters,
+      });
+      return store.getEventById(eventId);
+    }
+
     case 'subagent_completed': {
-      const eventId = subagentEventIds.get(desc.subagentId);
+      const eventId = await resolveSubagentEventId(
+        store,
+        sessionId,
+        desc.subagentId,
+        subagentEventIds,
+      );
       if (!eventId) return null;
 
       await writer.updateSubagent(eventId, {
         status: desc.status,
         resultSummary: desc.resultSummary,
+        provider: desc.provider,
         model: desc.model,
         reasoningEffort: desc.reasoningEffort,
+        extendedThinking: desc.extendedThinking,
+        launchParameters: desc.launchParameters,
       });
       return store.getEventById(eventId);
     }

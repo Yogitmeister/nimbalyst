@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { describe, it, expect, beforeEach } from 'vitest';
 import { TranscriptTransformer } from '../TranscriptTransformer';
 import type { IRawMessageStore, RawMessage, ISessionMetadataStore } from '../TranscriptTransformer';
@@ -754,6 +755,85 @@ describe('TranscriptTransformer', () => {
       const parsedResult = JSON.parse(payload.result);
       expect(parsedResult.action).toBe('committed');
       expect(parsedResult.commitHash).toBe('abc1234');
+    });
+
+    it('updates a Claude sub-agent with the observed child model across incremental batches', async () => {
+      const subagentId = 'toolu_subagent_audit';
+      const launchMetadata = {
+        subagentLaunchConfig: {
+          provider: 'claude-code',
+          parameters: [
+            { key: 'model', label: 'Model', value: 'sonnet', source: 'requested' },
+            { key: 'reasoningEffort', label: 'Reasoning effort', value: 'high', source: 'effective_session' },
+            { key: 'extendedThinking', label: 'Extended reasoning', value: 'on', source: 'requested' },
+          ],
+        },
+      };
+      const batch1Messages = [makeRawMessage({
+        id: 1,
+        sessionId: SESSION_ID,
+        direction: 'output',
+        metadata: launchMetadata,
+        content: JSON.stringify({
+          type: 'assistant',
+          message: {
+            id: 'msg_spawn',
+            content: [{
+              type: 'tool_use',
+              id: subagentId,
+              name: 'Agent',
+              input: { subagent_type: 'Explore', prompt: 'Inspect it' },
+            }],
+          },
+        }),
+      })];
+
+      await new TranscriptTransformer(
+        createMockRawStore(batch1Messages),
+        transcriptStore,
+        metadataStore,
+      ).processNewMessages(SESSION_ID, PROVIDER);
+
+      const batch2Messages = [
+        ...batch1Messages,
+        makeRawMessage({
+          id: 2,
+          sessionId: SESSION_ID,
+          direction: 'output',
+          metadata: launchMetadata,
+          content: JSON.stringify({
+            type: 'assistant',
+            parent_tool_use_id: subagentId,
+            message: {
+              id: 'msg_child',
+              model: 'claude-sonnet-4-6-20260801',
+              content: [{ type: 'thinking', thinking: 'Inspecting.' }],
+            },
+          }),
+        }),
+      ];
+
+      await new TranscriptTransformer(
+        createMockRawStore(batch2Messages),
+        transcriptStore,
+        metadataStore,
+      ).processNewMessages(SESSION_ID, PROVIDER);
+
+      const events = await transcriptStore.getSessionEvents(SESSION_ID);
+      const subagent = events.find(event => event.eventType === 'subagent');
+      expect(subagent).toBeDefined();
+      expect(subagent!.payload).toMatchObject({
+        status: 'running',
+        provider: 'claude-code',
+        model: 'claude-sonnet-4-6-20260801',
+        reasoningEffort: 'high',
+        extendedThinking: 'on',
+      });
+      expect((subagent!.payload as any).launchParameters).toEqual(expect.arrayContaining([
+        { key: 'model', label: 'Model', value: 'claude-sonnet-4-6-20260801', source: 'observed' },
+        { key: 'reasoningEffort', label: 'Reasoning effort', value: 'high', source: 'effective_session' },
+        { key: 'extendedThinking', label: 'Extended reasoning', value: 'on', source: 'observed' },
+      ]));
     });
 
     it('completes one Codex app-server tool across synthetic and native resume batches', async () => {

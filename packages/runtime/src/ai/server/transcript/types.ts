@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Canonical Transcript Event Types
  *
@@ -175,14 +176,38 @@ export type InteractivePromptPayload =
   | AskUserQuestionPayload
   | GitCommitProposalPayload;
 
+export type SubagentLaunchParameterSource =
+  | 'observed'
+  | 'effective_session'
+  | 'requested'
+  | 'tool_argument'
+  | 'default';
+
+export type SubagentLaunchParameterValue = string | number | boolean | null;
+
+/**
+ * One safe, model-relevant value captured at the sub-agent launch boundary.
+ * Secrets, prompts, filesystem paths, and credential-bearing SDK options are
+ * deliberately excluded from this audit surface.
+ */
+export interface SubagentLaunchParameter {
+  key: string;
+  label: string;
+  value: SubagentLaunchParameterValue;
+  source: SubagentLaunchParameterSource;
+}
+
 export interface SubagentPayload {
   agentType: string;
   status: 'running' | 'completed';
   teammateName: string | null;
   teamName: string | null;
   teammateMode: string | null;
+  provider?: string | null;
   model: string | null;
   reasoningEffort: string | null;
+  extendedThinking?: string | null;
+  launchParameters?: SubagentLaunchParameter[];
   color: string | null;
   isBackground: boolean;
   prompt: string;
