@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { parseDocumentDeepLinkAnchor, type SharedDocumentAnchor } from '../shared/documentDeepLinks';
 import { app, BrowserWindow, dialog, nativeImage, nativeTheme, session, shell } from 'electron';
 import {
@@ -207,6 +208,8 @@ import { registerCodexUsageHandlers } from './ipc/CodexUsageHandlers';
 import { codexUsageService } from './services/CodexUsageService';
 import { registerGeminiUsageHandlers } from './ipc/GeminiUsageHandlers';
 import { geminiUsageService } from './services/GeminiUsageService';
+import { registerOllamaUsageHandlers } from './ipc/OllamaUsageHandlers';
+import { ollamaUsageService } from './services/OllamaUsageService';
 import { codexAuthService } from './services/CodexAuthService';
 import { registerExtensionHandlers, getClaudePluginPaths, initializeExtensionFileTypes } from './ipc/ExtensionHandlers';
 import { registerExtensionPermissionHandlers } from './ipc/ExtensionPermissionHandlers';
@@ -2116,6 +2119,8 @@ app.whenReady().then(async () => {
     codexUsageService.initialize();
     registerGeminiUsageHandlers();
     geminiUsageService.initialize();
+    registerOllamaUsageHandlers();
+    ollamaUsageService.initialize();
     registerPermissionHandlers();
     registerGitStatusHandlers();
     registerGitHandlers();
@@ -3037,6 +3042,20 @@ app.whenReady().then(async () => {
     // invoke MCP tools against the localhost ports.
     const mcpAuthToken = generateMcpAuthToken();
     configureMcpServers({ mcpAuthToken });
+
+    // Resume durable ordinary FIFO work after a process restart. Control rows
+    // remain fenced until send_prompt_now records their delivery decision.
+    try {
+        const { discovered, triggered, skipped } =
+            await aiService.drainPendingOrdinaryPromptsOnStartup();
+        if (discovered > 0) {
+            logger.main.info(
+                `[Main] Startup queue drain: discovered ${discovered} session(s), triggered ${triggered}, skipped ${skipped}`
+            );
+        }
+    } catch (drainErr) {
+        logger.main.error('[Main] Startup queue drain failed:', drainErr);
+    }
 
     // Test-only IPC handler: lets E2E tests verify the bearer token is
     // enforced by the MCP servers. Mirrors the pattern used for

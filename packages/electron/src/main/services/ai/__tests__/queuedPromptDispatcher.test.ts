@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -7,6 +8,12 @@ import {
   type ClaimedQueuedPrompt,
   type QueuedPromptStoreLike,
 } from '../queuedPromptDispatcher';
+import {
+  createPriorityPromptDeliveryService,
+  type PriorityControlPrompt,
+  type PriorityInterruptReceipt,
+  type PriorityTargetState,
+} from '../../PriorityPromptDeliveryService';
 
 describe('queuedPromptDispatcher', () => {
   afterEach(() => {
@@ -382,9 +389,9 @@ describe('queuedPromptDispatcher', () => {
     } as unknown as Electron.BrowserWindow;
 
     const onChainSettled = vi.fn(async () => {});
-    // continueQueuedPromptChain dispatches a follow-on by re-adding to processingSet.
+    // continueQueuedPromptChain dispatches a follow-on by replacing the lease.
     const continueQueuedPromptChain = vi.fn(async (sessionId: string) => {
-      processingSet.add(sessionId);
+      processingSet.acquire(sessionId);
     });
 
     await tryClaimAndDispatchNextQueuedPrompt({
@@ -538,5 +545,178 @@ describe('queuedPromptDispatcher', () => {
     settleTurn.get('fifo')!();
     await vi.runAllTimersAsync();
     expect(processingSet.has('session-1')).toBe(false);
+  });
+
+  it('dispatches an ordinary prompt exactly once when post-turn drains race', async () => {
+    vi.useFakeTimers();
+    const queued: ClaimedQueuedPrompt = {
+      id: 'ordinary-after-active-turn', prompt: 'continue after the current turn',
+      attachments: null, documentContext: null,
+    };
+    let claimed = false;
+    const queueStore: QueuedPromptStoreLike = {
+      listPending: vi.fn(async () => claimed ? [] : [queued]),
+      claim: vi.fn(async () => {
+        if (claimed) return null;
+        claimed = true;
+        return queued;
+      }),
+      complete: vi.fn(async () => {}), fail: vi.fn(async () => {}),
+    };
+    const processingSet = new SessionProcessingGuard();
+    const targetWindow = {
+      isDestroyed: () => false, webContents: { send: vi.fn(), mainFrame: {} },
+    } as unknown as Electron.BrowserWindow;
+    const sendMessageHandler = vi.fn(async () => ({ content: 'ok' }));
+    const options = {
+      continueQueuedPromptChain: vi.fn(async () => {}), logError: vi.fn(), logInfo: vi.fn(),
+      onPromptClaimed: vi.fn(), processingSet, queueStore, sendMessageHandler,
+      sessionId: 'session-1', source: 'completion-handler queue',
+      startSession: vi.fn(async () => {}), targetWindow, workspacePath: '/workspace/project',
+    };
+
+    const results = await Promise.all([
+      tryClaimAndDispatchNextQueuedPrompt(options),
+      tryClaimAndDispatchNextQueuedPrompt(options),
+    ]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    await vi.runAllTimersAsync();
+    expect(sendMessageHandler).toHaveBeenCalledTimes(1);
+    expect(queueStore.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a replacement control lease when the real priority path interrupts an ordinary dispatch', async () => {
+    const sessionId = 'priority-handoff-session';
+    const workspacePath = '/workspace/project';
+    const deferred = <T = void>() => {
+      let resolve!: (value: T | PromiseLike<T>) => void;
+      let reject!: (reason?: unknown) => void;
+      const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+      return { promise, resolve, reject };
+    };
+    const ordinaryStarted = deferred();
+    const priorityStarted = deferred();
+    const ordinaryTurn = deferred<void>();
+    const priorityTurn = deferred<void>();
+    const processingSet = new SessionProcessingGuard();
+    const acquireSpy = vi.spyOn(processingSet, 'acquire');
+    const ordinary: ClaimedQueuedPrompt = { id: 'ordinary-1', prompt: 'ordinary work' };
+    const control: ClaimedQueuedPrompt = {
+      id: 'control-1', prompt: 'priority control', deliveryReady: false,
+    };
+    const queueRows = new Map<string, { prompt: ClaimedQueuedPrompt; status: string }>([
+      [ordinary.id, { prompt: ordinary, status: 'pending' }],
+      [control.id, { prompt: control, status: 'pending' }],
+    ]);
+    const controlRow: PriorityControlPrompt = {
+      id: control.id, sessionId, status: 'pending', deliveryClass: 'control', priorityRank: 100,
+      deliveryReady: false, interruptTargetGeneration: null, interruptReservationOwner: null,
+      interruptReceipt: null,
+    };
+    const running: PriorityTargetState = {
+      status: 'running', generation: 'running:10:20', lastActivity: 10, updatedAt: 20,
+    };
+    const queueStore: QueuedPromptStoreLike = {
+      listPending: vi.fn(async () => [...queueRows.values()]
+        .filter((row) => row.status === 'pending' && row.prompt.deliveryReady !== false)
+        .map((row) => row.prompt)
+        .sort((a, b) => (b.id === control.id ? 1 : 0) - (a.id === control.id ? 1 : 0))),
+      claim: vi.fn(async (promptId) => {
+        const row = queueRows.get(promptId);
+        if (!row || row.status !== 'pending') return null;
+        row.status = 'executing';
+        return row.prompt;
+      }),
+      complete: vi.fn(async (promptId) => { queueRows.get(promptId)!.status = 'completed'; }),
+      fail: vi.fn(async (promptId) => { queueRows.get(promptId)!.status = 'failed'; }),
+    };
+    const targetWindow = {
+      isDestroyed: () => false, webContents: { send: vi.fn(), mainFrame: {} },
+    } as unknown as Electron.BrowserWindow;
+    const continueQueuedPromptChain = vi.fn(async () => {});
+    const dispatch = (source: string) => tryClaimAndDispatchNextQueuedPrompt({
+      continueQueuedPromptChain,
+      logError: vi.fn(),
+      logInfo: vi.fn(),
+      onPromptClaimed: vi.fn(),
+      processingSet,
+      queueStore,
+      sendMessageHandler: vi.fn(async (_event, message) => {
+        if (message === ordinary.prompt) {
+          ordinaryStarted.resolve();
+          await ordinaryTurn.promise;
+        } else {
+          priorityStarted.resolve();
+          await priorityTurn.promise;
+        }
+        return { content: message };
+      }),
+      sessionId,
+      source,
+      startSession: vi.fn(async () => {}),
+      targetWindow,
+      workspacePath,
+    });
+
+    await expect(dispatch('ordinary dispatch')).resolves.toBe(true);
+    await ordinaryStarted.promise;
+    const ordinaryLease = acquireSpy.mock.results[0]?.value;
+    expect(ordinaryLease).toBeDefined();
+
+    const priorityService = createPriorityPromptDeliveryService({
+      createControlPrompt: vi.fn(async () => ({ row: controlRow, replayed: false })),
+      getTargetState: vi.fn(async () => running),
+      hasStructuredPendingPrompt: vi.fn(async () => false),
+      reserveInterrupt: vi.fn(async ({ generation, owner }) => {
+        controlRow.interruptTargetGeneration = generation;
+        controlRow.interruptReservationOwner = owner;
+        return { row: controlRow, reserved: true };
+      }),
+      recordInterruptReceipt: vi.fn(async ({ receipt }: { receipt: PriorityInterruptReceipt }) => {
+        controlRow.interruptReceipt = receipt;
+        controlRow.deliveryReady = receipt.success;
+        control.deliveryReady = receipt.success;
+        return controlRow;
+      }),
+      // This is the AI interruption seam used by the real delivery service:
+      // it revokes the active dispatcher guard before control delivery is triggered.
+      interruptCurrentTurn: vi.fn(async () => {
+        processingSet.delete(sessionId);
+        return { success: true, method: 'native-interrupt', nativeEntered: true };
+      }),
+      triggerProcessing: vi.fn(async () => dispatch('priority delivery')),
+      getControlPrompt: vi.fn(async () => controlRow),
+      createControlPromptId: () => control.id,
+      createReservationOwner: () => 'priority-owner',
+    });
+
+    await expect(priorityService.deliver({
+      sessionId,
+      workspacePath,
+      prompt: control.prompt,
+      idempotencyKey: 'handoff-1',
+      producer: 'send_prompt_now:test',
+      controlOperation: 'operator_directive',
+      interruptWaitingForInput: false,
+    })).resolves.toMatchObject({ action: 'interrupt_attempted', processingTriggerAccepted: true });
+    await priorityStarted.promise;
+
+    const replacementLease = acquireSpy.mock.results[1]?.value;
+    expect(replacementLease).toBeDefined();
+    expect(replacementLease).not.toBe(ordinaryLease);
+
+    // The ordinary deferred send settles only after the priority service has
+    // installed its replacement lease. Its finally must become a no-op.
+    ordinaryTurn.reject(new Error('interrupted ordinary turn'));
+    await vi.waitFor(() => expect(queueStore.fail).toHaveBeenCalledWith(ordinary.id, 'interrupted ordinary turn'));
+    expect(processingSet.releaseIfOwner(sessionId, ordinaryLease!)).toBe(false);
+    expect(processingSet.has(sessionId)).toBe(true);
+    expect(continueQueuedPromptChain).not.toHaveBeenCalled();
+    expect(queueRows.get(control.id)?.status).toBe('executing');
+
+    priorityTurn.resolve();
+    await vi.waitFor(() => expect(queueStore.complete).toHaveBeenCalledWith(control.id));
+    expect(processingSet.has(sessionId)).toBe(false);
+    expect(continueQueuedPromptChain).toHaveBeenCalledTimes(1);
   });
 });

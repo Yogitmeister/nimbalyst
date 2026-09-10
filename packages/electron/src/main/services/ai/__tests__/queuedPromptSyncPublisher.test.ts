@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
 import { publishQueuedPromptsToSync } from '../queuedPromptSyncPublisher';
@@ -45,6 +46,26 @@ describe('publishQueuedPromptsToSync', () => {
     expect(pushChange).toHaveBeenCalledWith('session-1', {
       type: 'metadata_updated',
       metadata: { queuedPrompts: [{ id: 'p2', prompt: 'second', timestamp: 200 }] },
+    });
+  });
+
+  it('attaches an exact settlement receipt only when the caller supplies one', async () => {
+    const { pushChange, deps } = makeDeps([]);
+
+    await publishQueuedPromptsToSync(deps, 'session-1', {
+      settlement: { id: 'prompt-1', outcome: 'claimed' },
+    });
+
+    expect(pushChange).toHaveBeenCalledWith('session-1', {
+      type: 'metadata_updated',
+      metadata: {
+        queuedPrompts: [],
+        queuedPromptSettlement: {
+          id: 'prompt-1',
+          outcome: 'claimed',
+          settledAt: expect.any(Number),
+        },
+      },
     });
   });
 

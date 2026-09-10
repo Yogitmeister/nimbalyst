@@ -589,6 +589,12 @@ export interface SyncedSessionMetadata {
   updatedAt?: number;
   /** Queued prompts waiting to be processed by desktop */
   queuedPrompts?: SyncedQueuedPrompt[];
+  /** Exact durable queue settlement receipt for a mobile-originated prompt. */
+  queuedPromptSettlement?: {
+    id: string;
+    outcome: 'claimed' | 'withdrawn';
+    settledAt: number;
+  };
   /** Signals that a message is waiting for desktop to process it */
   pendingExecution?: {
     messageId: string;

@@ -15,6 +15,7 @@ import type { OrchestrationMessageKind } from '@nimbalyst/runtime/ai/server/type
  */
 
 import { resolveProjectPath } from "../utils/workspaceDetection";
+import { resolveTargetWorkspaceBinding } from "./targetWorkspaceBinding";
 
 type CreateSessionArgs = {
   title?: string;
@@ -81,6 +82,14 @@ type ListQueuedPromptsArgs = {
   includePromptText?: boolean;
 };
 
+type SendPromptNowArgs = {
+  sessionId: string;
+  prompt: string;
+  idempotencyKey?: string;
+  controlOperation?: string;
+  interruptWaitingForInput?: boolean;
+};
+
 type NotifyUserArgs = {
   title: string;
   body: string;
@@ -130,6 +139,11 @@ interface MetaAgentToolFns {
     prompt: string,
     interrupt?: boolean,
     messageKind?: OrchestrationMessageKind
+  ) => Promise<string>;
+  sendPromptNow: (
+    metaSessionId: string,
+    workspaceId: string,
+    args: SendPromptNowArgs
   ) => Promise<string>;
   notifyUser: (
     metaSessionId: string,
@@ -299,6 +313,10 @@ export const META_AGENT_TOOL_DEFS: Array<{
           type: "string",
           description: "The session ID to inspect.",
         },
+        targetWorkspacePath: {
+          type: "string",
+          description: "Optional explicit workspace path for a session in another project.",
+        },
       },
       required: ["sessionId"],
     },
@@ -313,6 +331,10 @@ export const META_AGENT_TOOL_DEFS: Array<{
         sessionId: {
           type: "string",
           description: "The session ID to inspect.",
+        },
+        targetWorkspacePath: {
+          type: "string",
+          description: "Optional explicit workspace path for a session in another project.",
         },
         includeFullResponse: {
           type: "boolean",
@@ -378,6 +400,26 @@ export const META_AGENT_TOOL_DEFS: Array<{
           description:
             "Optional. If true, stop the session's current turn and start processing the queue immediately instead of waiting for the turn to finish. The interrupted turn's work is lost, so use this only when the new prompt makes the current one obsolete. Ignored for a session waiting on an interactive prompt (use respond_to_prompt) or a terminal-backed CLI session; the result reports interrupted/interruptSkippedReason. The queue drains oldest-first, so if the session already has queued prompts this delivers the oldest one, not necessarily yours.",
         },
+        targetWorkspacePath: {
+          type: "string",
+          description: "Optional explicit workspace path for the target session.",
+        },
+      },
+      required: ["sessionId", "prompt"],
+    },
+  },
+  {
+    name: "send_prompt_now",
+    description:
+      "Durably queue a priority control prompt and, when the target is actively running, fence and interrupt the current ordinary turn before triggering delivery. Use send_prompt for normal FIFO follow-ups; structured prompts must use respond_to_prompt.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: { type: "string", description: "The target child session ID." },
+        prompt: { type: "string", description: "The priority control prompt to deliver." },
+        idempotencyKey: { type: "string", description: "Optional stable request key for a replay-safe receipt." },
+        controlOperation: { type: "string", description: "Optional audit label for the control action." },
+        interruptWaitingForInput: { type: "boolean", description: "Only allow a normal-text waiting session to be interrupted; structured prompts remain protected." },
       },
       required: ["sessionId", "prompt"],
     },
@@ -438,6 +480,10 @@ export const META_AGENT_TOOL_DEFS: Array<{
           type: "string",
           description: "The child session waiting for input.",
         },
+        targetWorkspacePath: {
+          type: "string",
+          description: "Optional explicit workspace path for the target session.",
+        },
         promptId: {
           type: "string",
           description: "The interactive prompt ID.",
@@ -495,6 +541,7 @@ const EXTENSION_META_AGENT_ALLOWED_TOOLS = new Set<string>([
   "get_session_result",
   "list_queued_prompts",
   "send_prompt",
+  "send_prompt_now",
   "notify_user",
   "respond_to_prompt",
   "list_spawned_sessions",
@@ -549,13 +596,13 @@ export async function dispatchMetaAgentTool(
     case "get_session_status":
       return toolFns.getSessionStatus(
         aiSessionId,
-        effectiveWorkspaceId,
+        resolveTargetWorkspaceBinding(effectiveWorkspaceId, args),
         (args?.sessionId as string) ?? ""
       );
     case "get_session_result":
       return toolFns.getSessionResult(
         aiSessionId,
-        effectiveWorkspaceId,
+        resolveTargetWorkspaceBinding(effectiveWorkspaceId, args),
         (args?.sessionId as string) ?? "",
         { includeFullResponse: args?.includeFullResponse !== false }
       );
@@ -573,16 +620,26 @@ export async function dispatchMetaAgentTool(
       if (args?.messageKind !== undefined && !['instruction', 'report', 'status', 'question', 'error'].includes(String(args.messageKind))) throw new Error('Invalid orchestration messageKind');
       return toolFns.sendPrompt(
         aiSessionId,
-        effectiveWorkspaceId,
+        resolveTargetWorkspaceBinding(effectiveWorkspaceId, args),
         (args?.sessionId as string) ?? "",
         (args?.prompt as string) ?? "",
         args?.interrupt === true,
         (args?.messageKind as OrchestrationMessageKind | undefined) ?? 'instruction'
       );
+    case "send_prompt_now":
+      return toolFns.sendPromptNow(
+        aiSessionId,
+        effectiveWorkspaceId,
+        (args ?? {}) as SendPromptNowArgs
+      );
     case "notify_user":
       return toolFns.notifyUser(aiSessionId, effectiveWorkspaceId, (args ?? {}) as NotifyUserArgs);
     case "respond_to_prompt":
-      return toolFns.respondToPrompt(aiSessionId, effectiveWorkspaceId, (args ?? {}) as RespondToPromptArgs);
+      return toolFns.respondToPrompt(
+        aiSessionId,
+        resolveTargetWorkspaceBinding(effectiveWorkspaceId, args),
+        (args ?? {}) as RespondToPromptArgs,
+      );
     case "list_spawned_sessions":
       return toolFns.listSpawnedSessions(aiSessionId, effectiveWorkspaceId);
     default:

@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * PGLite Worker Thread (JavaScript)
  * Runs PGLite in an isolated worker thread to avoid module conflicts
@@ -1816,6 +1817,16 @@ class PGLiteWorker {
           claimed_at TIMESTAMPTZ,
           completed_at TIMESTAMPTZ,
           error_message TEXT,
+          delivery_class TEXT NOT NULL DEFAULT 'ordinary' CHECK (delivery_class IN ('ordinary', 'control')),
+          priority_rank INTEGER NOT NULL DEFAULT 0,
+          delivery_ready INTEGER NOT NULL DEFAULT 1 CHECK (delivery_ready IN (0, 1)),
+          producer TEXT,
+          idempotency_key TEXT,
+          request_digest TEXT,
+          control_operation TEXT,
+          interrupt_target_generation TEXT,
+          interrupt_reservation_owner TEXT,
+          interrupt_receipt TEXT,
           CONSTRAINT fk_queued_prompts_session
             FOREIGN KEY (session_id)
             REFERENCES ai_sessions(id)
@@ -1826,6 +1837,22 @@ class PGLiteWorker {
         CREATE INDEX IF NOT EXISTS idx_queued_prompts_status ON queued_prompts(status);
         CREATE INDEX IF NOT EXISTS idx_queued_prompts_session_status ON queued_prompts(session_id, status);
         CREATE INDEX IF NOT EXISTS idx_queued_prompts_created ON queued_prompts(created_at);
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS delivery_class TEXT NOT NULL DEFAULT 'ordinary';
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS priority_rank INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS delivery_ready INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS producer TEXT;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS request_digest TEXT;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS control_operation TEXT;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS interrupt_target_generation TEXT;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS interrupt_reservation_owner TEXT;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS interrupt_receipt TEXT;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_queued_prompts_control_idempotency
+          ON queued_prompts(session_id, idempotency_key)
+          WHERE idempotency_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_queued_prompts_priority_pending
+          ON queued_prompts(session_id, status, delivery_ready, priority_rank DESC, created_at ASC);
       `);
       console.log('[PGLite Worker] queued_prompts table created successfully');
     } catch (error) {

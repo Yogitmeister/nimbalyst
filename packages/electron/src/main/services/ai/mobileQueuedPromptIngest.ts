@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Ingests queued prompts that arrived on a session's sync index entry from
  * another device (the phone).
@@ -22,9 +23,8 @@ export interface IncomingQueuedPrompt {
 }
 
 export interface MobileQueuedPromptIngestDeps {
-  /** Existing row for this id, whatever its status — used to dedupe sync replays. */
-  getExisting(promptId: string): Promise<unknown | null>;
-  createPrompt(input: CreateQueuedPromptInput): Promise<unknown>;
+  /** Atomically creates a prompt or verifies that an identical row already exists. */
+  createOrReplayPrompt(input: CreateQueuedPromptInput): Promise<{ created: boolean }>;
   /** Mirror the session's still-pending rows back onto the sync index. */
   publishQueueState(sessionId: string): Promise<void>;
   getSession(sessionId: string): Promise<{ provider?: string; workspacePath?: string } | null>;
@@ -61,11 +61,10 @@ export async function ingestMobileQueuedPrompts(
     for (const prompt of prompts) {
       // Prompts composed on this desktop and echoed back by sync.
       if (prompt.id.startsWith('local-')) continue;
-      // Rows are status-transitioned, never deleted, so this also stops a late
-      // replay from resurrecting a prompt that already ran.
-      if (await deps.getExisting(prompt.id)) continue;
-
-      await deps.createPrompt({
+      // Rows are status-transitioned, never deleted. The durable operation
+      // safely distinguishes an identical replay from a same-ID conflict even
+      // when two index callbacks observe this prompt concurrently.
+      const result = await deps.createOrReplayPrompt({
         id: prompt.id,
         sessionId,
         prompt: prompt.prompt,
@@ -78,7 +77,7 @@ export async function ingestMobileQueuedPrompts(
           },
         },
       });
-      newPromptsCount++;
+      if (result.created) newPromptsCount++;
     }
 
     if (newPromptsCount === 0) return 0;

@@ -264,6 +264,7 @@ type DecryptedSessionIndexEntry = Omit<SessionIndexEntry, 'title' | 'encryptedTi
   queuedPrompts?: PlaintextQueuedPrompt[];  // Decrypted queued prompts
   currentContext?: { tokens: number; contextWindow: number };  // Decrypted from client metadata
   hasBeenNamed?: boolean;  // Decrypted from client metadata
+  queuedPromptSettlement?: { id: string; outcome: 'claimed' | 'withdrawn'; settledAt: number };
 };
 
 /** Encrypted create session request for wire protocol */
@@ -721,6 +722,12 @@ interface ClientMetadata {
   draftUpdatedAt?: number;
   /** Marker that the title was AI-chosen; prevents repeated rename attempts. */
   hasBeenNamed?: boolean;
+  /** Exact durable settlement receipt for a queued mobile prompt. */
+  queuedPromptSettlement?: {
+    id: string;
+    outcome: 'claimed' | 'withdrawn';
+    settledAt: number;
+  };
 }
 
 /**
@@ -789,7 +796,7 @@ export { isIndexClientMetadataOnlyUpdate as isIndexClientMetadataOnlyUpdateForTe
 
 function buildClientMetadataFromCacheEntry(entry: Pick<
   CachedSessionIndex,
-  'currentContext' | 'hasPendingPrompt' | 'phase' | 'tags' | 'draftInput' | 'draftUpdatedAt' | 'hasBeenNamed'
+  'currentContext' | 'hasPendingPrompt' | 'phase' | 'tags' | 'draftInput' | 'draftUpdatedAt' | 'hasBeenNamed' | 'queuedPromptSettlement'
 >): ClientMetadata | undefined {
   if (
     !entry.currentContext &&
@@ -797,7 +804,8 @@ function buildClientMetadataFromCacheEntry(entry: Pick<
     !entry.phase &&
     !entry.tags &&
     entry.draftInput === undefined &&
-    entry.hasBeenNamed === undefined
+    entry.hasBeenNamed === undefined &&
+    entry.queuedPromptSettlement === undefined
   ) {
     return undefined;
   }
@@ -810,6 +818,7 @@ function buildClientMetadataFromCacheEntry(entry: Pick<
     draftInput: entry.draftInput,
     draftUpdatedAt: entry.draftUpdatedAt,
     hasBeenNamed: entry.hasBeenNamed,
+    queuedPromptSettlement: entry.queuedPromptSettlement,
   };
 }
 
@@ -1020,6 +1029,7 @@ async function decryptSessionIndexEntry(
   let draftInput: string | undefined;
   let draftUpdatedAt: number | undefined;
   let hasBeenNamed: boolean | undefined;
+  let queuedPromptSettlement: ClientMetadata['queuedPromptSettlement'];
   if (entry.encryptedClientMetadata && entry.clientMetadataIv && key) {
     try {
       const clientMeta = await decryptClientMetadata(entry.encryptedClientMetadata, entry.clientMetadataIv, key);
@@ -1032,6 +1042,7 @@ async function decryptSessionIndexEntry(
       draftInput = clientMeta.draftInput;
       draftUpdatedAt = clientMeta.draftUpdatedAt;
       hasBeenNamed = clientMeta.hasBeenNamed;
+      queuedPromptSettlement = clientMeta.queuedPromptSettlement;
     } catch {
       throw new IndexEntryDecryptionError(`Cannot decrypt client metadata for session ${entry.sessionId}`);
     }
@@ -1066,6 +1077,7 @@ async function decryptSessionIndexEntry(
     hasPendingPrompt: hasPendingPrompt ?? entry.hasPendingPrompt,
     currentContext,
     lastReadAt: entry.lastReadAt,
+    queuedPromptSettlement,
   };
 
   const cacheEntry: CachedSessionIndex = {
@@ -1320,6 +1332,12 @@ interface CachedSessionIndex {
   draftUpdatedAt?: number;
   /** Marker that the title was AI-chosen; prevents repeated rename attempts. */
   hasBeenNamed?: boolean;
+  /** Exact durable settlement receipt for a queued mobile prompt. */
+  queuedPromptSettlement?: {
+    id: string;
+    outcome: 'claimed' | 'withdrawn';
+    settledAt: number;
+  };
 }
 
 // ============================================================================
@@ -1959,6 +1977,9 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       draftInput: 'draftInput' in pending ? (pending as any).draftInput : cached.draftInput,
       draftUpdatedAt: 'draftUpdatedAt' in pending ? (pending as any).draftUpdatedAt : cached.draftUpdatedAt,
       hasBeenNamed: 'hasBeenNamed' in pending ? (pending as any).hasBeenNamed : cached.hasBeenNamed,
+      queuedPromptSettlement: 'queuedPromptSettlement' in pending
+        ? pending.queuedPromptSettlement
+        : cached.queuedPromptSettlement,
     };
 
     if (isIndexClientMetadataOnlyUpdate(pending)) {
@@ -2789,6 +2810,9 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         const clientMeta = await decryptClientMetadata(broadcast.metadata.encryptedClientMetadata, broadcast.metadata.clientMetadataIv, session.encryptionKey);
         metadata.currentContext = clientMeta.currentContext;
         metadata.hasPendingPrompt = clientMeta.hasPendingPrompt;
+        if (clientMeta.queuedPromptSettlement !== undefined) {
+          metadata.queuedPromptSettlement = clientMeta.queuedPromptSettlement;
+        }
         if (clientMeta.draftInput !== undefined) metadata.draftInput = clientMeta.draftInput;
         if (clientMeta.draftUpdatedAt !== undefined) metadata.draftUpdatedAt = clientMeta.draftUpdatedAt;
       } catch (err) {
@@ -3824,6 +3848,9 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         ? pending.queuedPrompts
         : existingCache?.queuedPrompts;
       const cachedQueuedPromptCount = cachedQueuedPrompts?.length ?? existingCache?.queuedPromptCount;
+      const cachedQueuedPromptSettlement = pending && 'queuedPromptSettlement' in pending
+        ? pending.queuedPromptSettlement
+        : existingCache?.queuedPromptSettlement;
 
       const entry: SessionIndexEntry = {
         sessionId: session.id,
@@ -3891,7 +3918,8 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         pending?.tags !== undefined ||
         pending?.draftInput !== undefined ||
         pending?.draftUpdatedAt !== undefined ||
-        pending?.hasBeenNamed !== undefined
+        pending?.hasBeenNamed !== undefined ||
+        cachedQueuedPromptSettlement !== undefined
           ? {
               ...rawClientMeta,
               currentContext: pending?.currentContext ?? rawClientMeta?.currentContext,
@@ -3901,6 +3929,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               draftInput: pending?.draftInput ?? rawClientMeta?.draftInput,
               draftUpdatedAt: pending?.draftUpdatedAt ?? rawClientMeta?.draftUpdatedAt,
               hasBeenNamed: pending?.hasBeenNamed ?? rawClientMeta?.hasBeenNamed,
+              queuedPromptSettlement: cachedQueuedPromptSettlement,
             }
           : undefined;
       if (clientMeta) {
@@ -3949,6 +3978,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         draftInput: clientMeta?.draftInput,
         draftUpdatedAt: clientMeta?.draftUpdatedAt,
         hasBeenNamed: clientMeta?.hasBeenNamed,
+        queuedPromptSettlement: clientMeta?.queuedPromptSettlement,
       };
       built.push({
         sessionId: session.id,
@@ -4301,7 +4331,8 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             ('phase' in change.metadata) ||
             ('tags' in change.metadata) ||
             ('draftInput' in change.metadata) ||
-            ('hasBeenNamed' in change.metadata);
+            ('hasBeenNamed' in change.metadata) ||
+            ('queuedPromptSettlement' in change.metadata);
           if (hasClientMetaFields && config.encryptionKey) {
             const cached = sessionIndexCache.get(sessionId);
             const clientMeta: ClientMetadata = {
@@ -4312,6 +4343,9 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               draftInput: 'draftInput' in change.metadata ? (change.metadata as any).draftInput : cached?.draftInput,
               draftUpdatedAt: 'draftUpdatedAt' in change.metadata ? (change.metadata as any).draftUpdatedAt : cached?.draftUpdatedAt,
               hasBeenNamed: 'hasBeenNamed' in change.metadata ? (change.metadata as any).hasBeenNamed : cached?.hasBeenNamed,
+              queuedPromptSettlement: 'queuedPromptSettlement' in change.metadata
+                ? change.metadata.queuedPromptSettlement
+                : cached?.queuedPromptSettlement,
             };
             if (clientMeta.draftInput !== undefined) {
               // console.log('[CollabV3] Encrypting clientMeta with draftInput, sending to index');
@@ -4417,6 +4451,9 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               draftInput: 'draftInput' in meta ? (meta as any).draftInput : cached.draftInput,
               draftUpdatedAt: 'draftUpdatedAt' in meta ? (meta as any).draftUpdatedAt : cached.draftUpdatedAt,
               hasBeenNamed: 'hasBeenNamed' in meta ? (meta as any).hasBeenNamed : cached.hasBeenNamed,
+              queuedPromptSettlement: 'queuedPromptSettlement' in meta
+                ? meta.queuedPromptSettlement
+                : cached.queuedPromptSettlement,
             };
             if (isIndexClientMetadataOnlyUpdate(meta)) {
               await sendIndexClientMetadataPatch(updatedCache);
@@ -4463,6 +4500,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               draftInput: (meta as any).draftInput,
               draftUpdatedAt: (meta as any).draftUpdatedAt,
               hasBeenNamed: (meta as any).hasBeenNamed,
+              queuedPromptSettlement: meta.queuedPromptSettlement,
             };
             await sendIndexUpdate(newEntry);
           } else {
@@ -4489,6 +4527,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               'draftInput' in meta ||
               'draftUpdatedAt' in meta ||
               'hasBeenNamed' in meta ||
+              'queuedPromptSettlement' in meta ||
               'updatedAt' in meta;
             if (hasPartialUpdate) {
               // console.log('[CollabV3] Queueing partial metadata update for session:', sessionId, { isExecuting: meta.isExecuting, pendingExecution: meta.pendingExecution, title: meta.title });
@@ -4511,6 +4550,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               if ('draftInput' in meta) (existing as any).draftInput = (meta as any).draftInput;
               if ('draftUpdatedAt' in meta) (existing as any).draftUpdatedAt = (meta as any).draftUpdatedAt;
               if ('hasBeenNamed' in meta) (existing as any).hasBeenNamed = (meta as any).hasBeenNamed;
+              if ('queuedPromptSettlement' in meta) existing.queuedPromptSettlement = meta.queuedPromptSettlement;
               if ('updatedAt' in meta) existing.updatedAt = meta.updatedAt;
               pendingMetadataUpdates.set(sessionId, existing);
             } else {

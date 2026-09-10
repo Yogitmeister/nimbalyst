@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 // @vitest-environment node
 /**
  * Tests for the SQLite migration runner using a fake database handle.
@@ -255,6 +256,28 @@ describe('runMigrations against the real schema dir', () => {
       const mKind = cols.find((c) => c.name === 'message_kind');
       expect(sText?.type).toBe('TEXT');
       expect(mKind?.type).toBe('TEXT');
+
+      const queuedPromptColumns = handle
+        .prepare(`PRAGMA table_info(queued_prompts)`)
+        .all() as Array<{ name: string }>;
+      expect(queuedPromptColumns.map((column) => column.name)).toEqual(
+        expect.arrayContaining([
+          'delivery_class',
+          'priority_rank',
+          'delivery_ready',
+          'idempotency_key',
+          'interrupt_receipt',
+        ]),
+      );
+      const queuedPromptIndexes = handle
+        .prepare(`PRAGMA index_list(queued_prompts)`)
+        .all() as Array<{ name: string }>;
+      expect(queuedPromptIndexes.map((index) => index.name)).toEqual(
+        expect.arrayContaining([
+          'idx_queued_prompts_control_idempotency',
+          'idx_queued_prompts_priority_pending',
+        ]),
+      );
 
       const replicaCols = handle
         .prepare(`PRAGMA table_info(collab_document_replicas)`)

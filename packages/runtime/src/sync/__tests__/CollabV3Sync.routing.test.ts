@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import { isIndexClientMetadataOnlyUpdateForTest } from '../CollabV3Sync';
@@ -55,6 +56,16 @@ describe('isIndexClientMetadataOnlyUpdate routing predicate', () => {
     it('routes { hostDeviceId } through indexUpdate (execution ownership)', () => {
       expect(
         isIndexClientMetadataOnlyUpdateForTest(m({ hostDeviceId: 'desktop-1' })),
+      ).toBe(false);
+    });
+
+    it('routes an exact queued-prompt settlement through indexUpdate', () => {
+      expect(
+        isIndexClientMetadataOnlyUpdateForTest(
+          m({
+            queuedPromptSettlement: { id: 'prompt-1', outcome: 'claimed', settledAt: 123 },
+          }),
+        ),
       ).toBe(false);
     });
   });

@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Mirrors the desktop's pending queue into the sync index after every queue
  * transition.
@@ -23,6 +24,20 @@ export interface QueuedPromptSyncDeps {
   logWarn(message: string): void;
 }
 
+export interface QueuedPromptSettlement {
+  id: string;
+  outcome: 'claimed' | 'withdrawn';
+}
+
+export interface QueuedPromptSyncOptions {
+  /**
+   * Set only after this exact row won the durable pending -> executing claim.
+   * The receiver uses it as a prompt-ID-bound delivery receipt; a queue
+   * snapshot by itself is not ordered strongly enough to prove a claim.
+   */
+  settlement?: QueuedPromptSettlement;
+}
+
 /**
  * Returns the published snapshot, or null when the publish was skipped
  * (sync unavailable) or failed. Never throws — a sync side-channel must not
@@ -31,6 +46,7 @@ export interface QueuedPromptSyncDeps {
 export async function publishQueuedPromptsToSync(
   deps: QueuedPromptSyncDeps,
   sessionId: string,
+  options: QueuedPromptSyncOptions = {},
 ): Promise<SyncedQueuedPrompt[] | null> {
   const syncProvider = deps.getSyncProvider();
   if (!syncProvider?.pushChange) {
@@ -51,7 +67,17 @@ export async function publishQueuedPromptsToSync(
     // No `updatedAt`: draining the queue must not resort the mobile session list.
     syncProvider.pushChange(sessionId, {
       type: 'metadata_updated',
-      metadata: { queuedPrompts },
+      metadata: {
+        queuedPrompts,
+        ...(options.settlement
+          ? {
+              queuedPromptSettlement: {
+                ...options.settlement,
+                settledAt: Date.now(),
+              },
+            }
+          : {}),
+      },
     });
 
     return queuedPrompts;

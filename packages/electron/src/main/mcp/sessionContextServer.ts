@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Session-context tool surface (`get_session_summary`, `get_workstream_*`,
  * `list_recent_sessions`, `schedule_wakeup`, `update_session_board`).
@@ -23,6 +24,13 @@ import {
   deriveCoachingSignals,
   type CoachingMessageRow,
 } from "./sessionCoachingSignals";
+import { resolveTargetWorkspaceBinding } from "./targetWorkspaceBinding";
+
+const TARGET_WORKSPACE_PATH_SCHEMA = {
+  type: "string",
+  description:
+    "Optional explicit workspace path for an operation in another project. If omitted, this call remains bound to the caller's workspace.",
+} as const;
 
 // ─── Utilities ──────────────────────────────────────────────────────
 
@@ -124,7 +132,7 @@ async function handleGetSessionSummary(
   const sessionId = targetSessionId || currentSessionId;
 
   const session = await AISessionsRepository.get(sessionId);
-  if (!session) {
+  if (!session || session.workspacePath !== workspaceId) {
     return `Error: Session ${sessionId} not found`;
   }
 
@@ -335,7 +343,7 @@ async function handleGetWorkstreamOverview(
 
   if (!parentId) {
     const currentSession = await AISessionsRepository.get(currentSessionId);
-    if (!currentSession) {
+    if (!currentSession || currentSession.workspacePath !== workspaceId) {
       return "Error: Current session not found";
     }
     parentId = currentSession.parentSessionId ?? undefined;
@@ -345,7 +353,7 @@ async function handleGetWorkstreamOverview(
   }
 
   const parent = await AISessionsRepository.get(parentId);
-  if (!parent) {
+  if (!parent || parent.workspacePath !== workspaceId) {
     return `Error: Workstream session ${parentId} not found`;
   }
 
@@ -668,7 +676,7 @@ async function handleScheduleWakeup(args: {
   const { sessionId, workspaceId, delaySeconds, prompt, reason } = args;
 
   const session = await AISessionsRepository.get(sessionId);
-  if (!session) {
+  if (!session || session.workspacePath !== workspaceId) {
     return `Error: Session ${sessionId} not found`;
   }
 
@@ -728,6 +736,7 @@ export const SESSION_CONTEXT_TOOL_SCHEMAS = [
           description:
             "ID of the session to summarize. If omitted, summarizes the current session. Use list_recent_sessions to find session IDs.",
         },
+        targetWorkspacePath: TARGET_WORKSPACE_PATH_SCHEMA,
       },
       required: [],
     },
@@ -760,6 +769,7 @@ export const SESSION_CONTEXT_TOOL_SCHEMAS = [
           description:
             "ID of the workstream parent session. If omitted, uses the current session's parent workstream.",
         },
+        targetWorkspacePath: TARGET_WORKSPACE_PATH_SCHEMA,
       },
       required: [],
     },
@@ -797,6 +807,7 @@ export const SESSION_CONTEXT_TOOL_SCHEMAS = [
           description:
             "If true, include archived sessions in the results. Defaults to false. Archived sessions are marked with [ARCHIVED] in the output.",
         },
+        targetWorkspacePath: TARGET_WORKSPACE_PATH_SCHEMA,
       },
       required: [],
     },
@@ -858,6 +869,7 @@ export const SESSION_CONTEXT_TOOL_SCHEMAS = [
           description:
             "ID of the session to update. Use list_recent_sessions to find session IDs.",
         },
+        targetWorkspacePath: TARGET_WORKSPACE_PATH_SCHEMA,
         phase: {
           type: ["string", "null"],
           enum: [
@@ -900,10 +912,11 @@ export async function dispatchSessionContextTool(
   try {
     switch (toolName) {
       case "get_session_summary": {
+        const targetWorkspaceId = resolveTargetWorkspaceBinding(workspaceId, args);
         const result = await handleGetSessionSummary(
           args?.sessionId as string | undefined,
           aiSessionId,
-          workspaceId
+          targetWorkspaceId
         );
         return {
           content: [{ type: "text", text: result }],
@@ -924,10 +937,11 @@ export async function dispatchSessionContextTool(
       }
 
       case "get_workstream_overview": {
+        const targetWorkspaceId = resolveTargetWorkspaceBinding(workspaceId, args);
         const result = await handleGetWorkstreamOverview(
           args?.workstreamId as string | undefined,
           aiSessionId,
-          workspaceId
+          targetWorkspaceId
         );
         return {
           content: [{ type: "text", text: result }],
@@ -936,6 +950,7 @@ export async function dispatchSessionContextTool(
       }
 
       case "list_recent_sessions": {
+        const targetWorkspaceId = resolveTargetWorkspaceBinding(workspaceId, args);
         const limit = Math.min(
           Math.max((args?.limit as number) || 10, 1),
           250
@@ -951,7 +966,7 @@ export async function dispatchSessionContextTool(
           args?.query as string | undefined,
           limit,
           offset,
-          workspaceId,
+          targetWorkspaceId,
           aiSessionId,
           includeArchived,
           searchField
@@ -1047,6 +1062,15 @@ export async function dispatchSessionContextTool(
         if (tags !== undefined && !Array.isArray(tags)) {
           return {
             content: [{ type: "text", text: "Error: tags must be an array of strings" }],
+            isError: true,
+          };
+        }
+
+        const targetWorkspaceId = resolveTargetWorkspaceBinding(workspaceId, args);
+        const boardTarget = await AISessionsRepository.get(sessionId);
+        if (!boardTarget || boardTarget.workspacePath !== targetWorkspaceId) {
+          return {
+            content: [{ type: "text", text: 'Error: Session ' + sessionId + ' not found' }],
             isError: true,
           };
         }

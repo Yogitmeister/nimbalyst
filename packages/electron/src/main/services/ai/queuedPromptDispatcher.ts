@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import type { DocumentContext } from '@nimbalyst/runtime/ai/server/types';
 import { mergeClaimedRun, selectCoalescibleRun } from './coalesceQueuedPrompts';
 
@@ -46,6 +47,7 @@ export interface ClaimedQueuedPrompt {
   id: string;
   prompt: string;
   attachments?: unknown[] | null;
+  deliveryReady?: boolean;
   documentContext?: DocumentContext | null;
 }
 
@@ -161,7 +163,7 @@ export async function dispatchClaimedQueuedPrompt(
       // displaced it, the priority prompt that replaced it is still running and
       // releasing here would let the FIFO continuation start a second turn
       // underneath it (#1018).
-      processingSet.releaseIfOwner(sessionId, guardToken);
+      if (!processingSet.releaseIfOwner(sessionId, guardToken)) return;
       try {
         await continueQueuedPromptChain(
           sessionId,

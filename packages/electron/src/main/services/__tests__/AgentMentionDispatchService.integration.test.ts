@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 // @vitest-environment node
 import type { AgentWakePromptOrigin } from '@nimbalyst/runtime/ai/server/types';
 import type { TeamInboxMaterializedDelivery, TeamInboxSnapshot } from '@nimbalyst/runtime/sync';
@@ -150,9 +151,46 @@ function memoryQueue(): QueuedPromptsStore {
         ...input,
         status: 'pending',
         createdAt: Date.now(),
+        deliveryClass: 'ordinary',
+        priorityRank: 0,
+        deliveryReady: true,
       };
       rows.set(row.id, row);
       return row;
+    },
+    async createOrReplayMobilePrompt(input) {
+      const existing = rows.get(input.id);
+      if (existing) return { row: existing, created: false };
+      const row: QueuedPrompt = {
+        ...input,
+        status: 'pending',
+        createdAt: Date.now(),
+        deliveryClass: 'ordinary',
+        priorityRank: 0,
+        deliveryReady: true,
+      };
+      rows.set(row.id, row);
+      return { row, created: true };
+    },
+    async createPriorityControlPrompt(input) {
+      const existing = rows.get(input.id);
+      if (existing) return { row: existing, replayed: true };
+      const row: QueuedPrompt = {
+        id: input.id,
+        sessionId: input.sessionId,
+        prompt: input.prompt,
+        status: 'pending',
+        createdAt: Date.now(),
+        deliveryClass: 'control',
+        priorityRank: 0,
+        deliveryReady: true,
+        producer: input.producer,
+        idempotencyKey: input.idempotencyKey,
+        requestDigest: input.requestDigest,
+        controlOperation: input.controlOperation,
+      };
+      rows.set(row.id, row);
+      return { row, replayed: false };
     },
     async get(id) { return rows.get(id) ?? null; },
     async listForSession(sessionId, options) {
@@ -164,12 +202,39 @@ function memoryQueue(): QueuedPromptsStore {
       return [...rows.values()].filter((row) => row.sessionId === sessionId && row.status === 'pending');
     },
     async listSessionIdsWithPending() { return []; },
+    async listPendingSessionIds(options) {
+      return [...new Set(
+        [...rows.values()]
+          .filter((row) => row.status === 'pending'
+            && (!options?.deliveryClass || row.deliveryClass === options.deliveryClass))
+          .map((row) => row.sessionId),
+      )];
+    },
+    async reservePriorityInterrupt(input) {
+      const row = rows.get(input.promptId);
+      if (!row) throw new Error(`Unknown queued prompt ${input.promptId}`);
+      row.interruptTargetGeneration = input.generation;
+      row.interruptReservationOwner = input.owner;
+      return { row, reserved: true };
+    },
+    async recordPriorityInterruptReceipt(input) {
+      const row = rows.get(input.promptId);
+      if (!row) throw new Error(`Unknown queued prompt ${input.promptId}`);
+      row.interruptReceipt = input.receipt;
+      return row;
+    },
     async failAllPendingForSession() { return 0; },
     async claim(id) {
       const row = rows.get(id);
       if (!row || row.status !== 'pending') return null;
       row.status = 'executing';
       return row;
+    },
+    async withdrawPending(id, sessionId) {
+      const row = rows.get(id);
+      if (!row || row.sessionId !== sessionId || row.status !== 'pending') return false;
+      rows.delete(id);
+      return true;
     },
     async complete(id) { const row = rows.get(id); if (row) row.status = 'completed'; },
     async fail(id, errorMessage) {

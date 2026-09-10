@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { sessionInbox } from './sessionInboxService';
 import type { BrowserWindow } from 'electron';
 import { applyRemoteReadReceipt } from '../../ipc/ReadReceiptHandlers';
@@ -29,7 +30,7 @@ const MOBILE_REQUEST_DEDUP_GRACE_MS = 60_000;
  */
 export interface MobileSyncContext {
   sessionManager: SessionManager;
-  publishQueueStateToSync(sessionId: string): Promise<void>;
+  publishQueueStateToSync(sessionId: string, settlement?: { id: string; outcome: 'claimed' | 'withdrawn' }): Promise<void>;
   triggerQueuedPromptProcessingForSession(
     sessionId: string,
     workspacePath: string,
@@ -160,13 +161,9 @@ export class MobileSyncHandler {
             if (entry.queuedPrompts && entry.queuedPrompts.length > 0) {
               await ingestMobileQueuedPrompts(
                 {
-                  getExisting: async (promptId) => {
+                  createOrReplayPrompt: async (input) => {
                     const { getQueuedPromptsStore } = await import('../RepositoryManager');
-                    return getQueuedPromptsStore().get(promptId);
-                  },
-                  createPrompt: async (input) => {
-                    const { getQueuedPromptsStore } = await import('../RepositoryManager');
-                    return getQueuedPromptsStore().create(input);
+                    return getQueuedPromptsStore().createOrReplayMobilePrompt(input);
                   },
                   publishQueueState: (id) => this.ctx.publishQueueStateToSync(id),
                   getSession: async (id) => {
@@ -648,6 +645,18 @@ export class MobileSyncHandler {
           const { rolledBack } = await getQueuedPromptsStore().sweepExecutingForSession(sessionId);
           await this.ctx.publishQueueStateToSync(sessionId);
           return rolledBack;
+        },
+        withdrawPendingPrompt: async (sessionId, promptId) => {
+          const { getQueuedPromptsStore } = await import('../RepositoryManager');
+          const queueStore = getQueuedPromptsStore();
+          const withdrawn = await queueStore.withdrawPending(promptId, sessionId);
+          const queueSettlement = withdrawn
+            ? { id: promptId, outcome: 'withdrawn' as const }
+            : (await queueStore.get(promptId))?.status === 'executing'
+              ? { id: promptId, outcome: 'claimed' as const }
+              : undefined;
+          await this.ctx.publishQueueStateToSync(sessionId, queueSettlement);
+          return withdrawn;
         },
       });
     } catch (error) {

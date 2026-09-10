@@ -18,6 +18,7 @@ import { SessionFilesRepository } from '@nimbalyst/runtime/storage/repositories/
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { getDefaultAIModel } from '../utils/store';
 import { toMillis } from '../utils/timestampUtils';
+import { createPriorityPromptDeliveryService, createPriorityTargetGeneration, type PriorityControlPrompt, type PriorityTargetState } from './PriorityPromptDeliveryService';
 import { createWorktreeStore } from './WorktreeStore';
 import { GitWorktreeService } from './GitWorktreeService';
 import { database as databaseWorker } from '../database/PGLiteDatabaseWorker';
@@ -282,6 +283,8 @@ export class MetaAgentService {
           this.listQueuedPromptsJson(targetSessionId, workspaceId, options),
         sendPrompt: (metaSessionId, workspaceId, targetSessionId, prompt, interrupt, messageKind) =>
           this.sendPromptToSession(metaSessionId, targetSessionId, workspaceId, prompt, interrupt, messageKind),
+        sendPromptNow: (metaSessionId, workspaceId, args) =>
+          this.sendPromptNowToSession(metaSessionId, workspaceId, args),
         notifyUser: (callerSessionId, workspaceId, args) =>
           this.notifyUserJson(callerSessionId, workspaceId, args),
         respondToPrompt: (_metaSessionId, workspaceId, args) =>
@@ -1140,6 +1143,58 @@ export class MetaAgentService {
     return null;
   }
 
+  private async sendPromptNowToSession(
+    callerSessionId: string,
+    workspaceId: string,
+    args: SendPromptNowArgs,
+  ): Promise<string> {
+    if (!this.aiService) throw new Error('AI service not initialized');
+    const sessionId = args.sessionId?.trim();
+    const prompt = args.prompt?.trim();
+    if (!sessionId) throw new Error('sessionId is required');
+    if (!prompt) throw new Error('prompt is required');
+
+    const session = await AISessionsRepository.get(sessionId);
+    if (!session || session.workspacePath !== workspaceId) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    const { getQueuedPromptsStore } = await import('./RepositoryManager');
+    const queueStore = getQueuedPromptsStore();
+    const service = createPriorityPromptDeliveryService({
+      createControlPrompt: async (input) => {
+        const created = await queueStore.createPriorityControlPrompt(input);
+        return { row: created.row as unknown as PriorityControlPrompt, replayed: created.replayed };
+      },
+      getTargetState: (targetSessionId) => this.getPriorityTargetState(targetSessionId, workspaceId),
+      hasStructuredPendingPrompt: async (targetSessionId) =>
+        (await this.getPendingInteractivePrompt(targetSessionId)) !== null,
+      reserveInterrupt: async (input) => {
+        const reserved = await queueStore.reservePriorityInterrupt(input);
+        return { row: reserved.row as unknown as PriorityControlPrompt, reserved: reserved.reserved };
+      },
+      recordInterruptReceipt: async (input) =>
+        await queueStore.recordPriorityInterruptReceipt(input) as unknown as PriorityControlPrompt,
+      interruptCurrentTurn: (targetSessionId, expectedState) =>
+        this.aiService!.interruptCurrentTurnForSession(targetSessionId, expectedState),
+      triggerProcessing: (targetSessionId, targetWorkspacePath) =>
+        this.aiService!.triggerQueuedPromptProcessingForSession(targetSessionId, targetWorkspacePath, 'meta-agent'),
+      getControlPrompt: async (promptId) =>
+        await queueStore.get(promptId) as unknown as PriorityControlPrompt | null,
+    });
+
+    const receipt = await service.deliver({
+      sessionId,
+      workspacePath: session.worktreePath || session.workspacePath || workspaceId,
+      prompt,
+      idempotencyKey: args.idempotencyKey?.trim() || `send_prompt_now:${callerSessionId}:${randomUUID()}`,
+      producer: `send_prompt_now:${callerSessionId}`,
+      controlOperation: args.controlOperation?.trim() || 'agent_priority_prompt',
+      interruptWaitingForInput: args.interruptWaitingForInput === true,
+    });
+    return JSON.stringify(receipt, null, 2);
+  }
+
   private async notifyUserJson(
     callerSessionId: string,
     workspaceId: string,
@@ -1751,6 +1806,30 @@ export class MetaAgentService {
       [sessionId, workspaceId]
     );
     return rows[0] || null;
+  }
+
+  private async getPriorityTargetState(
+    sessionId: string,
+    workspaceId: string,
+  ): Promise<PriorityTargetState> {
+    const row = await this.getSessionStatusRow(sessionId, workspaceId);
+    if (!row) {
+      return {
+        status: 'missing',
+        generation: createPriorityTargetGeneration('missing', null, null),
+        lastActivity: null,
+        updatedAt: null,
+      };
+    }
+    const status = row.status as PriorityTargetState['status'];
+    const lastActivity = toMillis(row.last_activity);
+    const updatedAt = toMillis(row.updated_at);
+    return {
+      status,
+      generation: createPriorityTargetGeneration(status, lastActivity, updatedAt),
+      lastActivity,
+      updatedAt,
+    };
   }
 
   private async ensurePlanTrackerItem(workspaceId: string, sessionId: string, result: SessionResultData): Promise<void> {

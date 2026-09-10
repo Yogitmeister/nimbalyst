@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { describe, expect, it, vi } from 'vitest';
 import { createPGLiteQueuedPromptsStore } from '../PGLiteQueuedPromptsStore';
 
@@ -244,6 +245,46 @@ describe('PGLiteQueuedPromptsStore.complete', () => {
     await store.complete('prompt-1');
 
     expect(query).toHaveBeenCalledOnce();
+  });
+});
+
+describe('PGLiteQueuedPromptsStore.createOrReplayMobilePrompt', () => {
+  const input = {
+    id: 'mobile-1',
+    sessionId: 'session-1',
+    prompt: 'from mobile',
+    attachments: [{ id: 'attachment-1', filename: 'one.png' }],
+  };
+
+  it('uses an atomic ID conflict guard and propagates non-conflict database errors', async () => {
+    const databaseError = new Error('database unavailable');
+    const query = vi.fn(async (sql: string) => {
+      expect(sql).toContain('ON CONFLICT (id) DO NOTHING');
+      throw databaseError;
+    });
+    const store = createPGLiteQueuedPromptsStore({ query } as any);
+
+    await expect(store.createOrReplayMobilePrompt(input)).rejects.toBe(databaseError);
+    expect(query).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a replay whose durable row has a different session or content', async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes('INSERT INTO queued_prompts')) return { rows: [] };
+      return {
+        rows: [{
+          id: input.id,
+          session_id: 'different-session',
+          prompt: input.prompt,
+          attachments: JSON.stringify(input.attachments),
+          created_at: new Date(),
+          status: 'pending',
+        }],
+      };
+    });
+    const store = createPGLiteQueuedPromptsStore({ query } as any);
+
+    await expect(store.createOrReplayMobilePrompt(input)).rejects.toThrow(/idempotency_conflict/);
   });
 });
 

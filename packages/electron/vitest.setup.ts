@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -91,5 +92,8 @@ vi.mock('electron', async () => ({
   ipcMain: {
     handle: vi.fn(),
     on: vi.fn()
+  },
+  BrowserWindow: {
+    getAllWindows: vi.fn(() => [])
   }
 }));

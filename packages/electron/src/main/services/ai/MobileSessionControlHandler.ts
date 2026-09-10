@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * MobileSessionControlHandler
  *
@@ -46,6 +47,7 @@ export type ControlMessageType =
   | 'question_response'  // Legacy - kept for backwards compatibility
   | 'prompt_response'    // New unified prompt response type
   | 'prompt'
+  | 'withdraw_queued_prompt'
   | 'archive';
 
 // ============================================================
@@ -61,6 +63,10 @@ interface QuestionResponsePayload {
 interface PromptPayload {
   promptId: string;
   prompt: string;
+}
+
+interface WithdrawQueuedPromptPayload {
+  promptId: string;
 }
 
 /**
@@ -139,6 +145,13 @@ export interface MobileSessionControlCallbacks {
    * mobile cancels isn't left permanently wedged.
    */
   rollbackExecutingPrompts(sessionId: string): Promise<number>;
+
+  /**
+   * Remove one still-pending mobile prompt from the durable queue. This must
+   * be ID- and session-scoped so it cannot interrupt a prompt already claimed
+   * for execution.
+   */
+  withdrawPendingPrompt(sessionId: string, promptId: string): Promise<boolean>;
 }
 
 /**
@@ -213,6 +226,16 @@ function handleControlMessage(
       break;
     }
 
+    case 'withdraw_queued_prompt': {
+      const payload = message.payload as unknown as WithdrawQueuedPromptPayload;
+      if (!payload?.promptId) {
+        log.warn('Mobile queued-prompt withdrawal missing prompt id for session:', message.sessionId);
+        return;
+      }
+      void handleQueuedPromptWithdrawal(message.sessionId, payload.promptId, callbacks);
+      break;
+    }
+
     case 'archive': {
       const payload = message.payload as { isArchived?: boolean } | undefined;
       const isArchived = payload?.isArchived ?? true;
@@ -242,6 +265,26 @@ async function handlePromptTrigger(
     await callbacks.triggerQueuedPromptProcessing(sessionId, session.workspacePath);
   } catch (err) {
     log.error('Failed to handle mobile prompt control message:', err);
+  }
+}
+
+/**
+ * Withdraw a prompt only while it is still waiting in the durable queue. The
+ * store's conditional delete serializes against claim(), so a late withdrawal
+ * cannot erase an executing prompt or stop the wrong user action.
+ */
+async function handleQueuedPromptWithdrawal(
+  sessionId: string,
+  promptId: string,
+  callbacks: MobileSessionControlCallbacks,
+): Promise<void> {
+  try {
+    const withdrawn = await callbacks.withdrawPendingPrompt(sessionId, promptId);
+    log.info(
+      `Mobile queued-prompt withdrawal ${withdrawn ? 'completed' : 'arrived after claim'}: ${promptId}`,
+    );
+  } catch (err) {
+    log.error('Failed to withdraw mobile queued prompt:', err);
   }
 }
 

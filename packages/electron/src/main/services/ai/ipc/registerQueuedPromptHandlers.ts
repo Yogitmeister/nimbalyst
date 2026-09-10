@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { safeHandle } from '../../../utils/ipcRegistry';
 import { logger } from '../../../utils/logger';
 import { getTerminalSessionManager } from '../../TerminalSessionManager';
@@ -36,7 +37,7 @@ export function registerQueuedPromptHandlers(ctx: AIServiceContext): void {
       logger.main.info(`[AIService] claimQueuedPrompt: claimed ${promptId} for session ${sessionId}`);
       // The claimed prompt is now in the transcript, so drop it from the
       // queue mobile sees rather than leaving it double-reported.
-      await ctx.publishQueueStateToSync(sessionId);
+      await ctx.publishQueueStateToSync(sessionId, { id: claimed.id, outcome: 'claimed' });
       // Return in the format expected by the renderer
       return {
         id: claimed.id,
@@ -218,12 +219,12 @@ export function registerQueuedPromptHandlers(ctx: AIServiceContext): void {
     const { getQueuedPromptsStore } = await import('../../RepositoryManager');
     const queueStore = getQueuedPromptsStore();
     const row = await queueStore.get(promptId);
-    await queueStore.delete(promptId);
-    logger.main.info(`[AIService] deleteQueuedPrompt: deleted ${promptId}`);
+    const withdrawn = row ? await queueStore.withdrawPending(promptId, row.sessionId) : false;
+    logger.main.info(`[AIService] deleteQueuedPrompt: ${withdrawn ? 'withdrew' : 'not pending'} ${promptId}`);
     if (row?.sessionId) {
       await ctx.publishQueueStateToSync(row.sessionId);
     }
-    return { success: true };
+    return { success: withdrawn };
   });
 
   // Trigger queue processing for a session (e.g., when voice command queued while AI is idle)

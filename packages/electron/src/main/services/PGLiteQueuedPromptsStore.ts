@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * PGLite implementation of QueuedPromptsStore
  *
@@ -30,6 +31,26 @@ export interface QueuedPrompt {
   claimedAt?: number; // epoch ms
   completedAt?: number; // epoch ms
   errorMessage?: string;
+  deliveryClass: 'ordinary' | 'control';
+  priorityRank: number;
+  deliveryReady: boolean;
+  producer?: string;
+  idempotencyKey?: string;
+  requestDigest?: string;
+  controlOperation?: string;
+  interruptTargetGeneration?: string;
+  interruptReservationOwner?: string;
+  interruptReceipt?: QueuedPromptInterruptReceipt;
+}
+
+export interface QueuedPromptInterruptReceipt {
+  generation: string;
+  attempted: boolean;
+  success: boolean;
+  method: string | null;
+  error: string | null;
+  nativeEntered: boolean;
+  recordedAt: number;
 }
 
 export interface CreateQueuedPromptInput {
@@ -48,9 +69,40 @@ export interface CreateQueuedPromptInput {
   };
 }
 
+export interface CreatePriorityControlQueuedPromptInput {
+  id: string;
+  sessionId: string;
+  prompt: string;
+  producer: string;
+  idempotencyKey: string;
+  requestDigest: string;
+  controlOperation: string;
+}
+
+/**
+ * Mobile index updates can arrive concurrently. A prompt ID therefore needs
+ * create-or-replay semantics at the durable queue boundary rather than a
+ * best-effort preflight read in the sync listener.
+ */
+export interface CreateOrReplayMobileQueuedPromptInput extends CreateQueuedPromptInput {}
+
 export interface QueuedPromptsStore {
   /** Create a new queued prompt */
   create(input: CreateQueuedPromptInput): Promise<QueuedPrompt>;
+
+  /**
+   * Atomically create a mobile prompt or return the existing row for an
+   * identical sync replay. Reusing an ID with different content is an error.
+   */
+  createOrReplayMobilePrompt(input: CreateOrReplayMobileQueuedPromptInput): Promise<{
+    row: QueuedPrompt;
+    created: boolean;
+  }>;
+
+  createPriorityControlPrompt(input: CreatePriorityControlQueuedPromptInput): Promise<{
+    row: QueuedPrompt;
+    replayed: boolean;
+  }>;
 
   /** Get a specific queued prompt by ID */
   get(id: string): Promise<QueuedPrompt | null>;
@@ -69,6 +121,20 @@ export interface QueuedPromptsStore {
    */
   listSessionIdsWithPending(): Promise<string[]>;
 
+  listPendingSessionIds(options?: { deliveryClass?: 'ordinary' | 'control' }): Promise<string[]>;
+
+  reservePriorityInterrupt(input: {
+    promptId: string;
+    generation: string;
+    owner: string;
+  }): Promise<{ row: QueuedPrompt; reserved: boolean }>;
+
+  recordPriorityInterruptReceipt(input: {
+    promptId: string;
+    generation: string;
+    receipt: QueuedPromptInterruptReceipt;
+  }): Promise<QueuedPrompt>;
+
   /**
    * Mark every pending row for a session failed. Used when delivery is
    * terminally impossible (the project folder is gone), where deferring
@@ -83,6 +149,13 @@ export interface QueuedPromptsStore {
    * This is the key atomic operation that prevents duplicate execution.
    */
   claim(id: string): Promise<QueuedPrompt | null>;
+
+  /**
+   * Atomically remove a pending prompt that belongs to the given session.
+   * A prompt that has already been claimed must never be withdrawn here:
+   * cancelling an active turn is a separate, explicit session action.
+   */
+  withdrawPending(id: string, sessionId: string): Promise<boolean>;
 
   /** Mark a prompt as completed */
   complete(id: string): Promise<void>;
@@ -186,6 +259,15 @@ function rowToQueuedPrompt(row: any): QueuedPrompt {
     }
   }
 
+  let interruptReceipt = row.interrupt_receipt;
+  if (typeof interruptReceipt === 'string') {
+    try {
+      interruptReceipt = JSON.parse(interruptReceipt);
+    } catch {
+      interruptReceipt = undefined;
+    }
+  }
+
   return {
     id: row.id,
     sessionId: row.session_id,
@@ -197,7 +279,26 @@ function rowToQueuedPrompt(row: any): QueuedPrompt {
     claimedAt: toMillis(row.claimed_at) ?? undefined,
     completedAt: toMillis(row.completed_at) ?? undefined,
     errorMessage: row.error_message || undefined,
+    deliveryClass: row.delivery_class === 'control' ? 'control' : 'ordinary',
+    priorityRank: Number(row.priority_rank ?? 0),
+    deliveryReady: row.delivery_ready !== false && row.delivery_ready !== 0,
+    producer: row.producer || undefined,
+    idempotencyKey: row.idempotency_key || undefined,
+    requestDigest: row.request_digest || undefined,
+    controlOperation: row.control_operation || undefined,
+    interruptTargetGeneration: row.interrupt_target_generation || undefined,
+    interruptReservationOwner: row.interrupt_reservation_owner || undefined,
+    interruptReceipt: interruptReceipt || undefined,
   };
+}
+
+/**
+ * Attachment arrays are persisted as JSON on SQLite and may be decoded JSONB
+ * on PGLite. Canonical JSON comparison keeps replay validation backend-neutral
+ * while preserving array ordering and all attachment fields.
+ */
+function areAttachmentPayloadsEqual(left: any[] | undefined, right: any[]): boolean {
+  return JSON.stringify(left ?? []) === JSON.stringify(right);
 }
 
 export function createPGLiteQueuedPromptsStore(
@@ -235,6 +336,76 @@ export function createPGLiteQueuedPromptsStore(
       return rowToQueuedPrompt(rows[0]);
     },
 
+    async createOrReplayMobilePrompt(input: CreateOrReplayMobileQueuedPromptInput) {
+      await ensureReady();
+
+      const attachments = input.attachments ?? [];
+      const serializedAttachments = input.attachments ? JSON.stringify(input.attachments) : null;
+      const { rows } = await db.query<any>(
+        `INSERT INTO queued_prompts (id, session_id, prompt, attachments, document_context)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (id) DO NOTHING
+         RETURNING *`,
+        [
+          input.id,
+          input.sessionId,
+          input.prompt,
+          serializedAttachments,
+          input.documentContext ? JSON.stringify(input.documentContext) : null,
+        ],
+      );
+
+      if (rows.length > 0) {
+        console.log(`[QueuedPromptsStore] Created mobile prompt ${input.id} for session ${input.sessionId}`);
+        return { row: rowToQueuedPrompt(rows[0]), created: true };
+      }
+
+      const existing = await db.query<any>(
+        `SELECT * FROM queued_prompts WHERE id = $1 LIMIT 1`,
+        [input.id],
+      );
+      if (existing.rows.length === 0) {
+        throw new Error('Failed to create or replay mobile queued prompt');
+      }
+
+      const row = rowToQueuedPrompt(existing.rows[0]);
+      if (
+        row.id !== input.id ||
+        row.sessionId !== input.sessionId ||
+        row.prompt !== input.prompt ||
+        !areAttachmentPayloadsEqual(row.attachments, attachments)
+      ) {
+        throw new Error('idempotency_conflict: prompt ID was already used for different mobile prompt content');
+      }
+      return { row, created: false };
+    },
+
+    async createPriorityControlPrompt(input: CreatePriorityControlQueuedPromptInput) {
+      await ensureReady();
+      const { rows } = await db.query<any>(
+        `INSERT INTO queued_prompts (
+           id, session_id, prompt, delivery_class, priority_rank, delivery_ready, producer,
+           idempotency_key, request_digest, control_operation
+         ) VALUES ($1, $2, $3, 'control', 100, FALSE, $4, $5, $6, $7)
+         ON CONFLICT (session_id, idempotency_key)
+           WHERE idempotency_key IS NOT NULL DO NOTHING
+         RETURNING *`,
+        [input.id, input.sessionId, input.prompt, input.producer, input.idempotencyKey,
+          input.requestDigest, input.controlOperation],
+      );
+      if (rows.length > 0) return { row: rowToQueuedPrompt(rows[0]), replayed: false };
+
+      const existing = await db.query<any>(
+        `SELECT * FROM queued_prompts WHERE session_id = $1 AND idempotency_key = $2 LIMIT 1`,
+        [input.sessionId, input.idempotencyKey],
+      );
+      if (existing.rows.length === 0) throw new Error('Failed to create or replay priority control prompt');
+      if (existing.rows[0].request_digest !== input.requestDigest) {
+        throw new Error('idempotency_conflict: key was already used for a different request');
+      }
+      return { row: rowToQueuedPrompt(existing.rows[0]), replayed: true };
+    },
+
     async get(id: string): Promise<QueuedPrompt | null> {
       await ensureReady();
 
@@ -258,7 +429,7 @@ export function createPGLiteQueuedPromptsStore(
       if (!includeCompleted) {
         query += ` AND status NOT IN ('completed', 'failed')`;
       }
-      query += ` ORDER BY created_at ASC, id ASC`;
+      query += ` ORDER BY priority_rank DESC, created_at ASC, id ASC`;
 
       const { rows } = await db.query<any>(query, [sessionId]);
       return rows.map(rowToQueuedPrompt);
@@ -269,8 +440,8 @@ export function createPGLiteQueuedPromptsStore(
 
       const { rows } = await db.query<any>(
         `SELECT * FROM queued_prompts
-         WHERE session_id = $1 AND status = 'pending'
-         ORDER BY created_at ASC, id ASC`,
+         WHERE session_id = $1 AND status = 'pending' AND delivery_ready = TRUE
+         ORDER BY priority_rank DESC, created_at ASC, id ASC`,
         [sessionId]
       );
 
@@ -285,6 +456,50 @@ export function createPGLiteQueuedPromptsStore(
       );
 
       return rows.map((row) => row.session_id);
+    },
+
+    async listPendingSessionIds(options?: { deliveryClass?: 'ordinary' | 'control' }): Promise<string[]> {
+      await ensureReady();
+      const { rows } = await db.query<{ session_id: string }>(
+        `SELECT session_id FROM queued_prompts
+         WHERE status = 'pending' AND delivery_ready = TRUE
+           AND ($1 IS NULL OR delivery_class = $1)
+         GROUP BY session_id ORDER BY MIN(created_at) ASC, session_id ASC`,
+        [options?.deliveryClass ?? null],
+      );
+      return rows.map((row) => row.session_id);
+    },
+
+    async reservePriorityInterrupt(input) {
+      await ensureReady();
+      const { rows } = await db.query<any>(
+        `UPDATE queued_prompts SET interrupt_target_generation = $2, interrupt_reservation_owner = $3
+         WHERE id = $1 AND delivery_class = 'control' AND interrupt_receipt IS NULL
+           AND interrupt_reservation_owner IS NULL RETURNING *`,
+        [input.promptId, input.generation, input.owner],
+      );
+      if (rows.length > 0) return { row: rowToQueuedPrompt(rows[0]), reserved: true };
+      const existing = await db.query<any>(`SELECT * FROM queued_prompts WHERE id = $1 LIMIT 1`, [input.promptId]);
+      if (existing.rows.length === 0) throw new Error(`Priority control prompt ${input.promptId} not found`);
+      return { row: rowToQueuedPrompt(existing.rows[0]), reserved: false };
+    },
+
+    async recordPriorityInterruptReceipt(input) {
+      await ensureReady();
+      const { rows } = await db.query<any>(
+        `UPDATE queued_prompts SET interrupt_receipt = $3, delivery_ready = $4
+         WHERE id = $1 AND interrupt_target_generation = $2 AND interrupt_receipt IS NULL
+         RETURNING *`,
+        [input.promptId, input.generation, JSON.stringify(input.receipt), input.receipt.success],
+      );
+      if (rows.length > 0) return rowToQueuedPrompt(rows[0]);
+      const existing = await db.query<any>(`SELECT * FROM queued_prompts WHERE id = $1 LIMIT 1`, [input.promptId]);
+      if (existing.rows.length === 0) throw new Error(`Priority control prompt ${input.promptId} not found`);
+      const row = rowToQueuedPrompt(existing.rows[0]);
+      if (row.interruptTargetGeneration !== input.generation || !row.interruptReceipt) {
+        throw new Error('Failed to record priority interrupt receipt');
+      }
+      return row;
     },
 
     async failAllPendingForSession(sessionId: string, errorMessage: string): Promise<number> {
@@ -315,7 +530,7 @@ export function createPGLiteQueuedPromptsStore(
       const { rows } = await db.query<any>(
         `UPDATE queued_prompts
          SET status = 'executing', claimed_at = CURRENT_TIMESTAMP
-         WHERE id = $1 AND status = 'pending'
+         WHERE id = $1 AND status = 'pending' AND delivery_ready = TRUE
          RETURNING *`,
         [id]
       );
@@ -327,6 +542,26 @@ export function createPGLiteQueuedPromptsStore(
 
       console.log(`[QueuedPromptsStore] claim: successfully claimed prompt ${id}`);
       return rowToQueuedPrompt(rows[0]);
+    },
+
+    async withdrawPending(id: string, sessionId: string): Promise<boolean> {
+      await ensureReady();
+
+      // ATOMIC: withdrawal wins only while this exact session's row remains
+      // pending. A concurrent claim therefore leaves an executing prompt
+      // untouched instead of silently deleting an already-delivered turn.
+      const { rows } = await db.query<{ id: string }>(
+        `DELETE FROM queued_prompts
+         WHERE id = $1 AND session_id = $2 AND status = 'pending'
+         RETURNING id`,
+        [id, sessionId]
+      );
+
+      const withdrawn = rows.length > 0;
+      console.log(
+        `[QueuedPromptsStore] withdrawPending: prompt ${id} ${withdrawn ? 'withdrawn' : 'not pending'}`
+      );
+      return withdrawn;
     },
 
     async complete(id: string): Promise<void> {

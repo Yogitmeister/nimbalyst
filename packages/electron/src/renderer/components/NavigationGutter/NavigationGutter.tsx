@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { usePostHog } from 'posthog-js/react';
 import { useAtomValue, useSetAtom } from 'jotai';
@@ -12,6 +13,7 @@ import { ExtensionDevIndicator } from '../ExtensionDevIndicator';
 import { ClaudeUsageIndicator } from '../ClaudeUsageIndicator';
 import { CodexUsageIndicator } from '../CodexUsageIndicator';
 import { GeminiUsageIndicator } from '../GeminiUsageIndicator';
+import { OllamaUsageIndicator } from '../OllamaUsageIndicator';
 import { VoiceModeButton } from '../UnifiedAI/VoiceModeButton';
 import { useExtensionGutterButtons, useExtensionBottomPanelButtons } from '../../extensions/panels/usePanels';
 import { openOrganizationSurface } from './openOrganizationSurface';
@@ -475,6 +477,10 @@ export const NavigationGutter: React.FC<NavigationGutterProps> = ({
     {
       id: 'gemini-usage', section: 'indicators', icon: 'gemini', label: 'Gemini Usage', hideable: true,
       render: () => <GeminiUsageIndicator />,
+    },
+    {
+      id: 'ollama-usage', section: 'indicators', icon: 'cloud', label: 'Ollama Usage', hideable: true,
+      render: () => <OllamaUsageIndicator />,
     },
     {
       id: 'extension-dev', section: 'indicators', icon: 'extension', label: 'Extension Dev', hideable: true,

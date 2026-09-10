@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import type Store from 'electron-store';
 import type { SessionManager } from '@nimbalyst/runtime/ai/server';
 import type { ToolHandler, DocumentContext } from '@nimbalyst/runtime/ai/server/types';
@@ -66,7 +67,7 @@ export interface AIServiceContext {
   maskApiKeys(keys: Record<string, string>): Record<string, string>;
 
   // --- queue + turn control -----------------------------------------------
-  publishQueueStateToSync(sessionId: string): Promise<void>;
+  publishQueueStateToSync(sessionId: string, settlement?: { id: string; outcome: 'claimed' | 'withdrawn' }): Promise<void>;
   driveQueuedPrompts(
     sessionId: string,
     workspacePath: string,

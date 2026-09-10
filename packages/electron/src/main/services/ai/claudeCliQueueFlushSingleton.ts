@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Production wiring for the `claude-code-cli` queue flusher (NIM-806 — input
  * integration / queued prompts).
@@ -34,7 +35,7 @@ export async function flushNextClaudeCliQueuedPromptForSession(
     const store = getQueuedPromptsStore();
     // This path claims rows outside AIService, so it owns its own mirror of the
     // queue to mobile — see queuedPromptSyncPublisher.ts (NIM-2402).
-    const publishQueueState = () =>
+    const publishQueueState = (settlement?: { id: string; outcome: 'claimed' | 'withdrawn' }) =>
       publishQueuedPromptsToSync(
         {
           listPending: (s) => store.listPending(s),
@@ -42,6 +43,7 @@ export async function flushNextClaudeCliQueuedPromptForSession(
           logWarn: (message) => console.warn(message),
         },
         sessionId,
+        { settlement },
       );
 
     const flushed = await flushNextClaudeCliQueuedPrompt(
@@ -62,7 +64,7 @@ export async function flushNextClaudeCliQueuedPromptForSession(
               win.webContents.send('ai:promptClaimed', { sessionId, promptId });
             }
           }
-          void publishQueueState();
+          void publishQueueState({ id: promptId, outcome: 'claimed' });
         },
       },
     );

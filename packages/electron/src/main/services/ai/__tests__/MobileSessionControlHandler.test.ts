@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => {
@@ -103,7 +104,11 @@ vi.mock('../../WorktreeStore', () => ({
   createWorktreeStore: mocks.createWorktreeStore,
 }));
 
-import { resolveGitCommitWorkspacePath, resolveVoicePromptResponse } from '../MobileSessionControlHandler';
+import {
+  initMobileSessionControlHandler,
+  resolveGitCommitWorkspacePath,
+  resolveVoicePromptResponse,
+} from '../MobileSessionControlHandler';
 
 describe('MobileSessionControlHandler', () => {
   beforeEach(() => {
@@ -150,6 +155,36 @@ describe('MobileSessionControlHandler', () => {
       workspacePath: 'D:/project',
       worktreePath: 'D:/project_worktrees/task',
     })).toBeNull();
+  });
+
+  it('withdraws only the exact queued prompt requested by mobile control', async () => {
+    let deliverControlMessage: ((message: unknown) => void) | undefined;
+    const withdrawPendingPrompt = vi.fn().mockResolvedValue(true);
+    const cleanup = initMobileSessionControlHandler(
+      {
+        onSessionControlMessage: (listener: (message: unknown) => void) => {
+          deliverControlMessage = listener;
+          return vi.fn();
+        },
+      } as any,
+      vi.fn(),
+      {
+        triggerQueuedPromptProcessing: vi.fn(),
+        rollbackExecutingPrompts: vi.fn(),
+        withdrawPendingPrompt,
+      },
+    );
+
+    deliverControlMessage?.({
+      type: 'withdraw_queued_prompt',
+      sessionId: 'session-1',
+      payload: { promptId: 'mobile-prompt-1' },
+    });
+
+    await vi.waitFor(() => {
+      expect(withdrawPendingPrompt).toHaveBeenCalledWith('session-1', 'mobile-prompt-1');
+    });
+    cleanup();
   });
 
   it('uses the session provider and always persists the mobile response', async () => {
