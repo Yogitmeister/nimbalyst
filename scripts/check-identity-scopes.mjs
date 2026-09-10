@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node # [ASTRA-ORCH]
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -104,7 +104,7 @@ export function scanIdentityScopeViolations({
               : null;
         if (!rule || hasEscape(lines, lineIndex)) return;
         const violation = {
-          file: path.relative(root, filePath),
+          file: path.relative(root, filePath).split(path.sep).join('/'),
           line: lineIndex + 1,
           rule,
           source: line.trim(),

@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -74,6 +75,7 @@ test('a baselined declaration is forgiven exactly once per occurrence', () => {
     const baseline = new Map([['src/fixture.ts', ['memberId: string;']]]);
     const violations = scanIdentityScopeViolations({ root, targets: ['src'], baseline });
     assert.equal(violations.length, 1, 'the second occurrence must still fail');
+    assert.deepEqual(violations.map(({ file }) => file), ['src/fixture.ts']);
   });
 });
 
