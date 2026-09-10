@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAtom, useAtomValue, useSetAtom } from 'jotai';
 import type { ChatAttachment } from '@nimbalyst/runtime/ai/server/types';
@@ -34,6 +35,7 @@ import {
   toStableAnalyticsCategory,
   type SendBlockedReason,
 } from '../../../shared/analytics/sendOutcomes';
+import { reconcileBuiltInProviderControlValues } from '@nimbalyst/runtime/ai/server';
 
 interface SessionLaunchPopupProps {
   workspacePath: string | null;
@@ -113,6 +115,7 @@ export const SessionLaunchPopup: React.FC<SessionLaunchPopupProps> = ({ workspac
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [createdSessionId, setCreatedSessionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [reasoningControlsNotice, setReasoningControlsNotice] = useState<string | undefined>();
   const inputRef = useRef<AIInputRef>(null);
   const setDraftRef = useRef(setDraft);
   setDraftRef.current = setDraft;
@@ -166,9 +169,25 @@ export const SessionLaunchPopup: React.FC<SessionLaunchPopupProps> = ({ workspac
   }, [setDraft]);
 
   const handleModelChange = useCallback((model: string) => {
-    setDraft((current) => ({ ...current, model }));
+    const reconciled = reconcileBuiltInProviderControlValues(model, {
+      'effort-level': effortLevel,
+      'thinking-mode': thinkingMode,
+    });
+    setDraft((current) => ({
+      ...current,
+      model,
+      effortLevel: typeof reconciled.values['effort-level'] === 'string'
+        ? reconciled.values['effort-level'] as EffortLevel
+        : current.effortLevel,
+      thinkingMode: typeof reconciled.values['thinking-mode'] === 'string'
+        ? reconciled.values['thinking-mode'] as ThinkingMode
+        : current.thinkingMode,
+    }));
+    setReasoningControlsNotice(reconciled.resets.length
+      ? `Reset unsupported controls: ${reconciled.resets.map((reset) => `${reset.settingId} ${reset.from} → ${reset.to}`).join(', ')}`
+      : undefined);
     setAgentModeSettings({ defaultModel: model });
-  }, [setDraft, setAgentModeSettings]);
+  }, [setDraft, setAgentModeSettings, effortLevel, thinkingMode]);
 
   const handleEffortLevelChange = useCallback((nextEffort: EffortLevel) => {
     setDraft((current) => ({ ...current, effortLevel: nextEffort }));
@@ -326,6 +345,7 @@ export const SessionLaunchPopup: React.FC<SessionLaunchPopupProps> = ({ workspac
         thinkingMode={thinkingMode}
         onThinkingModeChange={handleThinkingModeChange}
         showThinkingToggle={developerMode && supportsThinkingToggle(selectedModel)}
+        reasoningControlsNotice={reasoningControlsNotice}
         provider={provider}
         testId="session-launch-popup-input"
       />

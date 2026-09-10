@@ -22,6 +22,8 @@ import {
   isAskUserQuestionProvider,
   ClaudeCodeProvider,
   OpenCodeProvider,
+  getBuiltInProviderControlEntry,
+  resolveProviderControlSnapshot,
 } from '@nimbalyst/runtime/ai/server';
 import { CLAUDE_CODE_SAFE_FALLBACK_MODEL } from '@nimbalyst/runtime/ai/modelConstants';
 import { reconcileClaudeCodeModels } from './claudeCodeModelReconcile';
@@ -924,7 +926,59 @@ export class AIService {
       config.model = CLAUDE_CODE_SAFE_FALLBACK_MODEL;
     }
 
-    return config;
+    // Schema-driven provider controls (providerControlSnapshot) are a
+    // separate, later concern than the base config above -- merge them in
+    // rather than picking one source over the other. NOTE: the original
+    // commit merged onto a `buildClaudeCodeRuntimeConfigForTurn` route
+    // resolver that doesn't exist on this base (depends on a route-pinning
+    // refactor -- 2ee794998 -- not carried in this release); merging onto
+    // the inline config above instead, same override order (spread last).
+    return {
+      ...config,
+      ...(await this.buildProviderControlRuntimeConfig(session)),
+    };
+  }
+
+  private async buildProviderControlRuntimeConfig(session: SessionData): Promise<Pick<ProviderConfig, 'providerControlSnapshot' | 'effortLevel' | 'thinkingMode'>> {
+    const modelId = session.model || session.providerConfig?.model;
+    const entry = getBuiltInProviderControlEntry(modelId);
+    if (!entry) return {};
+
+    const metadata = (session.metadata ?? {}) as Record<string, unknown>;
+    const storedValues = metadata.providerControlValues && typeof metadata.providerControlValues === 'object'
+      ? metadata.providerControlValues as Record<string, unknown>
+      : {};
+    const requested: Record<string, unknown> = { ...storedValues };
+    if (requested['effort-level'] === undefined && metadata.effortLevel !== undefined) {
+      requested['effort-level'] = metadata.effortLevel;
+    }
+    if (requested['thinking-mode'] === undefined && metadata.thinkingMode !== undefined) {
+      requested['thinking-mode'] = metadata.thinkingMode;
+    }
+
+    const snapshot = resolveProviderControlSnapshot({
+      catalog: [entry],
+      catalogEntryId: entry.id,
+      interfaceId: entry.interfaces[0],
+      consumer: 'main-session',
+      phase: metadata.providerControlSnapshot ? 'restart' : 'launch',
+      requested,
+    });
+
+    if (JSON.stringify(metadata.providerControlSnapshot) !== JSON.stringify(snapshot)) {
+      const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
+      await AISessionsRepository.updateMetadata(session.id, {
+        metadata: { providerControlSnapshot: snapshot },
+      });
+      session.metadata = { ...metadata, providerControlSnapshot: snapshot };
+    }
+    const effort = snapshot.resolved['effort-level'];
+    const thinking = snapshot.resolved['thinking-mode'];
+    return {
+      providerControlSnapshot: snapshot,
+      ...(typeof effort === 'string' ? { effortLevel: effort as ProviderConfig['effortLevel'] } : {}),
+      ...(typeof thinking === 'string' ? { thinkingMode: thinking as ProviderConfig['thinkingMode'] } : {}),
+    };
   }
 
   /**
@@ -1372,6 +1426,7 @@ export class AIService {
       getSettingsStore: () => this.getSettingsStore(),
       getApiKeyForProvider: (provider, workspacePath) => this.getApiKeyForProvider(provider, workspacePath),
       getProviderSetting: (provider, key) => this.getProviderSetting(provider, key),
+      buildProviderControlRuntimeConfig: (session) => this.buildProviderControlRuntimeConfig(session),
       getNormalizedProviderSettings: () => this.getNormalizedProviderSettings(),
       normalizeProviderSettings: (providerSettings) => this.normalizeProviderSettings(providerSettings),
       invalidateNormalizedProviderSettingsCache: () => {

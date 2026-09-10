@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Common types for AI provider abstraction
  */
@@ -16,6 +17,7 @@ import {
   normalizeClaudeCodeVariant,
 } from '../modelConstants';
 import type { TranscriptViewMessage } from './transcript/TranscriptProjector';
+import type { ProviderControlSnapshot } from './providers/claudeCode/providerControlContract';
 export type { ToolDefinition } from '../tools/definitions';
 export { ModelIdentifier } from './ModelIdentifier';
 export type { ToolResult } from './protocols/ProtocolInterface';
@@ -520,6 +522,8 @@ export interface ProviderConfig {
    */
   agentRole?: string;
   thinkingMode?: ThinkingMode;  // Extended thinking mode for Claude Agent (enabled/disabled)
+  claudeCodeBackend?: string;
+  providerControlSnapshot?: Readonly<ProviderControlSnapshot>; // Immutable reviewed route/control receipt
   responseFormat?: ProviderResponseFormat;  // Response format constraint (extension chat completions)
   skipLogging?: boolean;  // Skip message logging to DB (extension stateless completions)
 }

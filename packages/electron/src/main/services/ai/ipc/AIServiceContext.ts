@@ -1,5 +1,6 @@
 // [ASTRA-ORCH]
 import type Store from 'electron-store';
+import type { SessionData, ProviderConfig } from '@nimbalyst/runtime/ai/server/types';
 import type { SessionManager } from '@nimbalyst/runtime/ai/server';
 import type { ToolHandler, DocumentContext } from '@nimbalyst/runtime/ai/server/types';
 import type { DocumentContextService } from '@nimbalyst/runtime/ai/services/DocumentContextService';
@@ -50,6 +51,7 @@ export interface AIServiceContext {
   getSettingsStore(): Store<Record<string, unknown>>;
   getApiKeyForProvider(provider: string, workspacePath?: string): string | undefined;
   getProviderSetting(provider: string, key: string): any;
+  buildProviderControlRuntimeConfig(session: SessionData): Promise<Pick<ProviderConfig, 'providerControlSnapshot' | 'effortLevel' | 'thinkingMode'>>;
   getNormalizedProviderSettings(): Record<string, any>;
   normalizeProviderSettings(providerSettings: Record<string, any>): Record<string, any>;
   /**

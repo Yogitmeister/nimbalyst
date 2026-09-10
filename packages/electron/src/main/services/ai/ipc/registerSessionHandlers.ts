@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { TrayManager } from '../../../tray/TrayManager';
 import { safeHandle } from '../../../utils/ipcRegistry';
 import { logger } from '../../../utils/logger';
@@ -262,6 +263,7 @@ export function registerSessionHandlers(ctx: AIServiceContext): void {
       }
     }
 
+    Object.assign(initConfig, await ctx.buildProviderControlRuntimeConfig(session));
     await providerInstance.initialize(initConfig);
 
     // Register tool handler - targetFilePath will be determined dynamically per tool call

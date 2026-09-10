@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import React, { useRef, useEffect, KeyboardEvent, useState, useCallback, useMemo, forwardRef, useImperativeHandle } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { GenericTypeahead, TypeaheadOption } from '../Typeahead/GenericTypeahead';
@@ -12,6 +13,8 @@ import { ModelSelector } from './ModelSelector';
 import { EffortLevelSelector } from './EffortLevelSelector';
 import { ThinkingModeSelector } from './ThinkingModeSelector';
 import { OpenCodeRoleSelector } from './OpenCodeRoleSelector';
+import { CatalogControlSelectors } from './CatalogControlSelectors';
+import { getBuiltInProviderControlEntry, type ProviderControlValue } from '@nimbalyst/runtime/ai/server';
 import { registerPendingVoiceCommandSetter } from './VoiceModeButton.tsx';
 import { PendingVoiceCommand } from './PendingVoiceCommand';
 import { pendingVoiceCommandAtom, voiceActiveSessionIdAtom, type PendingVoiceCommand as PendingVoiceCommandType } from '../../store/atoms/voiceModeState';
@@ -95,6 +98,7 @@ interface AIInputProps {
   showThinkingToggle?: boolean;
   reasoningControlsDisabled?: boolean;
   reasoningControlsDisabledTitle?: string;
+  reasoningControlsNotice?: string;
 
   // OpenCode session role (an `app.agents` primary agent). Only supplied for
   // OpenCode sessions; the selector hides itself when no roles are known.
@@ -189,6 +193,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     reasoningControlsDisabledTitle,
     openCodeRole = null,
     onOpenCodeRoleChange,
+    reasoningControlsNotice,
     tokenUsage,
     provider,
     onQueue,
@@ -205,6 +210,18 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     const [slashCommandOptions, setSlashCommandOptions] = useState<TypeaheadOption[]>([]);
     const [allSlashCommands, setAllSlashCommands] = useState<SlashCommandEntry[]>([]);
     const [dragActive, setDragActive] = useState(false);
+    const hasCatalogControls = Boolean(getBuiltInProviderControlEntry(currentModel));
+    const catalogControlValues = useMemo(() => ({
+      'effort-level': effortLevel,
+      'thinking-mode': thinkingMode,
+    }), [effortLevel, thinkingMode]);
+    const handleCatalogControlChange = useCallback((settingId: string, value: ProviderControlValue) => {
+      if (settingId === 'effort-level' && typeof value === 'string') {
+        onEffortLevelChange?.(value as EffortLevel);
+      } else if (settingId === 'thinking-mode' && typeof value === 'string') {
+        onThinkingModeChange?.(value as ThinkingMode);
+      }
+    }, [onEffortLevelChange, onThinkingModeChange]);
     const [isFocused, setIsFocused] = useState(false);
     const [modelPickerOpenRequest, setModelPickerOpenRequest] = useState(0);
 
@@ -1421,7 +1438,21 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
                 turnActive={isLoading}
               />
             )}
-            {showEffortLevel && onEffortLevelChange && effortLevel && (
+            {hasCatalogControls && (onEffortLevelChange || onThinkingModeChange) && (
+              <CatalogControlSelectors
+                modelId={currentModel}
+                values={catalogControlValues}
+                onChange={handleCatalogControlChange}
+                disabled={reasoningControlsDisabled}
+                disabledTitle={reasoningControlsDisabledTitle}
+              />
+            )}
+            {reasoningControlsNotice && (
+              <span className="max-w-64 truncate text-[10px] text-[var(--nim-warning)]" title={reasoningControlsNotice}>
+                {reasoningControlsNotice}
+              </span>
+            )}
+            {!hasCatalogControls && showEffortLevel && onEffortLevelChange && effortLevel && (
               <EffortLevelSelector
                 level={effortLevel}
                 onLevelChange={onEffortLevelChange}
@@ -1430,7 +1461,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
                 modelId={currentModel}
               />
             )}
-            {showThinkingToggle && onThinkingModeChange && thinkingMode && (
+            {!hasCatalogControls && showThinkingToggle && onThinkingModeChange && thinkingMode && (
               <ThinkingModeSelector
                 mode={thinkingMode}
                 onModeChange={onThinkingModeChange}
