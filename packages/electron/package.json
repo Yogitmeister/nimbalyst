@@ -197,6 +197,7 @@
     "generateUpdatesFilesForAllChannels": true,
     "asar": true,
     "asarUnpack": [
+      "icon.png",
       "node_modules/**/*.node",
       "node_modules/@anthropic-ai/**/*",
       "node_modules/@openai/**/*",

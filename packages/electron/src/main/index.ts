@@ -371,9 +371,14 @@ if (process.env.ELECTRON_RUN_AS_NODE === '1' && process.platform === 'darwin') {
   }
 }
 
-// Windows notifications require a stable AppUserModelID.
+// Windows notifications require a stable AppUserModelID, and Windows resolves a
+// window's taskbar icon by matching this ID against shortcuts before falling back
+// to the window/EXE icon. Sharing `com.nimbalyst.electron` lets any stray shortcut
+// with that ID hijack the taskbar icon for every build using it — root-caused
+// 2026-07-02, when a stale Electron.lnk pointing at an unstamped build made
+// correct builds show the Electron atom. Keep side-by-side Yogi builds distinct.
 if (process.platform === 'win32') {
-  app.setAppUserModelId('com.nimbalyst.electron');
+  app.setAppUserModelId('com.nimbalyst.electron.yogi');
 }
 
 // Issue #146: register the `nim-asset://` scheme as standard/secure BEFORE

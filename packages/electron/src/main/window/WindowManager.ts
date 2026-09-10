@@ -1,6 +1,7 @@
+// [ASTRA-ORCH]
 import { BrowserWindow, app, nativeImage, ipcMain, screen, Menu, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 import { safeHandle, safeOn } from '../utils/ipcRegistry';
-import { join, basename } from 'path';
+import { join, basename, sep } from 'path';
 import { existsSync } from 'fs';
 import { WindowState, FileTreeItem } from '../types';
 import { WINDOW_CASCADE_OFFSET } from '../utils/constants';
@@ -196,16 +197,24 @@ export function createWindow(
     try {
         // console.log('[MAIN] Creating window at', new Date().toISOString());
 
-        // Set up icon path - icon.png is at the package root in both dev and packaged builds
-        // (included in electron-builder's `files` array, so it's inside the ASAR at the root)
-        let iconPath: string | undefined = join(app.getAppPath(), 'icon.png');
+        // Resolve the window icon by preference, first hit wins. Windows window
+        // chrome and taskbar want a packaged multi-size ICO; a PNG inside the
+        // ASAR is the weakest option because `nativeImage.createFromPath` is
+        // native code and cannot read inside an archive — it returns an empty
+        // image, and `existsSync` does not catch that (Electron patches `fs`
+        // for ASAR, so the guard passes and an empty icon is set).
+        const iconPath: string | undefined = [
+            // Side-by-side Yogi builds carry their own ICO next to app.asar.
+            ...(process.platform === 'win32'
+                ? [join(process.resourcesPath, 'yogi-icon.ico'), join(process.resourcesPath, 'icon.ico')]
+                : []),
+            // Unpacked copy of the source PNG (icon.png is in `asarUnpack`).
+            join(app.getAppPath(), 'icon.png').replace(`app.asar${sep}`, `app.asar.unpacked${sep}`),
+            join(app.getAppPath(), 'icon.png'),
+        ].find((candidate) => existsSync(candidate));
 
-        // Check if icon exists
-        if (!existsSync(iconPath)) {
-            console.log('[MAIN] Icon not found at:', iconPath);
-            iconPath = undefined;
-        } else {
-            // console.log('[MAIN] Using icon at:', iconPath);
+        if (!iconPath) {
+            console.log('[MAIN] No window icon found; falling back to the executable icon');
         }
 
         // Calculate window position with cascading effect
