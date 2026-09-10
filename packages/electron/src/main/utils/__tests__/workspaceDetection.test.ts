@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -299,7 +300,7 @@ describe('getAdditionalDirectoriesForWorkspace', () => {
   beforeEach(() => {
     // Real filesystem fixture so the sync fs.readdirSync path is exercised
     // end-to-end. The function is called from a synchronous loader and must
-    // tolerate a missing _worktrees dir without blowing up.
+    // tolerate missing Git worktree registrations without blowing up.
     tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nim-add-dirs-'));
     projectPath = path.join(tmpRoot, 'project');
     fs.mkdirSync(projectPath);
@@ -328,13 +329,15 @@ describe('getAdditionalDirectoriesForWorkspace', () => {
 
   it('returns sibling worktree paths when called from the parent project root', () => {
     fs.mkdirSync(worktreesDir);
-    fs.mkdirSync(path.join(worktreesDir, 'proud-gorge'));
-    fs.mkdirSync(path.join(worktreesDir, 'swift-falcon'));
+    const proudGorge = path.join(worktreesDir, 'proud-gorge');
+    const swiftFalcon = path.join(tmpRoot, 'external-worktrees', 'swift-falcon');
+    createLinkedWorktree(projectPath, proudGorge, 'proud-gorge');
+    createLinkedWorktree(projectPath, swiftFalcon, 'swift-falcon');
 
     const dirs = getAdditionalDirectoriesForWorkspace(projectPath);
     expect(dirs.sort()).toEqual([
-      path.join(worktreesDir, 'proud-gorge'),
-      path.join(worktreesDir, 'swift-falcon'),
+      fs.realpathSync.native(proudGorge),
+      fs.realpathSync.native(swiftFalcon),
     ].sort());
   });
 
@@ -342,20 +345,26 @@ describe('getAdditionalDirectoriesForWorkspace', () => {
     fs.mkdirSync(worktreesDir);
     const cwd = path.join(worktreesDir, 'proud-gorge');
     createLinkedWorktree(projectPath, cwd, 'proud-gorge');
-    fs.mkdirSync(path.join(worktreesDir, 'swift-falcon'));
+    const swiftFalcon = path.join(tmpRoot, 'external-worktrees', 'swift-falcon');
+    createLinkedWorktree(projectPath, swiftFalcon, 'swift-falcon');
 
     const dirs = getAdditionalDirectoriesForWorkspace(cwd);
     expect(dirs.sort()).toEqual([
       fs.realpathSync.native(projectPath),
-      path.join(fs.realpathSync.native(worktreesDir), 'swift-falcon'),
+      fs.realpathSync.native(swiftFalcon),
     ].sort());
     // The current worktree itself must not appear -- it is already the
     // workingDirectory, and re-listing it would just add noise.
     expect(dirs).not.toContain(cwd);
   });
 
-  it('survives a missing _worktrees directory', () => {
-    // No worktrees dir created. Should not throw, just return empty.
+  it('survives a project with no registered worktrees', () => {
+    // No worktree registrations created. Should not throw, just return empty.
+    expect(getAdditionalDirectoriesForWorkspace(projectPath)).toEqual([]);
+  });
+
+  it('does not grant access to arbitrary directory in conventional worktrees folder', () => {
+    fs.mkdirSync(path.join(worktreesDir, 'unverified-directory'), { recursive: true });
     expect(getAdditionalDirectoriesForWorkspace(projectPath)).toEqual([]);
   });
 
@@ -364,8 +373,12 @@ describe('getAdditionalDirectoriesForWorkspace', () => {
     // skills in every additional directory, so N sibling worktrees inflate the
     // system prompt with N duplicate copies of every project skill.
     fs.mkdirSync(worktreesDir);
-    fs.mkdirSync(path.join(worktreesDir, 'proud-gorge'));
-    fs.mkdirSync(path.join(worktreesDir, 'swift-falcon'));
+    createLinkedWorktree(projectPath, path.join(worktreesDir, 'proud-gorge'), 'proud-gorge');
+    createLinkedWorktree(
+      projectPath,
+      path.join(tmpRoot, 'external-worktrees', 'swift-falcon'),
+      'swift-falcon',
+    );
 
     const dirs = getAdditionalDirectoriesForWorkspace(projectPath, {
       includeSiblingWorktrees: false,
@@ -377,7 +390,11 @@ describe('getAdditionalDirectoriesForWorkspace', () => {
     fs.mkdirSync(worktreesDir);
     const cwd = path.join(worktreesDir, 'proud-gorge');
     createLinkedWorktree(projectPath, cwd, 'proud-gorge');
-    fs.mkdirSync(path.join(worktreesDir, 'swift-falcon'));
+    createLinkedWorktree(
+      projectPath,
+      path.join(tmpRoot, 'external-worktrees', 'swift-falcon'),
+      'swift-falcon',
+    );
 
     const dirs = getAdditionalDirectoriesForWorkspace(cwd, {
       includeSiblingWorktrees: false,
