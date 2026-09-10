@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env -S sh # [ASTRA-ORCH]
 set -eu
 
 # Git names the destination remote in $1 and streams one line per pushed ref on
@@ -37,7 +37,8 @@ base=$(node scripts/resolve-prepush-base.mjs)
 # Refuse to push escaped unit-test fixture commits (2026-07-22 incident: the
 # pre-push vitest run leaked "Test User" commits onto public main).
 echo "[pre-push] Checking outgoing commits for test-fixture authors..."
-node scripts/check-push-authors.mjs "$base..HEAD"
+author_base=$(node scripts/resolve-prepush-base.mjs --push-remote "$remote_name")
+node scripts/check-push-authors.mjs "$author_base..HEAD"
 
 # Hooks export repository-local GIT_* variables. In a linked worktree GIT_DIR
 # is absolute, so a real-Git test running in a temp directory can otherwise
