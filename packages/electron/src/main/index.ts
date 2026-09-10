@@ -164,6 +164,11 @@ import { initEnhancedPath, getEnhancedPath, getShellEnvironment } from './servic
 import { registerWorkspaceWindow, registerExtensionTools, shutdownHttpServer, startMcpHttpServer, updateDocumentState, getActiveExtensionShortNames } from './mcp/httpServer';
 import { writeMcpEndpointDescriptor, removeMcpEndpointDescriptor, type EndpointWorkspace } from './mcp/mcpEndpointDescriptor';
 import {
+  resolveSingleInstanceLifecycleOwnership,
+  runIfSingleInstanceLifecycleOwner,
+  startLosingSecondaryControlPath,
+} from './singleInstanceLifecycle';
+import {
   startWorkspaceBackendModules,
   syncEnabledBackendModulesOnStartup,
   getDefaultBackendModuleLifecycleDeps,
@@ -731,11 +736,16 @@ registerLinuxAppImageProtocolHandler();
 // (e.g., from a file double-click), it forwards its context to the primary instance.
 // Skip for multi-instance dev mode and Playwright tests.
 const allowMultipleInstances = !!process.env.NIMBALYST_USER_DATA_DIR || !!process.env.PLAYWRIGHT;
+const acquiredSingleInstanceLock = allowMultipleInstances
+    ? null
+    : app.requestSingleInstanceLock();
+const singleInstanceLifecycle = resolveSingleInstanceLifecycleOwnership({
+    allowMultipleInstances,
+    acquiredSingleInstanceLock,
+});
 
 if (!allowMultipleInstances) {
-    const gotTheLock = app.requestSingleInstanceLock();
-
-    if (!gotTheLock) {
+    if (!acquiredSingleInstanceLock) {
         // Another instance holds the lock. On macOS, when the OS launches the
         // packaged app to open a file, the path comes via Apple Events which
         // Electron delivers as the open-file event. But open-file only fires
@@ -746,44 +756,37 @@ if (!allowMultipleInstances) {
 
         logger.main.info(`[SingleInstance] Second instance launched, waiting for open-file. argv=${JSON.stringify(process.argv)}`);
 
-        // Also check argv for file paths (Windows/Linux, or CLI open --args)
-        const fileArg = process.argv.find(arg =>
-            !arg.startsWith('-') &&
-            arg !== process.argv[0] &&
-            path.isAbsolute(arg)
-        );
-        if (fileArg) {
-            logger.main.info(`[SingleInstance] Found file in argv: ${fileArg}`);
-            try { writeFileSync(pendingOpenFilePath, fileArg, 'utf-8'); } catch (_) {}
-            app.quit();
-        } else if (process.argv.find(arg => arg.startsWith('nimbalyst://'))) {
-            // Primary instance will handle via second-instance event; quit immediately
-            logger.main.info('[SingleInstance] Second instance has deep link arg, quitting immediately');
-            app.quit();
-        } else {
-            // No file in argv -- wait for open-file Apple Event
-            let gotFile = false;
-            app.on('open-file', (event, filePath) => {
-                event.preventDefault();
-                gotFile = true;
-                logger.main.info(`[SingleInstance] Second instance received open-file: ${filePath}`);
+        startLosingSecondaryControlPath({
+            argv: process.argv,
+            isAbsolutePath: path.isAbsolute,
+            relayFile: (filePath) => {
+                logger.main.info(`[SingleInstance] Relaying file to primary: ${filePath}`);
                 try {
                     writeFileSync(pendingOpenFilePath, filePath, 'utf-8');
                     logger.main.info(`[SingleInstance] Wrote signal file: ${pendingOpenFilePath}`);
                 } catch (err) {
                     logger.main.error('[SingleInstance] Failed to write signal file:', err);
                 }
-                app.quit();
-            });
-
-            // Fallback timeout -- if open-file never fires, quit anyway
-            setTimeout(() => {
-                if (!gotFile) {
-                    logger.main.info('[SingleInstance] No open-file after timeout, quitting');
-                    app.quit();
-                }
-            }, 5000);
-        }
+            },
+            registerOpenFileHandler: (handler) => {
+              app.on('open-file', (event, filePath) => {
+                event.preventDefault();
+                logger.main.info(`[SingleInstance] Second instance received open-file: ${filePath}`);
+                handler(filePath);
+              });
+            },
+            scheduleExitTimeout: (handler, delayMs) => {
+                setTimeout(handler, delayMs);
+            },
+            quit: () => app.quit(),
+            onDeepLinkExit: () => {
+                // Primary instance handles the URL via the second-instance event.
+                logger.main.info('[SingleInstance] Second instance has deep link arg, quitting immediately');
+            },
+            onTimeoutExit: () => {
+                logger.main.info('[SingleInstance] No open-file after timeout, quitting');
+            },
+        });
     } else {
         // We are the primary instance. When a second instance tries to launch,
         // extract any deep link URL or file path and handle it here.
@@ -832,7 +835,7 @@ if (!allowMultipleInstances) {
 // Workaround for dev mode: watch a signal file that the second instance writes.
 // Currently only works for CLI invocations where the path is in argv.
 // For Finder double-click during dev, quit the packaged app first.
-{
+runIfSingleInstanceLifecycleOwner(singleInstanceLifecycle, () => {
     const pendingOpenFilePath = path.join(app.getPath('userData'), '.pending-open-file');
 
     // Check for a stale signal file on startup (second instance may have written
@@ -869,7 +872,7 @@ if (!allowMultipleInstances) {
     } catch (err) {
         logger.main.warn('[SingleInstance] Failed to watch for open-file signals:', err);
     }
-}
+});
 
 // Track pending deep link URL
 let pendingDeepLinkUrl: string | null = null;
@@ -1009,7 +1012,8 @@ function summarizeDeepLink(url: string): { host: string; pathname: string; param
 }
 
 // Handle deep link URLs (nimbalyst://...)
-app.on('open-url', (event, url) => {
+runIfSingleInstanceLifecycleOwner(singleInstanceLifecycle, () => {
+  app.on('open-url', (event, url) => {
     event.preventDefault();
     logger.main.info('[DeepLink] open-url event:', summarizeDeepLink(url));
 
@@ -1019,6 +1023,7 @@ app.on('open-url', (event, url) => {
         // Store the URL to handle after app is ready
         pendingDeepLinkUrl = url;
     }
+  });
 });
 
 function handleAppActionLink(
@@ -1549,7 +1554,8 @@ async function openTrackerFromDeepLink(
 }
 
 // Handle file open from OS (macOS)
-app.on('open-file', (event, path) => {
+runIfSingleInstanceLifecycleOwner(singleInstanceLifecycle, () => {
+  app.on('open-file', (event, path) => {
     event.preventDefault();
     logger.main.info(`open-file event received: ${path}`);
 
@@ -1559,6 +1565,7 @@ app.on('open-file', (event, path) => {
         // Store the file path to open after app is ready
         pendingFilePath = path;
     }
+  });
 });
 
 // Helper function to open a file with workspace detection
@@ -1735,7 +1742,8 @@ BrowserWindow.prototype.focus = function(this: BrowserWindow) {
 // --- END ACTIVATION DEBUGGING ---
 
 // App ready handler
-app.whenReady().then(async () => {
+runIfSingleInstanceLifecycleOwner(singleInstanceLifecycle, () => {
+  void app.whenReady().then(async () => {
     checkpoint('app-ready');
 
     // Windows opened from here on are revealed without activating; the app is
@@ -3607,10 +3615,12 @@ app.whenReady().then(async () => {
             });
         }
     });
+  });
 });
 
 // Activate handler (macOS)
-app.on('activate', () => {
+runIfSingleInstanceLifecycleOwner(singleInstanceLifecycle, () => {
+  app.on('activate', () => {
     // Avoid resurrecting windows while quitting
     if (isAppQuitting) return;
     // Only create window if app is ready (screen module requires app to be ready)
@@ -3619,10 +3629,15 @@ app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
         createWorkspaceManagerWindow();
     }
+  });
 });
 
 // Before quit handler
 app.on('before-quit', async (event) => {
+    if (!singleInstanceLifecycle.ownsPrimaryLifecycle) {
+        logger.main.info('[SingleInstance] Secondary exit bypasses primary lifecycle cleanup');
+        return;
+    }
     getCollabOutboxDrainCoordinator().stop();
     getCollabAssetOutboxDrainCoordinator().stop();
     console.log('[QUIT] before-quit event triggered');
@@ -4246,32 +4261,34 @@ app.on('before-quit', async (event) => {
 });
 
 // Window all closed handler
-app.on('window-all-closed', () => {
-  logger.main.info('All windows closed');
-  if (isAppQuitting) {
-    // App is quitting, allow normal quit to proceed
-    app.quit();
-    return;
-  }
-
-  // Check if the WorkspaceManager itself was manually closed by the user
-  // In that case, don't reopen it (quit on Windows/Linux, stay running on macOS)
-  if (wasWorkspaceManagerManuallyClosed()) {
-    if (process.platform !== 'darwin') {
-      logger.main.info('WorkspaceManager manually closed on non-macOS platform, quitting app');
+runIfSingleInstanceLifecycleOwner(singleInstanceLifecycle, () => {
+  app.on('window-all-closed', () => {
+    logger.main.info('All windows closed');
+    if (isAppQuitting) {
+      // App is quitting, allow normal quit to proceed
       app.quit();
-    } else {
-      logger.main.info('WorkspaceManager manually closed on macOS, app stays running (dock icon can reopen)');
+      return;
     }
-    return;
-  }
 
-  // A project window was closed (not the WorkspaceManager)
-  // Show the WorkspaceManager so user can open another project
-  if (app.isReady()) {
-    logger.main.info('Project window closed, showing WorkspaceManager');
-    createWorkspaceManagerWindow();
-  }
+    // Check if the WorkspaceManager itself was manually closed by the user
+    // In that case, don't reopen it (quit on Windows/Linux, stay running on macOS)
+    if (wasWorkspaceManagerManuallyClosed()) {
+      if (process.platform !== 'darwin') {
+        logger.main.info('WorkspaceManager manually closed on non-macOS platform, quitting app');
+        app.quit();
+      } else {
+        logger.main.info('WorkspaceManager manually closed on macOS, app stays running (dock icon can reopen)');
+      }
+      return;
+    }
+
+    // A project window was closed (not the WorkspaceManager)
+    // Show the WorkspaceManager so user can open another project
+    if (app.isReady()) {
+      logger.main.info('Project window closed, showing WorkspaceManager');
+      createWorkspaceManagerWindow();
+    }
+  });
 });
 
 // Windows-specific shutdown signal handlers
