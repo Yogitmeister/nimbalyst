@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- A session no longer shows ready and accepts a new prompt while the agent is still streaming after a mid-turn compaction.
 - Embedded file links resolve relative to their document, with `/` for workspace-root paths.
 - Claude Agent's bundled runtime no longer self-updates out of place; preserved copies are recovered automatically.
 - Coordinating agents read sibling reports during long-running work without replaying them as extra turns.

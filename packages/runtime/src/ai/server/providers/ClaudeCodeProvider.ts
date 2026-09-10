@@ -140,6 +140,7 @@ import {
   shouldApplyTaskUpdatedStatus,
   isNotificationFlushResult,
   shouldArmGraceTimerForResult,
+  shouldYieldCompleteForResult,
   shouldContinueWithTaskResults,
   buildTaskResultContinuationMessage,
   type DrainExitCause,
@@ -1656,7 +1657,15 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
             continue;
           }
 
-          if (typeof chunk === 'object' && chunk !== null && chunk.type === 'result' && !state.completeEmitted) {
+          // Also skip the early yield once a compact boundary has been seen this
+          // turn: compaction is this codebase's own confirmed multi-result-turn
+          // case (see the promptEndTimer field comment above), so the `result`
+          // chunk here is not reliably the turn's last chunk. Falling through
+          // keeps the loop (and the "processing" UI state) alive for whatever
+          // streams next; the post-loop fallback below yields `complete` once
+          // the SDK genuinely stops, via the same grace timer that already
+          // guards stdin closure. See NIM-597.
+          if (typeof chunk === 'object' && chunk !== null && shouldYieldCompleteForResult(chunk, state.completeEmitted, state.receivedCompactBoundary)) {
             await this.flushPendingWrites();
             if (sessionId) await this.processTranscriptMessages(sessionId);
 
