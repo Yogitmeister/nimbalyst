@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { isClaudeCodeFamily } from '@nimbalyst/runtime/ai/server/types';
 import { isHeadlessAgentAvailable } from './headlessAgentAvailability';
 
@@ -27,14 +28,14 @@ export interface FilterableModel {
 /**
  * Providers that are on before the user has touched anything in Settings.
  *
- * Only `claude-code` (the SDK-backed Claude Agent) ships enabled — it is the
+ * `claude-code` and the admitted `model-launcher` route ship enabled — it is the
  * app's default agent and needs no configuration. Everything else, including
  * `claude-code-cli`, stays off until explicitly enabled. The CLI provider is
  * purely a preference for driving the terminal `claude` binary; a Claude
  * subscription works fine through the default agent, so it does not belong in
  * the picker for people who never asked for it.
  */
-const DEFAULT_ENABLED_PROVIDERS: ReadonlySet<string> = new Set(['claude-code']);
+const DEFAULT_ENABLED_PROVIDERS: ReadonlySet<string> = new Set(['claude-code', 'model-launcher']);
 
 /**
  * Providers whose default is decided by the machine rather than by a constant:

@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Shared AI model constants available across hosts.
  */
@@ -258,6 +259,161 @@ export type ClaudeCodeVariant = 'fable' | 'fable-5' | 'opus' | 'sonnet' | 'haiku
 export type ClaudeCodeVariantInput = ClaudeCodeVariant | 'opus-5' | 'sonnet-5' | 'fable-5-1';
 
 /**
+ * Persisted identity for the approved non-Anthropic Claude Agent route.
+ *
+ * These are exact programmatic identities, not visible Claude picker variants.
+ * Similar strings remain invalid, and the interactive claude-code-cli provider
+ * does not accept this namespace.
+ */
+export const CLAUDE_CODE_OLLAMA_GLM_5_2_CLOUD_MODEL =
+  'claude-code:ollama-glm-5-2-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_GLM_5_2_CLOUD_VARIANT =
+  'ollama-glm-5-2-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_GLM_5_2_CLOUD_SDK_ALIAS =
+  'claude-sonnet-4-5-20250929' as const;
+
+export const CLAUDE_CODE_OLLAMA_GPT_OSS_20B_CLOUD_MODEL =
+  'claude-code:ollama-gpt-oss-20b-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_GPT_OSS_20B_CLOUD_VARIANT =
+  'ollama-gpt-oss-20b-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_GPT_OSS_20B_CLOUD_SDK_ALIAS =
+  'claude-ollama-gpt-oss-20b' as const;
+
+export const CLAUDE_CODE_OLLAMA_NEMOTRON_3_NANO_CLOUD_MODEL =
+  'claude-code:ollama-nemotron-3-nano-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_NEMOTRON_3_NANO_CLOUD_VARIANT =
+  'ollama-nemotron-3-nano-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_NEMOTRON_3_NANO_CLOUD_SDK_ALIAS =
+  'claude-ollama-nemotron-3-nano' as const;
+
+export const CLAUDE_CODE_OLLAMA_DEEPSEEK_V4_FLASH_CLOUD_MODEL =
+  'claude-code:ollama-deepseek-v4-flash-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_DEEPSEEK_V4_FLASH_CLOUD_VARIANT =
+  'ollama-deepseek-v4-flash-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_DEEPSEEK_V4_FLASH_CLOUD_SDK_ALIAS =
+  'claude-ollama-deepseek-v4-flash' as const;
+
+export const CLAUDE_CODE_OLLAMA_QWEN3_5_CLOUD_MODEL =
+  'claude-code:ollama-qwen3-5-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_QWEN3_5_CLOUD_VARIANT =
+  'ollama-qwen3-5-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_QWEN3_5_CLOUD_SDK_ALIAS =
+  'claude-ollama-qwen3-5' as const;
+
+export const CLAUDE_CODE_OLLAMA_NEMOTRON_3_SUPER_CLOUD_MODEL =
+  'claude-code:ollama-nemotron-3-super-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_NEMOTRON_3_SUPER_CLOUD_VARIANT =
+  'ollama-nemotron-3-super-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_NEMOTRON_3_SUPER_CLOUD_SDK_ALIAS =
+  'claude-ollama-nemotron-3-super' as const;
+
+export const CLAUDE_CODE_OLLAMA_GLM_5_1_CLOUD_MODEL =
+  'claude-code:ollama-glm-5-1-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_GLM_5_1_CLOUD_VARIANT =
+  'ollama-glm-5-1-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_GLM_5_1_CLOUD_SDK_ALIAS =
+  'claude-ollama-glm-5-1' as const;
+
+export const CLAUDE_CODE_OLLAMA_MINIMAX_M2_7_CLOUD_MODEL =
+  'claude-code:ollama-minimax-m2-7-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_MINIMAX_M2_7_CLOUD_VARIANT =
+  'ollama-minimax-m2-7-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_MINIMAX_M2_7_CLOUD_SDK_ALIAS =
+  'claude-ollama-minimax-m2-7' as const;
+
+export const CLAUDE_CODE_OLLAMA_KIMI_K2_6_CLOUD_MODEL =
+  'claude-code:ollama-kimi-k2-6-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_KIMI_K2_6_CLOUD_VARIANT =
+  'ollama-kimi-k2-6-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_KIMI_K2_6_CLOUD_SDK_ALIAS =
+  'claude-ollama-kimi-k2-6' as const;
+
+export const CLAUDE_CODE_OLLAMA_KIMI_K2_7_CODE_CLOUD_MODEL =
+  'claude-code:ollama-kimi-k2-7-code-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_KIMI_K2_7_CODE_CLOUD_VARIANT =
+  'ollama-kimi-k2-7-code-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_KIMI_K2_7_CODE_CLOUD_SDK_ALIAS =
+  'claude-ollama-kimi-k2-7-code' as const;
+
+export const CLAUDE_CODE_OLLAMA_MINIMAX_M3_CLOUD_MODEL =
+  'claude-code:ollama-minimax-m3-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_MINIMAX_M3_CLOUD_VARIANT =
+  'ollama-minimax-m3-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_MINIMAX_M3_CLOUD_SDK_ALIAS =
+  'claude-ollama-minimax-m3' as const;
+
+export const CLAUDE_CODE_OLLAMA_DEEPSEEK_V4_PRO_CLOUD_MODEL =
+  'claude-code:ollama-deepseek-v4-pro-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_DEEPSEEK_V4_PRO_CLOUD_VARIANT =
+  'ollama-deepseek-v4-pro-cloud' as const;
+export const CLAUDE_CODE_OLLAMA_DEEPSEEK_V4_PRO_CLOUD_SDK_ALIAS =
+  'claude-ollama-deepseek-v4-pro' as const;
+
+/** Canonical persisted identity → backend variant → SDK alias bindings. */
+export const CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES = [
+  {
+    persistedModel: CLAUDE_CODE_OLLAMA_GLM_5_2_CLOUD_MODEL,
+    variant: CLAUDE_CODE_OLLAMA_GLM_5_2_CLOUD_VARIANT,
+    sdkAlias: CLAUDE_CODE_OLLAMA_GLM_5_2_CLOUD_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_OLLAMA_GPT_OSS_20B_CLOUD_MODEL,
+    variant: CLAUDE_CODE_OLLAMA_GPT_OSS_20B_CLOUD_VARIANT,
+    sdkAlias: CLAUDE_CODE_OLLAMA_GPT_OSS_20B_CLOUD_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_OLLAMA_NEMOTRON_3_NANO_CLOUD_MODEL,
+    variant: CLAUDE_CODE_OLLAMA_NEMOTRON_3_NANO_CLOUD_VARIANT,
+    sdkAlias: CLAUDE_CODE_OLLAMA_NEMOTRON_3_NANO_CLOUD_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_OLLAMA_DEEPSEEK_V4_FLASH_CLOUD_MODEL,
+    variant: CLAUDE_CODE_OLLAMA_DEEPSEEK_V4_FLASH_CLOUD_VARIANT,
+    sdkAlias: CLAUDE_CODE_OLLAMA_DEEPSEEK_V4_FLASH_CLOUD_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_OLLAMA_QWEN3_5_CLOUD_MODEL,
+    variant: CLAUDE_CODE_OLLAMA_QWEN3_5_CLOUD_VARIANT,
+    sdkAlias: CLAUDE_CODE_OLLAMA_QWEN3_5_CLOUD_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_OLLAMA_NEMOTRON_3_SUPER_CLOUD_MODEL,
+    variant: CLAUDE_CODE_OLLAMA_NEMOTRON_3_SUPER_CLOUD_VARIANT,
+    sdkAlias: CLAUDE_CODE_OLLAMA_NEMOTRON_3_SUPER_CLOUD_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_OLLAMA_GLM_5_1_CLOUD_MODEL,
+    variant: CLAUDE_CODE_OLLAMA_GLM_5_1_CLOUD_VARIANT,
+    sdkAlias: CLAUDE_CODE_OLLAMA_GLM_5_1_CLOUD_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_OLLAMA_MINIMAX_M2_7_CLOUD_MODEL,
+    variant: CLAUDE_CODE_OLLAMA_MINIMAX_M2_7_CLOUD_VARIANT,
+    sdkAlias: CLAUDE_CODE_OLLAMA_MINIMAX_M2_7_CLOUD_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_OLLAMA_KIMI_K2_6_CLOUD_MODEL,
+    variant: CLAUDE_CODE_OLLAMA_KIMI_K2_6_CLOUD_VARIANT,
+    sdkAlias: CLAUDE_CODE_OLLAMA_KIMI_K2_6_CLOUD_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_OLLAMA_KIMI_K2_7_CODE_CLOUD_MODEL,
+    variant: CLAUDE_CODE_OLLAMA_KIMI_K2_7_CODE_CLOUD_VARIANT,
+    sdkAlias: CLAUDE_CODE_OLLAMA_KIMI_K2_7_CODE_CLOUD_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_OLLAMA_MINIMAX_M3_CLOUD_MODEL,
+    variant: CLAUDE_CODE_OLLAMA_MINIMAX_M3_CLOUD_VARIANT,
+    sdkAlias: CLAUDE_CODE_OLLAMA_MINIMAX_M3_CLOUD_SDK_ALIAS,
+  },
+  {
+    persistedModel: CLAUDE_CODE_OLLAMA_DEEPSEEK_V4_PRO_CLOUD_MODEL,
+    variant: CLAUDE_CODE_OLLAMA_DEEPSEEK_V4_PRO_CLOUD_VARIANT,
+    sdkAlias: CLAUDE_CODE_OLLAMA_DEEPSEEK_V4_PRO_CLOUD_SDK_ALIAS,
+  },
+] as const;
+
+/**
  * Accepted input aliases for Claude Agent model identifiers.
  *
  * `opus-5` is intentionally accepted as an alias for the canonical `opus`
@@ -504,6 +660,7 @@ export const DEFAULT_MODELS = {
   // fallbacks used when the CLI cannot be reached.
   'grok-build': 'grok-build:grok-4.6',
   'cursor-agent': 'cursor-agent:auto',
+  'model-launcher': 'model-launcher:deepseek-pro',
 };
 
 /**

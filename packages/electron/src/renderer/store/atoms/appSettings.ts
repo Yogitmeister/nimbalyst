@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { changeProviderCredential } from '../providerCredentials';
 import { SAVED_CREDENTIAL } from '../../../shared/providerCredentials';
 /**
@@ -1224,6 +1225,7 @@ const defaultProviders: Record<string, ProviderConfig> = {
   'grok-build': { enabled: false, testStatus: 'idle', installStatus: 'not-installed' },
   'cursor-agent': { enabled: false, testStatus: 'idle', installStatus: 'not-installed' },
   'antigravity-gemini-agent': { enabled: false, testStatus: 'idle', installStatus: 'not-installed' },
+  'model-launcher': { enabled: true, testStatus: 'idle' },
   lmstudio: { enabled: false, baseUrl: 'http://127.0.0.1:8234', testStatus: 'idle' },
 };
 

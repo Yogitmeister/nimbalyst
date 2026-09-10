@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { SAVED_CREDENTIAL } from '../../../../shared/providerCredentials';
 import { getProviderCredentials } from '../../credentials/providerCredentials';
 import { safeHandle } from '../../../utils/ipcRegistry';
@@ -266,6 +267,9 @@ export function registerSettingsHandlers(ctx: AIServiceContext): void {
           break;
         case 'antigravity-gemini-agent':
           // Antigravity app login only; no API key to test.
+          apiKey = 'not-required';
+          break;
+        case 'model-launcher':
           apiKey = 'not-required';
           break;
         case 'lmstudio':

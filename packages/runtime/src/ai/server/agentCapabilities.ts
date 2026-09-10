@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Declared agent-capability contract.
  *
@@ -190,6 +191,10 @@ export const BUILTIN_AGENT_CAPABILITIES: Readonly<Record<AIProviderType, AgentCa
     compaction: 'unsupported',
     contextReporting: 'none',
   },
+
+  // Model Launcher (DeepSeek, etc.): a plain chat-completions provider, no
+  // agent surfaces.
+  'model-launcher': NO_AGENT_CAPABILITIES,
 });
 
 /**

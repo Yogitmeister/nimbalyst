@@ -202,7 +202,7 @@ export class AIService {
     // Initialize mobile sync handler if sync is enabled
     this.mobileSync = new MobileSyncHandler({
       sessionManager: this.sessionManager,
-      publishQueueStateToSync: (sessionId) => this.publishQueueStateToSync(sessionId),
+      publishQueueStateToSync: (sessionId, settlement) => this.publishQueueStateToSync(sessionId, settlement),
       triggerQueuedPromptProcessingForSession: (sessionId, workspacePath, reason) =>
         this.triggerQueuedPromptProcessingForSession(sessionId, workspacePath, reason),
       requestQueueDrive: (sessionId, workspacePath, reason) =>
@@ -643,10 +643,18 @@ export class AIService {
     if (expectedState && (!current || current.generation !== expectedState.generation || current.status !== expectedState.status)) {
       return { success: false, error: 'stale lifecycle generation', nativeEntered: false };
     }
+    const interruptedInbox = sessionInbox.current(sessionId);
     try {
       const result = await provider.interruptCurrentTurn();
+      await sessionInbox.end(interruptedInbox, false).catch(err => logger.main.error('[AIService] Inbox retirement failed during priority interruption:', err));
       if (expectedState) await sweepInterruptedQueue();
       logger.main.info(`[AIService] Interrupted current turn for session ${sessionId} (method=${result.method})`);
+      const stateManager = getSessionStateManager();
+      await clearStuckRunningState({
+        getSessionState: (id) => stateManager.getSessionState(id),
+        interruptSession: (id) => stateManager.interruptSession(id),
+        logWarn: (message) => logger.main.warn(message),
+      }, { sessionId, hadActiveTurn: result.hadActiveTurn, method: result.method });
       return { success: true, method: result.method, nativeEntered: true };
     } catch (error) {
       if (expectedState) await sweepInterruptedQueue();
@@ -999,7 +1007,7 @@ export class AIService {
     // Claude Code is enabled by default (undefined means enabled).
     // This matches the logic in ai:getModels which uses `claudeCodeSettings.enabled !== false`.
     // Other providers require explicit enabling (undefined means disabled).
-    const globalEnabled = provider === 'claude-code'
+    const globalEnabled = provider === 'claude-code' || provider === 'model-launcher'
       ? providerSettings[provider]?.enabled !== false
       : providerSettings[provider]?.enabled ?? false;
 
@@ -1437,7 +1445,8 @@ export class AIService {
       maskApiKey: (key) => this.maskApiKey(key),
       maskApiKeys: (keys) => this.maskApiKeys(keys),
 
-      publishQueueStateToSync: (sessionId) => this.publishQueueStateToSync(sessionId),
+      publishQueueStateToSync: (sessionId, settlement) => this.publishQueueStateToSync(sessionId, settlement),
+      requestQueueDrive: (sessionId, workspacePath, reason) => this.requestQueueDrive(sessionId, workspacePath, reason),
       driveQueuedPrompts: (sessionId, workspacePath, reason) => this.driveQueuedPrompts(sessionId, workspacePath, reason),
       forceSessionIdleOnCancel: (sessionId) => this.forceSessionIdleOnCancel(sessionId),
       interruptCurrentTurn: (sessionId) => this.interruptCurrentTurn(sessionId),

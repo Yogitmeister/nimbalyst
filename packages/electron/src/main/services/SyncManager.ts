@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { isRetainedSession } from '@nimbalyst/collab-protocol';
 import Store from '../utils/privateSettingsStore';
 import { getProviderCredentials, subscribeProviderCredentialChanges } from './credentials/providerCredentials';
@@ -1257,6 +1258,7 @@ async function getAvailableModelsForMobile(): Promise<{ models: Array<{ id: stri
     if (providerSettings['openai-codex']?.enabled === true) enabledSet.add('openai-codex');
     if (providerSettings['openai-codex-acp']?.enabled === true) enabledSet.add('openai-codex-acp');
     if (providerSettings['lmstudio']?.enabled === true) enabledSet.add('lmstudio');
+    if (providerSettings['model-launcher']?.enabled !== false) enabledSet.add('model-launcher');
 
     const modelsConfig = {
       ...apiKeys,

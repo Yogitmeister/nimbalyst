@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 <!-- New features go here -->
 - Added schema-driven reasoning controls with reviewed, persisted transport receipts for Claude Agent, Codex, and Unified Model Launcher sessions.
+- Added DeepSeek Pro and DeepSeek Flash as preferred Nimbalyst model pointers through the workspace Unified Model Launcher.
 
 ### Changed
 <!-- Changes to existing functionality go here -->

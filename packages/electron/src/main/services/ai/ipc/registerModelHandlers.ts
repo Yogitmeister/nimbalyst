@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import { getProviderCredentials } from '../../credentials/providerCredentials';
 import { getAgentProviderRegistry } from '../../../extensions/AgentProviderRegistry';
 import { safeHandle } from '../../../utils/ipcRegistry';
@@ -50,6 +51,7 @@ export function registerModelHandlers(ctx: AIServiceContext): void {
     if (resolveProviderEnabled('antigravity-gemini-agent', providerSettings['antigravity-gemini-agent'])) {
       enabledSet.add('antigravity-gemini-agent');
     }
+    if (providerSettings['model-launcher']?.enabled !== false) enabledSet.add('model-launcher');
     if (providerSettings['lmstudio']?.enabled === true) enabledSet.add('lmstudio');
 
     const modelsConfig = {
@@ -244,6 +246,11 @@ export function registerModelHandlers(ctx: AIServiceContext): void {
         ),
         models: providerSettings['antigravity-gemini-agent']?.models,
         hiddenModels: providerSettings['antigravity-gemini-agent']?.hiddenModels
+      },
+      'model-launcher': {
+        enabled: providerSettings['model-launcher']?.enabled !== false,
+        models: providerSettings['model-launcher']?.models,
+        hiddenModels: providerSettings['model-launcher']?.hiddenModels,
       },
       'lmstudio': {
         enabled: providerSettings['lmstudio']?.enabled === true,

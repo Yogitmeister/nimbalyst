@@ -70,6 +70,7 @@ export interface AIServiceContext {
 
   // --- queue + turn control -----------------------------------------------
   publishQueueStateToSync(sessionId: string, settlement?: { id: string; outcome: 'claimed' | 'withdrawn' }): Promise<void>;
+  requestQueueDrive(sessionId: string, workspacePath: string, reason: DriveReason): void;
   driveQueuedPrompts(
     sessionId: string,
     workspacePath: string,

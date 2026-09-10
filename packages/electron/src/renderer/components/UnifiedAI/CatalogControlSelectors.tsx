@@ -1,10 +1,7 @@
 // [ASTRA-ORCH]
 import React from 'react';
-import {
-  getBuiltInProviderControlEntry,
-  type ProviderControlDefinition,
-  type ProviderControlValue,
-} from '@nimbalyst/runtime/ai/server';
+import { getBuiltInProviderControlEntry } from '@nimbalyst/runtime/ai/server/providers/claudeCode/providerControlCatalogDefaults';
+import { type ProviderControlDefinition, type ProviderControlValue } from '@nimbalyst/runtime/ai/server/providers/claudeCode/providerControlContract';
 
 interface CatalogControlSelectorsProps {
   modelId?: string;

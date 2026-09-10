@@ -134,7 +134,7 @@ import { diffPeekSizeAtom, setDiffPeekSizeAtom } from '../../store/atoms/diffPee
 import { registerSessionWorkspace, loadInitialSessionFileState } from '../../store/listeners/fileStateListeners';
 import { sessionFileEditsAtom } from '../../store/atoms/sessionFiles';
 import { SESSION_PHASE_COLUMNS, setSessionPhaseAtom, type SessionPhase } from '../../store/atoms/sessionKanban';
-import { reconcileBuiltInProviderControlValues } from '@nimbalyst/runtime/ai/server';
+import { reconcileBuiltInProviderControlValues } from '@nimbalyst/runtime/ai/server/providers/claudeCode/providerControlCatalogDefaults';
 
 /**
  * Detect a metadata value that's the artifact of `{...stringValue, ...}` -

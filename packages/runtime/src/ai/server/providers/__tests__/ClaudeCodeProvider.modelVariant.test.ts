@@ -1,4 +1,6 @@
+// [ASTRA-ORCH]
 import { describe, it, expect } from 'vitest';
+import { CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES } from '../../../modelConstants';
 import { resolveClaudeCodeModelVariant } from '../../types';
 
 const DEFAULT_MODEL = 'claude-code:opus-1m';
@@ -75,6 +77,14 @@ describe('resolveClaudeCodeModelVariant', () => {
   });
 
   describe('SDK compatibility', () => {
+    it('resolves every Ollama identity to its exact SDK alias', () => {
+      for (const identity of CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES) {
+        expect(resolveClaudeCodeModelVariant(identity.persistedModel, DEFAULT_MODEL)).toBe(
+          identity.sdkAlias
+        );
+      }
+    });
+
     it('standard variants are valid SDK model values', () => {
       const validSdkValues = ['sonnet', 'opus', 'haiku'];
       for (const variant of validSdkValues) {

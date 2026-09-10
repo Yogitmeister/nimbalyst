@@ -13,6 +13,7 @@ import type { ToolResult } from './protocols/ProtocolInterface';
 import { ModelIdentifier } from './ModelIdentifier';
 import {
   CLAUDE_CODE_ACCEPTED_VARIANT_INPUTS,
+  CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES,
   CLAUDE_CODE_PINNED_SDK_MODELS,
   normalizeClaudeCodeVariant,
 } from '../modelConstants';
@@ -198,7 +199,7 @@ export interface Message {
  * Add new providers here -- the type, runtime array, and exhaustiveness
  * checks all derive from this one definition.
  */
-export const AI_PROVIDER_TYPES = ['claude', 'claude-code', 'claude-code-cli', 'openai', 'openai-codex', 'openai-codex-acp', 'lmstudio', 'opencode', 'copilot-cli', 'grok-build', 'cursor-agent', 'antigravity-gemini-agent'] as const;
+export const AI_PROVIDER_TYPES = ['claude', 'claude-code', 'claude-code-cli', 'openai', 'openai-codex', 'openai-codex-acp', 'lmstudio', 'opencode', 'copilot-cli', 'grok-build', 'cursor-agent', 'antigravity-gemini-agent', 'model-launcher'] as const;
 
 export type AIProviderType = typeof AI_PROVIDER_TYPES[number];
 
@@ -229,7 +230,8 @@ export type AgentProviderType =
   // Keeps its original contribution id from the years it shipped as an
   // extension: the id is persisted on every existing Gemini session row, and
   // re-keying it would orphan that history for a cosmetic gain.
-  | 'antigravity-gemini-agent';
+  | 'antigravity-gemini-agent'
+  | 'model-launcher';
 
 const AGENT_PROVIDER_TYPES: ReadonlySet<string> = new Set<AgentProviderType>([
   'claude-code',
@@ -241,6 +243,7 @@ const AGENT_PROVIDER_TYPES: ReadonlySet<string> = new Set<AgentProviderType>([
   'grok-build',
   'cursor-agent',
   'antigravity-gemini-agent',
+  'model-launcher',
 ]);
 
 export function isAgentProvider(provider: string | null | undefined): provider is AgentProviderType {
@@ -316,6 +319,14 @@ export function resolveClaudeCodeModelVariant(configuredModel: string | undefine
   // Try parsing with ModelIdentifier
   const parsed = ModelIdentifier.tryParse(configured);
   if (parsed && isClaudeCodeFamily(parsed.provider)) {
+    const ollamaIdentity = parsed.provider === 'claude-code'
+      ? CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES.find(
+        (identity) => identity.persistedModel === parsed.combined
+      )
+      : undefined;
+    if (ollamaIdentity) {
+      return ollamaIdentity.sdkAlias;
+    }
     // baseVariant strips suffixes like -1m
     const variant = parsed.baseVariant as ClaudeCodeVariant;
     if ((CLAUDE_CODE_VARIANTS as readonly string[]).includes(variant)) {

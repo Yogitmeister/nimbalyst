@@ -1,8 +1,8 @@
 // [ASTRA-ORCH]
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { asPersonalJwt, asPersonalMemberId } from '../../auth/jwtScopes';
 import { createCollabV3Sync } from '../CollabV3Sync';
+import { asPersonalJwt, asPersonalMemberId } from '../../auth/jwtScopes';
 
 class FakeWebSocket {
   static readonly OPEN = 1;

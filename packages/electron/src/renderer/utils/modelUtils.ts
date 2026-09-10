@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Model display utilities for renderer components.
  *
@@ -187,6 +188,7 @@ export function getProviderDisplayName(provider: string): string {
     case 'grok-build': return 'Grok Build';
     case 'cursor-agent': return 'Cursor Agent';
     case 'antigravity-gemini-agent': return 'Gemini';
+    case 'model-launcher': return 'Model Launcher';
     default: return provider;
   }
 }

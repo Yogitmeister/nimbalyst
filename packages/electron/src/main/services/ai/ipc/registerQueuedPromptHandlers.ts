@@ -202,6 +202,12 @@ export function registerQueuedPromptHandlers(ctx: AIServiceContext): void {
       }
     }
 
+    // Every provider needs the durable queue-drive edge after persistence.
+    // Keep the CLI live-PID idle kick above; DB claims make the paths race-safe.
+    if (queuedSession?.workspacePath) {
+      ctx.requestQueueDrive(sessionId, queuedSession.workspacePath, 'renderer-trigger');
+    }
+
     return {
       id: created.id,
       prompt: created.prompt,

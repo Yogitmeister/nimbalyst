@@ -1,4 +1,6 @@
+// [ASTRA-ORCH]
 import { describe, it, expect } from 'vitest';
+import { CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES } from '../../modelConstants';
 import { ModelIdentifier } from '../ModelIdentifier';
 
 describe('ModelIdentifier', () => {
@@ -15,6 +17,22 @@ describe('ModelIdentifier', () => {
       expect(id.provider).toBe('claude-code');
       expect(id.model).toBe('opus');
       expect(id.combined).toBe('claude-code:opus');
+    });
+
+    it('accepts exact Ollama identities and rejects lookalikes or CLI substitutions', () => {
+      for (const identity of CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES) {
+        const id = ModelIdentifier.parse(identity.persistedModel);
+        expect(id.provider).toBe('claude-code');
+        expect(id.model).toBe(identity.variant);
+        expect(id.combined).toBe(identity.persistedModel);
+
+        expect(() => ModelIdentifier.parse(`${identity.persistedModel}-ish`)).toThrow(
+          'Invalid Claude Code variant'
+        );
+        expect(() => ModelIdentifier.parse(`claude-code-cli:${identity.variant}`)).toThrow(
+          'Invalid Claude Code variant'
+        );
+      }
     });
 
     it('parses claude-code with 1m suffix', () => {

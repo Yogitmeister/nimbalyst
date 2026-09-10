@@ -1,17 +1,14 @@
+// [ASTRA-ORCH]
 /**
  * Single entry point for asking the sync server to push a notification to the
  * user's phone.
- *
- * Every push used to be fire-and-forget: `requestMobilePush` resolved as soon
- * as the WebSocket send did not throw, so a suppressed push, a dropped push and
- * a delivered push were indistinguishable (GitHub #1268). The server now
- * acknowledges, and this is where that acknowledgement becomes a number we can
- * look at -- suppression rates are otherwise only ever inferred.
  *
  * `force` marks an explicit attention alert and bypasses the server's presence
  * suppression. Never gate a forced call site on local presence: the whole point
  * is that the server owns that decision, and a local gate stops `force` ever
  * reaching it.
+ *
+ * The server acknowledges accepted requests and delivery outcomes.
  */
 
 import type { MobilePushOptions, MobilePushResult } from '@nimbalyst/runtime/sync/types';
@@ -23,9 +20,8 @@ import { logger } from '../../utils/logger';
 /**
  * Request a mobile push and report the outcome.
  *
- * Returns null when sync is not available at all; otherwise the server's
- * acknowledgement, or a `no_ack` result if none arrived. Callers may ignore
- * the return value -- reporting happens here.
+ * Returns null when sync is unavailable; otherwise the server acknowledgement
+ * or a no_ack result. Reporting happens here even when callers ignore it.
  */
 export async function requestMobilePush(
   sessionId: string,

@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Factory for creating AI provider instances
  */
@@ -15,6 +16,7 @@ import { CopilotCLIProvider } from './providers/CopilotCLIProvider';
 import { GrokBuildProvider } from './providers/GrokBuildProvider';
 import { CursorAgentProvider } from './providers/CursorAgentProvider';
 import { GeminiAntigravityProvider } from './providers/GeminiAntigravityProvider';
+import { ModelLauncherProvider } from './providers/ModelLauncherProvider';
 import { ExtensionAgentProvider } from './providers/ExtensionAgentProvider';
 import { ProviderConfig, AIProviderType, assertExhaustiveProvider } from './types';
 
@@ -93,6 +95,9 @@ export class ProviderFactory {
         break;
       case 'antigravity-gemini-agent':
         provider = new GeminiAntigravityProvider();
+        break;
+      case 'model-launcher':
+        provider = new ModelLauncherProvider();
         break;
       default:
         assertExhaustiveProvider(type);

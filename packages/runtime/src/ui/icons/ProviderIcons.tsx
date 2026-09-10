@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import React from 'react';
 import { MaterialSymbol } from './MaterialSymbol';
 
@@ -11,6 +12,7 @@ const PROVIDER_ICON_MAP: Record<string, string> = {
   // ACP transport reuses the OpenAI Codex icon (same underlying agent).
   'openai-codex-acp': 'openai-codex',
   'claude-code-cli': 'claude-code',
+  'model-launcher': 'terminal',
   // Gemini Antigravity extension provider -> Gemini brand glyph.
   'antigravity-gemini-agent': 'gemini',
   'antigravity-gemini': 'gemini',

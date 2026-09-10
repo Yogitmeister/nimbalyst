@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Claude Code provider using claude-agent-sdk with MCP support
  * Uses bundled SDK from package dependencies
@@ -50,6 +51,11 @@ import {
   CLAUDE_CODE_SAFE_FALLBACK_MODEL,
   baseContextWindowForVariant,
 } from '../../modelConstants';
+// NOTE: the original commit's parent also imported providerRouteCredentials/
+// providerRuntimeRoutePersistence/runtimeRouteResolver symbols for the
+// route-pinning system (2ee794998), not carried in this release. Nothing in
+// this file's actual diff (CLAUDE_CODE_BACKENDS enumeration) uses them.
+import { CLAUDE_CODE_BACKENDS } from './claudeCode/customBackends';
 import type { InterruptTurnResult } from '../AIProvider';
 import { isBedrockToolSearchError } from '../utils/errorDetection';
 import { AgentMessagesRepository } from '../../../storage/repositories/AgentMessagesRepository';
@@ -156,6 +162,11 @@ export interface ScheduleWakeupRequest {
   reason: string;
 }
 
+
+/** Display labels for catalog-backed Claude Agent routes in the model picker. */
+const CATALOG_PROVIDER_LABELS: Record<string, string> = {
+  ollama: 'Ollama Cloud',
+};
 
 export class ClaudeCodeProvider extends BaseAgentProvider {
   private currentMode?: 'planning' | 'agent' | 'auto'; // Track session mode for prompt customization and tool filtering
@@ -617,6 +628,11 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     attachments?: any[]
   ): AsyncIterableIterator<StreamChunk> {
     const startTime = Date.now();
+    // NOTE: this turn-start block also depends on the route-pinning system
+    // (2ee794998, not carried) for runtimeRoutes/routeCredentials, and on the
+    // Claude-background-recovery family's beginRecoveryTurn()/recoverySessionId
+    // (not yet landed at this point in the fold sequence) -- left empty here,
+    // to be reconciled once/if that family lands and touches this file again.
 
     // CRITICAL: Capture hidden mode flag at START and reset immediately
     // This prevents race conditions when concurrent sendMessage calls overlap
@@ -3570,6 +3586,24 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         });
       }
 
+    }
+
+    // Catalog-backed brain-swap routes (Ollama Cloud today). These run the
+    // Claude Code harness against a non-Anthropic upstream, so they belong
+    // under `claude-code` in the picker and must launch as Claude Agent
+    // sessions; `initialize()` already resolves them by persisted id. Without
+    // this loop the catalog entries exist and are launchable but never reach
+    // the model list, so the only visible rows for these models come from a
+    // user's opencode.json and launch as OpenCode sessions instead.
+    // CLAUDE_CODE_BACKENDS is the projection that already dropped catalog
+    // entries without a usable Claude-Agent main-session route.
+    for (const backend of CLAUDE_CODE_BACKENDS) {
+      models.push({
+        id: backend.persistedModel,
+        name: `Claude Agent · ${backend.model} (${CATALOG_PROVIDER_LABELS[backend.provider] ?? backend.provider})`,
+        provider: 'claude-code' as const,
+        maxTokens: 8192
+      });
     }
 
     return models;

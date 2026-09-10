@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * ModelIdentifier Value Object
  *
@@ -13,6 +14,7 @@
 import { AIProviderType, AI_PROVIDER_TYPES, isClaudeCodeFamily } from './types';
 import {
   CLAUDE_CODE_ACCEPTED_VARIANT_INPUTS,
+  CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES,
   DEFAULT_MODELS,
   normalizeClaudeCodeVariant,
 } from '../modelConstants';
@@ -162,6 +164,18 @@ export class ModelIdentifier {
     // Validate model for provider
     if (isClaudeCodeFamily(provider)) {
       const normalizedModel = model.toLowerCase();
+
+      // Ollama identities are exact persisted programmatic identities. They
+      // belong only to the in-process claude-code provider, never the genuine
+      // claude-code-cli provider, and must not widen native Claude parsing.
+      const ollamaIdentity = provider === 'claude-code'
+        ? CLAUDE_CODE_OLLAMA_BACKEND_IDENTITIES.find(
+          (identity) => identity.variant === normalizedModel
+        )
+        : undefined;
+      if (ollamaIdentity) {
+        return new ModelIdentifier(provider, ollamaIdentity.variant);
+      }
 
       // Strip known suffixes to get base variant
       let baseVariant = normalizedModel;

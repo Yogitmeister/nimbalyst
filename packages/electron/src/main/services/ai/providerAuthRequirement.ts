@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Single source of truth for "does the host need an API key before this
  * built-in provider can run?".
@@ -63,6 +64,7 @@ export function resolveProviderAuthRequirement(
     // (`codex auth login`, `copilot auth login`, `grok login`,
     // `cursor-agent login`, the Antigravity app). No API key, and deliberately
     // no env-var fallback -- see the standing rule in CLAUDE.md.
+    case 'model-launcher':
     case 'openai-codex':
     case 'openai-codex-acp':
     case 'opencode':

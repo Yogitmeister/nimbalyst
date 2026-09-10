@@ -35,7 +35,7 @@ import {
   toStableAnalyticsCategory,
   type SendBlockedReason,
 } from '../../../shared/analytics/sendOutcomes';
-import { reconcileBuiltInProviderControlValues } from '@nimbalyst/runtime/ai/server';
+import { reconcileBuiltInProviderControlValues } from '@nimbalyst/runtime/ai/server/providers/claudeCode/providerControlCatalogDefaults';
 
 interface SessionLaunchPopupProps {
   workspacePath: string | null;

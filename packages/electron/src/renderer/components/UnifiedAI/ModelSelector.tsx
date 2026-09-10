@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 import React, { useState, useEffect } from 'react';
 import {
   autoUpdate,
@@ -24,7 +25,7 @@ import { AlphaBadge } from '../common/AlphaBadge';
 import { HelpTooltip } from '../../help';
 import { isDirectChatProvider, isProviderVisible } from '../../utils/chatProviderVisibility';
 
-const ALPHA_PROVIDERS = new Set(['opencode', 'copilot-cli', 'grok-build', 'cursor-agent', 'antigravity-gemini-agent']);
+const ALPHA_PROVIDERS = new Set(['opencode', 'copilot-cli', 'grok-build', 'cursor-agent', 'antigravity-gemini-agent', 'model-launcher']);
 const TYPEAHEAD_RESET_MS = 700;
 
 interface Model {
@@ -321,6 +322,7 @@ export function ModelSelector({
       case 'grok-build': return 'Grok Build';
       case 'cursor-agent': return 'Cursor Agent';
       case 'antigravity-gemini-agent': return 'Gemini';
+      case 'model-launcher': return 'Model Launcher';
       case 'lmstudio': return 'LMStudio';
       default: {
         // Extension-contributed providers carry their contribution id here

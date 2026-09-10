@@ -1,3 +1,4 @@
+// [ASTRA-ORCH]
 /**
  * Registry of available AI models with dynamic fetching
  */
@@ -48,6 +49,7 @@ const PROVIDER_API_KEY_SOURCE: Readonly<Record<AIProviderType, string | null>> =
   'grok-build': null,
   'cursor-agent': null,
   'antigravity-gemini-agent': null,
+  'model-launcher': null,
 });
 
 export class ModelRegistry {
@@ -204,6 +206,9 @@ export class ModelRegistry {
       case 'antigravity-gemini-agent':
         const { GeminiAntigravityProvider } = await import('./providers/GeminiAntigravityProvider');
         return GeminiAntigravityProvider.getModels();
+      case 'model-launcher':
+        const { ModelLauncherProvider } = await import('./providers/ModelLauncherProvider');
+        return ModelLauncherProvider.getModels();
       default:
         return assertExhaustiveProvider(provider);
     }
@@ -244,7 +249,9 @@ export class ModelRegistry {
     // in Settings and in `enabledProviders` while its catalog was never
     // fetched, so its models never reached the picker and nothing anywhere
     // reported a problem. `Record<AIProviderType, ...>` makes the next addition
-    // a compile error instead.
+    // a compile error instead. `model-launcher` is covered the same way via
+    // its own PROVIDER_API_KEY_SOURCE entry (null -- it needs no api key,
+    // matching the original per-provider call with no key argument).
     const promises = AI_PROVIDER_TYPES
       .filter((provider) => !enabledProviders || enabledProviders.has(provider))
       .map((provider) => {
@@ -314,6 +321,9 @@ export class ModelRegistry {
       case 'antigravity-gemini-agent':
         const { GeminiAntigravityProvider: GAP } = await import('./providers/GeminiAntigravityProvider');
         return GAP.getDefaultModel();
+      case 'model-launcher':
+        const { ModelLauncherProvider } = await import('./providers/ModelLauncherProvider');
+        return ModelLauncherProvider.getDefaultModel();
       default:
         assertExhaustiveProvider(provider);
     }
