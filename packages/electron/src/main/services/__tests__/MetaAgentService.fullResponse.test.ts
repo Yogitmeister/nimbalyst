@@ -1,3 +1,5 @@
+// [ASTRA-ORCH]
+import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 // FIX A regression guard: get_session_result (via buildSessionResultData) must
@@ -157,7 +159,7 @@ describe('MetaAgentService buildSessionResultData editedFiles dedupe (#1244)', (
     const service = MetaAgentService.getInstance();
     const data = await (service as any).buildSessionResultData('child-4', '/ws', PREFETCHED);
 
-    expect(data.editedFiles).toEqual(['src/a.ts', 'src/b.ts']);
+    expect(data.editedFiles).toEqual([path.join('src', 'a.ts'), path.join('src', 'b.ts')]);
   });
 
   it('collapses distinct absolute paths that resolve to the same workspace-relative path', async () => {
@@ -171,6 +173,6 @@ describe('MetaAgentService buildSessionResultData editedFiles dedupe (#1244)', (
     const service = MetaAgentService.getInstance();
     const data = await (service as any).buildSessionResultData('child-5', '/ws', PREFETCHED);
 
-    expect(data.editedFiles).toEqual(['src/a.ts']);
+    expect(data.editedFiles).toEqual([path.join('src', 'a.ts')]);
   });
 });

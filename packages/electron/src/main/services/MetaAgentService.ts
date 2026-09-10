@@ -57,7 +57,7 @@ interface SessionResultData {
   lastResponse: string | null;
   /** Full final assistant response (large cap), for get_session_result so the
    *  meta-agent can synthesize from the child's real work, not a 500-char stub.
-   *  The notification preview deliberately uses lastResponse, not this. */
+   *  Notifications expose only a recognized bounded pointer or safe metadata. */
   fullResponse: string | null;
   recentMessages: Array<{ direction: 'input' | 'output'; text: string }>;
   editedFiles: string[];
@@ -195,6 +195,40 @@ type RequestMobilePush = (
   body: string,
   options: { force?: boolean; reason?: string }
 ) => Promise<MobilePushResult | null>;
+
+const CHILD_POINTER_SIGNAL_MAX_LENGTH = 500;
+const CHILD_POINTER_SIGNAL_PATTERN =
+  /^(?:\[[^\]]{1,80}\]\s*)?(?:DONE|CONSULTED|GATE-STOPPED|BLOCKED(?:\s+ON)?)\s*:?\s*.{0,400}?\|\s*(?:file|report)\s*:\s*\S/i;
+
+export function dedupeFilePaths(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const filePath of paths) {
+    if (!seen.has(filePath)) {
+      seen.add(filePath);
+      deduped.push(filePath);
+    }
+  }
+  return deduped;
+}
+
+function extractChildPointerSignal(
+  result: Pick<SessionResultData, 'recentMessages' | 'lastResponse'>,
+): string | null {
+  const lastOutputMessage = [...result.recentMessages]
+    .reverse()
+    .find((message) => message.direction === 'output');
+  const candidate = (lastOutputMessage?.text ?? result.lastResponse ?? '').trim();
+  if (!candidate) return null;
+  const lines = candidate.split('\n').map((line) => line.trim()).filter(Boolean);
+  const lastLine = lines[lines.length - 1];
+  if (
+    !lastLine
+    || lastLine.length > CHILD_POINTER_SIGNAL_MAX_LENGTH
+    || !CHILD_POINTER_SIGNAL_PATTERN.test(lastLine)
+  ) return null;
+  return lastLine;
+}
 
 export class MetaAgentService {
   private static instance: MetaAgentService | null = null;
@@ -1512,32 +1546,21 @@ export class MetaAgentService {
       `Event: ${eventType}`,
     ];
 
-    // The original task is deliberately not repeated here. This notification is
-    // only ever queued to the child's `createdBySessionId`, which is the session
-    // that wrote that prompt in the first place -- it is already in the parent's
-    // own transcript. Re-embedding up to 2,000 characters of it in every update
-    // was the largest part of each row, repeated once per child turn. The title
-    // and session id above are enough to identify the child; `get_session_result`
-    // returns the full prompt when a parent genuinely needs it.
-    if (result.recentMessages.length > 0) {
-      lines.push('Recent messages:');
-      for (const message of result.recentMessages) {
-        const label = message.direction === 'input' ? 'User' : 'Assistant';
-        lines.push(`- ${label}: ${message.text}`);
-      }
-    } else if (result.lastResponse) {
-      lines.push(`Last response: ${result.lastResponse}`);
-    }
-    if (result.editedFiles.length > 0) {
-      lines.push('Files modified:');
-      for (const filePath of result.editedFiles) {
-        lines.push(`- ${filePath}`);
+    const pointerSignal = extractChildPointerSignal(result);
+    if (pointerSignal) {
+      lines.push(pointerSignal);
+    } else {
+      if (result.editedFiles.length > 0) {
+        const fileWord = result.editedFiles.length === 1 ? 'file' : 'files';
+        lines.push(
+          `Files modified: ${result.editedFiles.length} unique ${fileWord} (call get_session_result with sessionId "${result.sessionId}" for the path list).`,
+        );
       }
     }
     if (result.toolScope === 'read' || result.toolScope === 'write') {
       const denied = result.toolScope === 'read' ? 'write_file or run_command' : 'run_command';
       lines.push(
-        `Tool scope: ${result.toolScope} (this child had NO ${denied}). Any claim it ran, built, or tested anything is false; "Files modified" above is the complete list of files it changed.`,
+        `Tool scope: ${result.toolScope} (this child had NO ${denied}). Any claim it ran, built, or tested anything is false.`,
       );
     }
     if (result.errorMessage) {
@@ -1640,9 +1663,9 @@ export class MetaAgentService {
       // toolUseId, not on path), so a file edited twenty times appears twenty
       // times. Consumers here want the set of files touched -- collapse to
       // unique paths, keeping first-edit order.
-      editedFiles = [
-        ...new Set(fileLinks.map((file: any) => this.stripWorkspacePath(file.filePath, workspaceId))),
-      ];
+      editedFiles = dedupeFilePaths(
+        fileLinks.map((file: any) => this.stripWorkspacePath(file.filePath, workspaceId)),
+      );
     } catch {
       editedFiles = [];
     }
