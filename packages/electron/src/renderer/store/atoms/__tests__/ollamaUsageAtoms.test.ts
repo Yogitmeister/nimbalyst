@@ -44,8 +44,8 @@ describe('ollamaUsageAvailableAtom', () => {
       ollamaUsageAtom,
       baseData({
         limitsAvailable: true,
-        session: { utilization: 0, resetsAt: null, models: [] },
-        weekly: { utilization: 5.1, resetsAt: null, models: [] },
+        session: { utilization: 0, resetsAt: null, windowStart: null, windowEnd: null, models: [] },
+        weekly: { utilization: 5.1, resetsAt: null, windowStart: null, windowEnd: null, models: [] },
       })
     );
     expect(store.get(ollamaUsageAvailableAtom)).toBe(true);

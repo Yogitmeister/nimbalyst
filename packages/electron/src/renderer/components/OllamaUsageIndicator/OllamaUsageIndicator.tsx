@@ -53,6 +53,9 @@ export const OllamaUsageIndicator: React.FC<OllamaUsageIndicatorProps> = ({ clas
   const strokeDashoffset = RING_CIRCUMFERENCE * (1 - utilization / 100);
   const limitsAvailable = !hasLoadError && (usage?.limitsAvailable ?? false);
 
+  // No elapsed stripe on the ring itself -- same as Claude/Codex/Gemini's ring
+  // indicators, which only show the pace-marker stripe in the popover
+  // (OllamaUsagePopover.tsx). The ring stays a plain percentage.
   const colorClasses: Record<string, string> = {
     green: 'stroke-green-500',
     yellow: 'stroke-yellow-500',

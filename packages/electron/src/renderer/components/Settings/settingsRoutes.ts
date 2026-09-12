@@ -15,6 +15,7 @@ export type ApplicationSettingsCategory =
   | 'opencode'
   | 'copilot-cli'
   | 'lmstudio'
+  | 'ollama'
   | 'marketplace'
   | 'installed-extensions'
   | 'privileged-extensions'
@@ -146,6 +147,7 @@ const builtinSettingsRouteDefinitions: readonly Omit<BuiltinSettingsRoute, 'sour
   { id: 'claude', scope: 'application', group: 'Chat Providers', label: 'Claude Chat', icon: 'chat', isAvailable: directChatProvidersVisible },
   { id: 'openai', scope: 'application', group: 'Chat Providers', label: 'OpenAI', icon: 'chat', isAvailable: directChatProvidersVisible },
   { id: 'lmstudio', scope: 'application', group: 'Chat Providers', label: 'LM Studio', icon: 'memory', isAvailable: directChatProvidersVisible },
+  { id: 'ollama', scope: 'application', group: 'Chat Providers', label: 'Ollama Cloud', icon: 'cloud', isAvailable: directChatProvidersVisible },
   { id: 'marketplace', scope: 'application', group: 'Extensions', label: 'Marketplace', icon: 'storefront' },
   { id: 'installed-extensions', scope: 'application', group: 'Extensions', label: 'Installed', icon: 'extension' },
   { id: 'privileged-extensions', scope: 'application', group: 'Extensions', label: 'Privileged Capabilities', icon: 'shield_lock' },

@@ -50,6 +50,8 @@
 import { BrowserWindow } from 'electron';
 import { logger } from '../utils/logger';
 import { getShellEnvironment } from './CLIManager';
+import { getOllamaCookie } from './OllamaCookieService';
+import { fetchOllamaResetTimes, OllamaResetTimeResult } from './OllamaResetTimeScraper';
 
 type OllamaEnv = Record<string, string | undefined>;
 
@@ -60,7 +62,9 @@ export interface OllamaUsageModelBreakdown {
 
 export interface OllamaUsageWindow {
   utilization: number; // 0-100 percentage
-  resetsAt: string | null; // not present in the API payload today
+  resetsAt: string | null; // filled from scraper (session/weekly) or costPeriod.ending_at (cost-period)
+  windowStart: string | null; // window start time (from costPeriod.starting_at or scraper)
+  windowEnd: string | null; // window end time (from costPeriod.ending_at or scraper)
   models: OllamaUsageModelBreakdown[];
 }
 
@@ -85,6 +89,13 @@ export interface OllamaUsageData {
   lastUpdated: number; // Unix timestamp
   /** Set when limitsAvailable is false: why (missing key, HTTP error, etc). */
   error?: string;
+  /**
+   * True when the stored Ollama session cookie was rejected (redirected off
+   * /settings) on the most recent scrape attempt. Distinct from a generic
+   * scrape `error` so the UI can prompt for a fresh cookie specifically,
+   * rather than showing a dead countdown forever. See enrichWithResetTimes.
+   */
+  cookieExpired?: boolean;
 }
 
 const USAGE_API_URL = 'https://ollama.com/api/usage';
@@ -140,6 +151,8 @@ function parseWindow(raw: RawOllamaUsageWindow | undefined): OllamaUsageWindow |
   return {
     utilization: Math.round(raw.usage * 1000) / 10, // 0-1 fraction -> 0-100%, 1 decimal
     resetsAt: null,
+    windowStart: null,
+    windowEnd: null,
     models,
   };
 }
@@ -152,6 +165,18 @@ class OllamaUsageServiceImpl {
   private lastActivityTime = 0;
   private isPolling = false;
   private isSleeping = true;
+  // Track locally-persisted window starts for session/weekly (scraper only gives ends).
+  private sessionWindowStart: string | null = null;
+  private weeklyWindowStart: string | null = null;
+  // Last known resetsAt per window, persisted across refreshes -- the account-usage
+  // API re-parses session/weekly fresh every call (see parseWindow) with resetsAt
+  // always null, so without this the lazy trigger below would never see a
+  // non-null/non-past resetsAt and would re-hit ollama.com/settings on every poll.
+  private sessionResetsAt: string | null = null;
+  private weeklyResetsAt: string | null = null;
+  // Track scraper results and errors
+  private lastScraperResult: OllamaResetTimeResult | null = null;
+  private lastScraperTime = 0;
 
   /**
    * Initialize the service. Does not start polling until activity is
@@ -178,6 +203,24 @@ class OllamaUsageServiceImpl {
   stop(): void {
     this.stopPolling();
     logger.main.info('[OllamaUsageService] Stopped');
+  }
+
+  /**
+   * Test-only: clear cached usage and persisted session/weekly window state.
+   * `ollamaUsageService` is a module-level singleton, so without this, tests
+   * that populate session/weekly resetsAt leak that state into later tests
+   * (and, being real ISO timestamps, whether they still read as "in the
+   * future" depends on wall-clock time when the suite runs).
+   */
+  resetForTests(): void {
+    this.cachedUsage = null;
+    this.lastFetchTime = 0;
+    this.sessionWindowStart = null;
+    this.weeklyWindowStart = null;
+    this.sessionResetsAt = null;
+    this.weeklyResetsAt = null;
+    this.lastScraperResult = null;
+    this.lastScraperTime = 0;
   }
 
   /** Returns the cached snapshot if fresh, otherwise fetches a new one. */
@@ -237,11 +280,18 @@ class OllamaUsageServiceImpl {
       this.fetchProxyHealth(),
     ]);
 
+    // Enrich session/weekly windows with reset times from scraper (lazy trigger).
+    // This happens after account usage fetch so we know which windows are present.
+    const session = accountUsage.session;
+    const weekly = accountUsage.weekly;
+    const { cookieExpired } = await this.enrichWithResetTimes(session, weekly);
+
     const usageData: OllamaUsageData = {
       ...accountUsage,
       ...proxyHealth,
       planTiers: [...PLAN_TIERS],
       lastUpdated: Date.now(),
+      cookieExpired,
     };
     this.cachedUsage = usageData;
     this.lastFetchTime = Date.now();
@@ -359,6 +409,91 @@ class OllamaUsageServiceImpl {
       });
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Fetch reset times from scraper if:
+   * - Cookie is available
+   * - resetsAt is missing or already past
+   *
+   * Per the scraper's design, never guess a time -- degrade to null if the
+   * scrape fails or times out. On cookie-expired, surface that state so the
+   * UI can prompt for a fresh cookie.
+   */
+  private async enrichWithResetTimes(
+    session: OllamaUsageWindow | undefined,
+    weekly: OllamaUsageWindow | undefined
+  ): Promise<{ cookieExpired: boolean }> {
+    // Seed from the last scrape before checking anything -- the account-usage
+    // API never carries resetsAt, so a freshly-parsed window always starts
+    // null here regardless of what a previous refresh already learned.
+    if (session && this.sessionResetsAt) {
+      session.resetsAt = this.sessionResetsAt;
+      session.windowStart = this.sessionWindowStart;
+      session.windowEnd = this.sessionResetsAt;
+    }
+    if (weekly && this.weeklyResetsAt) {
+      weekly.resetsAt = this.weeklyResetsAt;
+      weekly.windowStart = this.weeklyWindowStart;
+      weekly.windowEnd = this.weeklyResetsAt;
+    }
+
+    const cookie = getOllamaCookie();
+    if (!cookie) {
+      logger.main.debug('[OllamaUsageService] No Ollama session cookie stored; reset times unavailable.');
+      return { cookieExpired: false };
+    }
+
+    // Only call scraper if at least one window needs a reset time.
+    const sessionNeedsTime = session && (!session.resetsAt || new Date(session.resetsAt) <= new Date());
+    const weeklyNeedsTime = weekly && (!weekly.resetsAt || new Date(weekly.resetsAt) <= new Date());
+
+    if (!sessionNeedsTime && !weeklyNeedsTime) {
+      return { cookieExpired: false }; // Both windows already have valid reset times.
+    }
+
+    try {
+      const result = await fetchOllamaResetTimes(cookie);
+      this.lastScraperResult = result;
+      this.lastScraperTime = Date.now();
+
+      if (result.status === 'ok') {
+        // Populate session reset time. windowStart resets to "now" only when
+        // resetsAt actually changed (previous window ended, a new one
+        // started) -- otherwise keep the first-seen start for this window.
+        if (session && result.session) {
+          if (this.sessionResetsAt !== result.session || !this.sessionWindowStart) {
+            this.sessionWindowStart = new Date().toISOString();
+          }
+          session.resetsAt = result.session;
+          session.windowStart = this.sessionWindowStart;
+          session.windowEnd = result.session;
+          this.sessionResetsAt = result.session;
+        }
+        // Same for weekly.
+        if (weekly && result.weekly) {
+          if (this.weeklyResetsAt !== result.weekly || !this.weeklyWindowStart) {
+            this.weeklyWindowStart = new Date().toISOString();
+          }
+          weekly.resetsAt = result.weekly;
+          weekly.windowStart = this.weeklyWindowStart;
+          weekly.windowEnd = result.weekly;
+          this.weeklyResetsAt = result.weekly;
+        }
+        return { cookieExpired: false };
+      } else if (result.status === 'cookie-expired') {
+        // Surface distinctly so the UI can prompt for a fresh cookie rather
+        // than silently showing a dead/missing countdown forever.
+        logger.main.warn('[OllamaUsageService] Ollama session cookie expired (redirect detected)');
+        return { cookieExpired: true };
+      } else {
+        logger.main.warn(`[OllamaUsageService] Failed to fetch reset times: ${result.error}`);
+        return { cookieExpired: false };
+      }
+    } catch (error) {
+      logger.main.error('[OllamaUsageService] Unexpected error fetching reset times:', error);
+      return { cookieExpired: false };
     }
   }
 }

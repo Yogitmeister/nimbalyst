@@ -25,6 +25,8 @@ export interface OllamaUsageModelBreakdown {
 export interface OllamaUsageWindow {
   utilization: number; // 0-100 percentage
   resetsAt: string | null;
+  windowStart: string | null;
+  windowEnd: string | null;
   models: OllamaUsageModelBreakdown[];
 }
 
@@ -45,6 +47,8 @@ export interface OllamaUsageData {
   planTiers: OllamaUsagePlanTier[];
   lastUpdated: number;
   error?: string;
+  /** True when the stored session cookie was rejected on the last scrape -- prompt for a fresh one. */
+  cookieExpired?: boolean;
 }
 
 export const ollamaUsageAtom = atom<OllamaUsageData | null>(null);
