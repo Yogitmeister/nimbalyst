@@ -9,6 +9,7 @@ import {
   shouldApplyTaskUpdatedStatus,
   isNotificationFlushResult,
   shouldArmGraceTimerForResult,
+  shouldYieldCompleteForResult,
   shouldContinueWithTaskResults,
   buildTaskResultContinuationMessage,
 } from '../subagentDrain';
@@ -188,6 +189,32 @@ describe('shouldArmGraceTimerForResult', () => {
   it('never arms on a non-result chunk', () => {
     expect(shouldArmGraceTimerForResult({ type: 'assistant' }, true, false)).toBe(false);
     expect(shouldArmGraceTimerForResult({ type: 'user' }, false, false)).toBe(false);
+  });
+});
+
+describe('shouldYieldCompleteForResult', () => {
+  // Regression: NIM-597. Reported live by Yogev: "the button is blue as if
+  // you're not working and I can send a prompt. It should be red like you're
+  // working." Root cause: a multi-result turn (compaction, etc.) sends a
+  // `result` chunk that is not reliably the last chunk of the turn, but the
+  // provider used to yield `complete` (session -> "ready") on the FIRST result
+  // unconditionally, before the SDK had actually finished streaming.
+  it('does not yield complete on a result chunk once compaction was observed this turn', () => {
+    expect(shouldYieldCompleteForResult({ type: 'result' }, false, true)).toBe(false);
+  });
+
+  it('yields complete on the first result of an uncompacted turn (unchanged common case)', () => {
+    expect(shouldYieldCompleteForResult({ type: 'result' }, false, false)).toBe(true);
+  });
+
+  it('never yields complete twice for the same turn, compacted or not', () => {
+    expect(shouldYieldCompleteForResult({ type: 'result' }, true, false)).toBe(false);
+    expect(shouldYieldCompleteForResult({ type: 'result' }, true, true)).toBe(false);
+  });
+
+  it('never yields complete on a non-result chunk', () => {
+    expect(shouldYieldCompleteForResult({ type: 'assistant' }, false, false)).toBe(false);
+    expect(shouldYieldCompleteForResult({ type: 'system' }, false, true)).toBe(false);
   });
 });
 

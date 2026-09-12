@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- A session no longer shows ready and accepts a new prompt while the agent is still streaming after a mid-turn compaction.
 - Queued chat messages now continue through a replacement project window after the original window reloads or closes.
 - Windows and Linux get the File/Edit/View menus back, now drawn in the project window's title bar.
 - Structured agent prompts now retain their actionable state until exactly one answer settles and reliably resume their waiting session.
