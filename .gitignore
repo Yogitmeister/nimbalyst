@@ -16,6 +16,12 @@ out/
 out2/
 release/
 packages/electron/release/
+# Suffixed variants of the above (e.g. release-nim405-local/, release-v12-final-20260722-1552/) --
+# local one-off Electron build-output dirs that don't match the bare `release/` name but are the
+# exact same disposable build-output shape. Confirmed twice (2026-08-11 workspace WIP cleanup):
+# both hit GitHub's 100MB file-size limit when accidentally swept into a backup/dirty-snapshot
+# commit, because this pattern didn't cover their name.
+packages/electron/release-*/
 # Not a build output: the Android release source set holds the inert
 # screenshot-mode stubs, and assembleRelease fails without them.
 !packages/android/app/src/release/
