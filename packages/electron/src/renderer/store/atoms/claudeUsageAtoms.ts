@@ -17,11 +17,28 @@ export type ClaudeUsageSeverity = 'normal' | 'warning' | 'critical';
 /**
  * A weekly limit scoped to one model (e.g. "Fable", "Opus"), mirrored from
  * ClaudeUsageService. Sent over IPC alongside the account-wide windows.
+ *
+ * `utilization: null` means the API sent no usable percentage — render it as
+ * unknown, never as 0%, which would hide a limit that may already be full.
  */
-export interface ClaudeScopedLimit extends ClaudeUsageWindow {
+export interface ClaudeScopedLimit {
   id: string;
   label: string;
+  utilization: number | null;
+  resetsAt: string | null;
   severity: ClaudeUsageSeverity;
+  isActive: boolean;
+}
+
+/**
+ * Whether a scoped limit earns a row in the panel. Shared so the popover and
+ * any other consumer of these limits agree on one rule.
+ *
+ * A 0% limit is noise, but "unknown" and "the API says this one is limiting you
+ * right now" are exactly the cases the user opened the panel to see.
+ */
+export function shouldDisplayScopedLimit(limit: ClaudeScopedLimit): boolean {
+  return limit.utilization === null || limit.isActive || limit.utilization > 0;
 }
 
 export interface ClaudeUsageData {

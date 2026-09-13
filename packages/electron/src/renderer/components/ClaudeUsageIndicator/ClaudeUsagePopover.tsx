@@ -14,6 +14,7 @@ import {
   claudeUsageSessionColorAtom,
   claudeUsageWeeklyColorAtom,
   formatResetTime,
+  shouldDisplayScopedLimit,
   type ClaudeUsageSeverity,
 } from '../../store/atoms/claudeUsageAtoms';
 import { toggleGutterItemHiddenAtom } from '../../store/atoms/appSettings';
@@ -35,7 +36,8 @@ const SEVERITY_COLORS: Record<ClaudeUsageSeverity, 'green' | 'yellow' | 'red'> =
 interface UsageSectionProps {
   title: string;
   subtitle: string;
-  utilization: number;
+  /** `null` renders as "—" (unknown), which is not the same as 0%. */
+  utilization: number | null;
   resetsAt: string | null;
   color: 'green' | 'yellow' | 'red' | 'muted';
   windowDurationMs: number; // Duration of the window in milliseconds
@@ -75,7 +77,10 @@ const UsageSection: React.FC<UsageSectionProps> = ({
 
   const colors = colorClasses[color] || colorClasses.muted;
   const timeElapsedPercent = calculateTimeElapsedPercent(resetsAt, windowDurationMs);
-  const isOverPacing = utilization > timeElapsedPercent;
+  // A limit whose percentage the API did not send still gets a row — it may be
+  // the one that is full. It just cannot claim a number or a pace verdict.
+  const isUnknown = utilization === null;
+  const isOverPacing = !isUnknown && utilization > timeElapsedPercent;
 
   return (
     <div className="mb-4 last:mb-0">
@@ -84,15 +89,18 @@ const UsageSection: React.FC<UsageSectionProps> = ({
           <div className="text-[13px] font-semibold text-nim">{title}</div>
           <div className="text-[11px] text-nim-muted">{subtitle}</div>
         </div>
-        <div className={`text-[16px] font-semibold ${colors.text}`}>
-          {Math.round(utilization)}%
+        <div
+          className={`text-[16px] font-semibold ${colors.text}`}
+          title={isUnknown ? 'The usage API did not report a percentage for this limit' : undefined}
+        >
+          {isUnknown ? '—' : `${Math.round(utilization)}%`}
         </div>
       </div>
       <div className="relative h-1.5 bg-nim-tertiary rounded-full overflow-hidden mb-1.5">
         {/* Usage fill bar */}
         <div
           className={`h-full rounded-full transition-all duration-300 ${colors.bar}`}
-          style={{ width: `${Math.min(utilization, 100)}%` }}
+          style={{ width: isUnknown ? '0%' : `${Math.min(utilization, 100)}%` }}
         />
         {/* Pace marker - vertical line showing where you "should be" based on time elapsed */}
         <div
@@ -203,12 +211,12 @@ export const ClaudeUsagePopover: React.FC<ClaudeUsagePopoverProps> = ({
                 windowDurationMs={7 * 24 * 60 * 60 * 1000} // 7 days
               />
               {(usage.scopedLimits ?? [])
-                .filter((limit) => limit.utilization > 0)
+                .filter(shouldDisplayScopedLimit)
                 .map((limit) => (
                   <UsageSection
                     key={limit.id}
                     title={`${limit.label} (Weekly)`}
-                    subtitle="7-day window"
+                    subtitle={limit.isActive ? '7-day window · limiting you now' : '7-day window'}
                     utilization={limit.utilization}
                     resetsAt={limit.resetsAt}
                     color={SEVERITY_COLORS[limit.severity] ?? 'muted'}

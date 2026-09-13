@@ -38,10 +38,12 @@ import {
 import { logger } from '../utils/logger';
 import { getShellEnvironment } from './shellEnvironment';
 import { ClaudeSettingsManager } from './ClaudeSettingsManager';
-import { extractScopedLimits, type ClaudeScopedLimit } from './claudeUsageLimits';
+import { parseScopedLimits, type ClaudeScopedLimit } from './claudeUsageLimits';
 
+// Types only. Re-exporting the parser itself would hand callers a path back
+// into this module's electron/runtime import graph, which is the entire reason
+// the parser lives in its own dependency-free file.
 export type { ClaudeUsageSeverity, ClaudeScopedLimit } from './claudeUsageLimits';
-export { extractScopedLimits } from './claudeUsageLimits';
 
 /** Env shape the Claude config-dir resolvers read. */
 type ClaudeEnv = Record<string, string | undefined>;
@@ -188,6 +190,24 @@ class ClaudeUsageServiceImpl {
       this.broadcastUpdate();
       return errorData;
     }
+  }
+
+  /**
+   * Parse the per-model limits, reporting anything the parser could not label.
+   *
+   * The bug this panel fixes was a limit rendering as nothing at all, so a
+   * scoped entry we cannot turn into a bar gets a log line rather than a silent
+   * drop — otherwise the next payload change reproduces it invisibly.
+   */
+  private readScopedLimits(data: unknown): ClaudeScopedLimit[] {
+    const { limits, discarded } = parseScopedLimits(data);
+    if (discarded.length > 0) {
+      logger.main.warn(
+        `[ClaudeUsageService] ${discarded.length} scoped usage limit(s) had no model name and ` +
+        `were not shown: ${JSON.stringify(discarded)}`
+      );
+    }
+    return limits;
   }
 
   /**
@@ -407,7 +427,7 @@ class ClaudeUsageServiceImpl {
             utilization: data.seven_day_opus.utilization ?? 0,
             resetsAt: data.seven_day_opus.resets_at ?? null,
           } : undefined,
-          scopedLimits: extractScopedLimits(data),
+          scopedLimits: this.readScopedLimits(data),
           lastUpdated: Date.now(),
         };
       } catch (error) {
