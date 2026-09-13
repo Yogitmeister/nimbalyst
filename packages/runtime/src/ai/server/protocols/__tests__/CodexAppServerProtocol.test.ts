@@ -7,6 +7,7 @@ import {setCodexShellTrackingHost} from '../codexAppServer/shellTracking';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import path from 'node:path';
 import { PassThrough } from 'node:stream';
 
 // IMPORTANT: mock `node:child_process` BEFORE importing the protocol so the
@@ -464,7 +465,7 @@ describe('CodexAppServerProtocol', () => {
 
     const rootsReq = await nextWrittenMatching(child, 'skills/extraRoots/set');
     expect(rootsReq.params).toEqual({
-      extraRoots: ['/tmp/ws/.agents/skills/.nimbalyst-generated'],
+      extraRoots: [path.join('/tmp/ws', '.agents', 'skills', '.nimbalyst-generated')],
     });
     child.emitLine({ id: rootsReq.id, result: {} });
 
