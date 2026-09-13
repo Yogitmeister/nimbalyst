@@ -49,6 +49,7 @@ import type {
 } from './types';
 import { filterSessionsForPersonalSync } from './types';
 import type { SyncedReadReceipt } from '../readReceipts/readReceipts';
+import { asPersonalMemberId, type PersonalJwt, type PersonalMemberId } from '../auth/jwtScopes';
 
 // ============================================================================
 // CollabV3 Protocol Types (matches server)
@@ -392,7 +393,7 @@ type ServerMessage =
 // ============================================================================
 
 interface JwtClaims {
-  sub: string;
+  sub: PersonalMemberId;
   /** Stytch B2B organization_id claim. Personal-scoped JWTs carry the personal orgId; team-scoped JWTs carry the team orgId. */
   organization_id?: string;
 }
@@ -401,7 +402,7 @@ interface JwtClaims {
  * Decode a JWT's payload claims. Does not verify the signature -- the server does that.
  * The JWT is a base64url encoded string in the format: header.payload.signature
  */
-function decodeJwtClaims(jwt: string): JwtClaims {
+function decodeJwtClaims(jwt: PersonalJwt): JwtClaims {
   try {
     const parts = jwt.split('.');
     if (parts.length !== 3) {
@@ -419,7 +420,7 @@ function decodeJwtClaims(jwt: string): JwtClaims {
       throw new Error('JWT missing sub claim');
     }
 
-    return { sub: parsed.sub, organization_id: parsed.organization_id };
+    return { sub: asPersonalMemberId(parsed.sub), organization_id: parsed.organization_id };
   } catch (error) {
     console.error('[CollabV3] Failed to decode JWT:', error);
     throw new Error('Invalid JWT: cannot decode claims');
@@ -969,29 +970,29 @@ interface CachedSessionIndex {
 export function createCollabV3Sync(config: SyncConfig): SyncProvider {
   // We need to get the initial JWT synchronously for setup, but will refresh before each connection
   // The getJwt function is called before each WebSocket connection to ensure fresh JWT
-  let currentJwt: string | null = null;
-  let currentUserId: string | null = null;
+  let currentJwt: PersonalJwt | null = null;
+  let currentUserId: PersonalMemberId | null = null;
 
   // Helper to get fresh JWT and extract user ID.
-  // Uses config.userId as the authoritative room routing ID.
-  // The JWT sub claim is validated against config.userId -- if they differ,
+  // Uses config.personalMemberId as the authoritative room routing ID.
+  // The JWT sub claim is validated against config.personalMemberId -- if they differ,
   // the JWT is from a different org (e.g., team) and the caller's getJwt()
   // should be returning a personal-org-scoped JWT. Log a warning so the
   // mismatch is visible but still use config.userId for routing to ensure
   // desktop and mobile always connect to the same index room.
-  async function ensureFreshJwt(): Promise<{ jwt: string; userId: string }> {
+  async function ensureFreshJwt(): Promise<{ jwt: PersonalJwt; userId: PersonalMemberId }> {
     const jwt = await config.getJwt();
     const claims = decodeJwtClaims(jwt);
     const jwtUserId = claims.sub;
     currentJwt = jwt;
 
-    // Use config.userId (personalUserId from SyncManager) as the canonical
+    // Use config.personalMemberId as the canonical
     // room routing ID. This must match iOS which also uses the personal
     // member ID. If the JWT sub doesn't match, the server WILL reject the
     // WebSocket auth (it validates JWT sub === room URL userId) -- but
     // routing to the wrong room is worse because it silently breaks
     // cross-device sync (prompts, drafts, etc.).
-    if (config.userId && jwtUserId !== config.userId) {
+    if (jwtUserId !== config.personalMemberId) {
       const jwtIsTeamScoped =
         !!claims.organization_id && !!config.orgId && claims.organization_id !== config.orgId;
       // Rate-limit: this used to log every 2s forever once the loop kicked in.
@@ -1003,7 +1004,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           {
             jwtSub: jwtUserId,
             jwtOrgId: claims.organization_id ?? null,
-            configUserId: config.userId, // personalUserId from SyncManager
+            configUserId: config.personalMemberId,
             configOrgId: config.orgId,   // personalOrgId from SyncManager
             likelyCause: jwtIsTeamScoped
               ? 'JWT is team-scoped (organization_id differs from personal orgId). getJwt() should return a personal-org-scoped JWT -- check StytchAuthService.refreshPersonalSession / getPersonalSessionJwt.'
@@ -1018,7 +1019,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       (err as any).code = 'AUTH_MISMATCH';
       throw err;
     }
-    currentUserId = config.userId || jwtUserId;
+    currentUserId = config.personalMemberId;
     return { jwt, userId: currentUserId };
   }
 
@@ -1026,10 +1027,10 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     return !!err && typeof err === 'object' && (err as any).code === 'AUTH_MISMATCH';
   }
 
-  // Get user ID synchronously if we have a cached JWT, otherwise use config.userId
-  function getUserId(): string {
+  // Get user ID synchronously if we have a cached JWT, otherwise use the personal routing identity.
+  function getUserId(): PersonalMemberId {
     if (currentUserId) return currentUserId;
-    if (config.userId) return config.userId;
+    return config.personalMemberId;
     throw new Error('JWT not initialized - call ensureFreshJwt first');
   }
 
@@ -1503,7 +1504,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     }
   }
 
-  function buildRoomId(userId: string, suffix: string): string {
+  function buildRoomId(userId: PersonalMemberId, suffix: string): string {
     return `org:${config.orgId}:user:${userId}:${suffix}`;
   }
 
@@ -1895,7 +1896,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
     // Get fresh JWT before connecting. Throws AUTH_MISMATCH if the JWT cannot
     // succeed against the configured room (caught below to set indexAuthBlocked).
-    let jwt: string;
+    let jwt: PersonalJwt;
     try {
       ({ jwt } = await ensureFreshJwt());
     } catch (err) {
@@ -3173,7 +3174,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       // covers the case where the per-session connect() is the first
       // sync call in the process and connectToIndex() hasn't latched
       // yet).
-      let jwt: string;
+      let jwt: PersonalJwt;
       try {
         ({ jwt } = await ensureFreshJwt());
       } catch (err) {

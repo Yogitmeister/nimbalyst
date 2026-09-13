@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { asPersonalJwt, asPersonalMemberId } from '../../auth/jwtScopes';
 import { createCollabV3Sync } from '../CollabV3Sync';
 
 class FakeWebSocket {
@@ -40,8 +41,9 @@ describe('CollabV3 queued prompt truth', () => {
   it('round-trips queue provenance and terminal truth through encrypted sync', async () => {
     const encryptionKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
     const sender = createCollabV3Sync({
-      serverUrl: 'wss://sync.example.test', orgId: 'org-1', userId: 'sender',
-      getJwt: async () => jwtFor('sender'), encryptionKey,
+      serverUrl: 'wss://sync.example.test', orgId: 'org-1',
+      personalMemberId: asPersonalMemberId('sender'),
+      getJwt: async () => asPersonalJwt(jwtFor('sender')), encryptionKey,
     });
     await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
     const senderIndex = FakeWebSocket.instances[0];
@@ -67,8 +69,9 @@ describe('CollabV3 queued prompt truth', () => {
     const encryptedQueuedPrompts = latestIndexUpdate(senderIndex).session.encryptedQueuedPrompts;
 
     const receiver = createCollabV3Sync({
-      serverUrl: 'wss://sync.example.test', orgId: 'org-1', userId: 'receiver',
-      getJwt: async () => jwtFor('receiver'), encryptionKey,
+      serverUrl: 'wss://sync.example.test', orgId: 'org-1',
+      personalMemberId: asPersonalMemberId('receiver'),
+      getJwt: async () => asPersonalJwt(jwtFor('receiver')), encryptionKey,
     });
     await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
     FakeWebSocket.instances[1].open();
