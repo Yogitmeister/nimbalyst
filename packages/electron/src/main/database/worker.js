@@ -1922,6 +1922,120 @@ class PGLiteWorker {
       throw error;
     }
 
+    // Durable host-control receipt/outbox foundation. It is intentionally
+    // separate from queued prompts: native effects are never replayed by a
+    // prompt-delivery retry.
+    try {
+      await this.db.exec(`
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS interrupt_lease_expires_at TIMESTAMPTZ;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS interrupt_operation_id TEXT;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS interrupt_fence INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS interrupt_application_state TEXT NOT NULL DEFAULT 'not_started'
+          CHECK (interrupt_application_state IN ('not_started', 'unknown', 'not_applied', 'applied', 'legacy_unknown'));
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS interrupt_started_at TIMESTAMPTZ;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS interrupt_applied_at TIMESTAMPTZ;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS interrupt_application_receipt JSONB;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS interrupt_cleanup_state TEXT NOT NULL DEFAULT 'pending'
+          CHECK (interrupt_cleanup_state IN ('pending', 'claimed', 'complete'));
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS interrupt_cleanup_fence INTEGER NOT NULL DEFAULT 0;
+
+        UPDATE queued_prompts
+        SET interrupt_operation_id = COALESCE(
+              interrupt_operation_id,
+              'legacy-interrupt:' || id || ':' || COALESCE(interrupt_target_generation, 'missing')
+            ),
+            interrupt_reservation_owner = COALESCE(interrupt_reservation_owner, 'legacy-orphan'),
+            interrupt_lease_expires_at = COALESCE(interrupt_lease_expires_at, TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+            interrupt_application_state = 'legacy_unknown'
+        WHERE interrupt_target_generation IS NOT NULL
+          AND interrupt_receipt IS NULL
+          AND interrupt_operation_id IS NULL
+          AND interrupt_reservation_owner IS NULL
+          AND interrupt_lease_expires_at IS NULL
+          AND interrupt_fence = 0
+          AND interrupt_application_state = 'not_started';
+
+        UPDATE queued_prompts
+        SET interrupt_operation_id = COALESCE(
+              interrupt_operation_id,
+              'legacy-interrupt:' || id || ':' || COALESCE(interrupt_target_generation, 'missing')
+            )
+        WHERE interrupt_receipt IS NOT NULL
+          AND interrupt_operation_id IS NULL;
+
+        CREATE TABLE IF NOT EXISTS host_control_receipts (
+          id TEXT PRIMARY KEY,
+          reservation_key TEXT NOT NULL UNIQUE,
+          request_digest TEXT NOT NULL,
+          operation TEXT NOT NULL CHECK (operation = 'inject_attention_reply'),
+          session_id TEXT NOT NULL,
+          event_identity TEXT NOT NULL,
+          attention_generation TEXT,
+          state TEXT NOT NULL CHECK (state IN ('reserved', 'injected', 'already_resolved', 'failed')),
+          reservation_owner TEXT,
+          lease_expires_at TIMESTAMPTZ,
+          mutation_id TEXT,
+          mutation_fence INTEGER NOT NULL DEFAULT 0,
+          mutation_state TEXT NOT NULL DEFAULT 'not_started'
+            CHECK (mutation_state IN ('not_started', 'unknown', 'not_applied', 'applied', 'legacy_unknown')),
+          mutation_started_at TIMESTAMPTZ,
+          mutation_applied_at TIMESTAMPTZ,
+          mutation_receipt JSONB,
+          cleanup_prompt_state TEXT NOT NULL DEFAULT 'pending'
+            CHECK (cleanup_prompt_state IN ('pending', 'claimed', 'complete')),
+          cleanup_prompt_fence INTEGER NOT NULL DEFAULT 0,
+          cleanup_attention_state TEXT NOT NULL DEFAULT 'pending'
+            CHECK (cleanup_attention_state IN ('pending', 'claimed', 'complete')),
+          cleanup_attention_fence INTEGER NOT NULL DEFAULT 0,
+          cleanup_attention_result TEXT
+            CHECK (cleanup_attention_result IN ('settled', 'already_absent')),
+          cleanup_terminal_state TEXT NOT NULL DEFAULT 'pending'
+            CHECK (cleanup_terminal_state IN ('pending', 'claimed', 'complete')),
+          cleanup_terminal_fence INTEGER NOT NULL DEFAULT 0,
+          receipt JSONB,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_host_control_receipts_session
+          ON host_control_receipts(session_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS native_winner_outbox (
+          id TEXT PRIMARY KEY,
+          reservation_key TEXT NOT NULL UNIQUE,
+          session_id TEXT NOT NULL,
+          event_identity TEXT NOT NULL,
+          attention_generation TEXT,
+          state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'sent')),
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          receipt JSONB,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          last_attempt_at TIMESTAMPTZ,
+          sent_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_native_winner_outbox_pending
+          ON native_winner_outbox(created_at, id) WHERE state = 'pending';
+
+        CREATE TABLE IF NOT EXISTS host_control_store_identity (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          store_id TEXT NOT NULL UNIQUE,
+          authority_root TEXT NOT NULL
+        );
+      `);
+      const fs = require('fs');
+      const { randomUUID } = require('crypto');
+      const canonicalDataDir = fs.realpathSync.native(this.dataDir);
+      await this.db.query(
+        `INSERT INTO host_control_store_identity (singleton, store_id, authority_root)
+         VALUES (1, $1, $2)
+         ON CONFLICT (singleton) DO NOTHING`,
+        [randomUUID(), `${canonicalDataDir}.host-control-authority-v3`],
+      );
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create host control foundation:', error);
+      throw error;
+    }
+
     // Session Wakeups table - scheduled re-invocations of an AI session
     // Persists across app restarts; scheduler in main process arms a single setTimeout
     console.log('[PGLite Worker] Creating ai_session_wakeups table...');

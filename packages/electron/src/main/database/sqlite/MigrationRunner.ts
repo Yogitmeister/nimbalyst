@@ -16,6 +16,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
 import type { Database as SqliteDatabase } from 'better-sqlite3';
 
 export interface Migration {
@@ -30,6 +31,23 @@ export interface Migration {
 export interface MigrationResult {
   applied: number[];
   skipped: number[];
+}
+
+function ensureHostControlStoreIdentity(db: SqliteDatabase, schemaDir: string): void {
+  const exists = db.prepare(
+    `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'host_control_store_identity'`,
+  ).get();
+  if (!exists) return;
+  const storeId = randomUUID();
+  const databaseName = (db as SqliteDatabase & { name?: string }).name;
+  const authorityRoot = databaseName && databaseName !== ':memory:'
+    ? `${fs.realpathSync.native(databaseName)}.host-control-authority-v3`
+    : path.join(path.resolve(schemaDir), `.host-control-memory-${storeId}`);
+  db.prepare(
+    `INSERT INTO host_control_store_identity (singleton, store_id, authority_root)
+     VALUES (1, ?, ?)
+     ON CONFLICT(singleton) DO NOTHING`,
+  ).run(storeId, authorityRoot);
 }
 
 /**
@@ -200,6 +218,14 @@ export function getMigrations(schemaDir: string): Migration[] {
       version: 32,
       name: 'queued_prompt_truth_provenance',
       sqlFile: path.join(schemaDir, '0032_queued_prompt_truth_provenance.sql'),
+    },
+    {
+      version: 43,
+      name: 'host_control_schema_foundation',
+      run: (db) => {
+        db.exec(fs.readFileSync(path.join(schemaDir, '0043_host_control_schema_foundation.sql'), 'utf-8'));
+        ensureHostControlStoreIdentity(db, schemaDir);
+      },
     },
   ];
 }
