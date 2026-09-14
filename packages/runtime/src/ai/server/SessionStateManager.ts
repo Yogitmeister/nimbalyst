@@ -13,6 +13,7 @@ import {
   SessionStateListener,
   StartSessionOptions,
   UpdateActivityOptions,
+  EndSessionOptions,
 } from './types/SessionState';
 
 const STALE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes (as specified in requirements)
@@ -22,10 +23,28 @@ interface DatabaseWorker {
   query<T = any>(sql: string, params?: any[]): Promise<{ rows: T[] }>;
 }
 
+/**
+ * Preserves the generation installed by startSession when a listener rejects.
+ * Callers can use it for exact-turn cleanup without reading mutable current state.
+ */
+export class SessionStartError extends Error {
+  readonly attentionGeneration: string;
+  readonly cause: unknown;
+
+  constructor(attentionGeneration: string, cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = 'SessionStartError';
+    this.attentionGeneration = attentionGeneration;
+    this.cause = cause;
+  }
+}
+
 export class SessionStateManager extends EventEmitter {
   private activeSessions: Map<string, SessionState> = new Map();
   private database: DatabaseWorker | null = null;
   private activityUpdateTimers: Map<string, NodeJS.Timeout> = new Map();
+  private attentionGenerationCounter = 0;
+  private databaseUpdateTails: Map<string, Promise<void>> = new Map();
 
   constructor() {
     super();
@@ -69,8 +88,9 @@ export class SessionStateManager extends EventEmitter {
   /**
    * Start tracking a session
    */
-  async startSession(options: StartSessionOptions): Promise<void> {
+  async startSession(options: StartSessionOptions): Promise<string> {
     const { sessionId, workspacePath, initialStatus = 'running' } = options;
+    const attentionGeneration = options.attentionGeneration ?? this.createAttentionGeneration(sessionId);
 
     const state: SessionState = {
       sessionId,
@@ -78,27 +98,32 @@ export class SessionStateManager extends EventEmitter {
       status: initialStatus,
       lastActivity: new Date(),
       isStreaming: false,
+      attentionGeneration,
     };
 
     this.activeSessions.set(sessionId, state);
 
-    // Update database
-    await this.updateDatabase(sessionId, initialStatus);
-
-    // Emit event
-    this.emitEvent({
-      type: 'session:started',
-      sessionId,
-      workspacePath: state.workspacePath,
-      timestamp: new Date(),
-    });
+    try {
+      await this.updateDatabase(sessionId, initialStatus, true);
+      if (this.activeSessions.get(sessionId) !== state) return attentionGeneration;
+      this.emitEvent({
+        type: 'session:started',
+        sessionId,
+        workspacePath: state.workspacePath,
+        timestamp: new Date(),
+        attentionGeneration,
+      });
+    } catch (error) {
+      throw new SessionStartError(attentionGeneration, error);
+    }
+    return attentionGeneration;
   }
 
   /**
    * Update session activity
    */
   async updateActivity(options: UpdateActivityOptions): Promise<void> {
-    const { sessionId, status, isStreaming } = options;
+    const { sessionId, status, isStreaming, attentionGeneration: expectedGeneration } = options;
 
     const state = this.activeSessions.get(sessionId);
     if (!state) {
@@ -108,17 +133,20 @@ export class SessionStateManager extends EventEmitter {
       if (status !== undefined) {
         console.warn(`[SessionStateManager] Session ${sessionId} not in activeSessions, updating DB and emitting event directly`);
         await this.updateDatabase(sessionId, status);
+        const attentionGeneration = expectedGeneration ?? (status === 'running' ? this.createAttentionGeneration(sessionId) : undefined);
         const workspacePath = await this.getWorkspacePathForSession(sessionId) ?? undefined;
+        const current = this.activeSessions.get(sessionId);
+        if (current && current.attentionGeneration !== attentionGeneration) return;
         if (status === 'waiting_for_input') {
-          this.emitEvent({ type: 'session:waiting', sessionId, workspacePath, timestamp: new Date() });
+          this.emitEvent({ type: 'session:waiting', sessionId, workspacePath, timestamp: new Date(), attentionGeneration });
         } else if (status === 'error') {
-          this.emitEvent({ type: 'session:error', sessionId, workspacePath, error: 'Session error', timestamp: new Date() });
+          this.emitEvent({ type: 'session:error', sessionId, workspacePath, error: 'Session error', timestamp: new Date(), attentionGeneration });
         } else if (status === 'running') {
-          this.emitEvent({ type: isStreaming ? 'session:streaming' : 'session:started', sessionId, workspacePath, timestamp: new Date() });
+          this.emitEvent({ type: isStreaming ? 'session:streaming' : 'session:started', sessionId, workspacePath, timestamp: new Date(), attentionGeneration });
         } else if (status === 'idle') {
           // Turn boundary (e.g. claude-code-cli PID watcher): a terminal event so
           // the renderer clears the running indicator. session:activity would not.
-          this.emitEvent({ type: 'session:completed', sessionId, workspacePath, timestamp: new Date() });
+          this.emitEvent({ type: 'session:completed', sessionId, workspacePath, timestamp: new Date(), attentionGeneration });
         }
       } else {
         console.warn(`[SessionStateManager] Cannot update activity for unknown session: ${sessionId}`);
@@ -126,8 +154,19 @@ export class SessionStateManager extends EventEmitter {
       return;
     }
 
+    if (expectedGeneration && state.attentionGeneration !== expectedGeneration) {
+      return;
+    }
+
     // Update in-memory state
+    const previousStatus = state.status;
     state.lastActivity = new Date();
+    if (expectedGeneration) {
+      state.attentionGeneration = expectedGeneration;
+    } else if ((status === 'running' || status === 'waiting_for_input') && (previousStatus === 'idle' || previousStatus === 'error')) {
+      state.attentionGeneration = this.createAttentionGeneration(sessionId);
+    }
+    const attentionGeneration = state.attentionGeneration;
     if (status !== undefined) {
       state.status = status;
     }
@@ -147,7 +186,11 @@ export class SessionStateManager extends EventEmitter {
     // by a concurrent updateActivity call. If so, skip emitting this stale event.
     // This prevents a race where rapid waiting->running transitions (e.g. auto-approved
     // tool permissions) cause a late session:waiting to fire after session:streaming.
-    if (status !== undefined && state.status !== status) {
+    if (
+      this.activeSessions.get(sessionId) !== state
+      || (status !== undefined && state.status !== status)
+      || state.attentionGeneration !== attentionGeneration
+    ) {
       return;
     }
 
@@ -158,6 +201,7 @@ export class SessionStateManager extends EventEmitter {
         sessionId,
         workspacePath: state.workspacePath,
         timestamp: new Date(),
+        attentionGeneration,
       });
     } else if (status === 'waiting_for_input') {
       this.emitEvent({
@@ -165,6 +209,7 @@ export class SessionStateManager extends EventEmitter {
         sessionId,
         workspacePath: state.workspacePath,
         timestamp: new Date(),
+        attentionGeneration,
       });
     } else if (status === 'error') {
       this.emitEvent({
@@ -173,6 +218,7 @@ export class SessionStateManager extends EventEmitter {
         workspacePath: state.workspacePath,
         error: 'Session encountered an error',
         timestamp: new Date(),
+        attentionGeneration,
       });
     } else if (status === 'idle') {
       // An explicit idle status is a turn boundary (e.g. the claude-code-cli PID
@@ -185,6 +231,7 @@ export class SessionStateManager extends EventEmitter {
         sessionId,
         workspacePath: state.workspacePath,
         timestamp: new Date(),
+        attentionGeneration,
       });
     } else {
       this.emitEvent({
@@ -192,6 +239,7 @@ export class SessionStateManager extends EventEmitter {
         sessionId,
         workspacePath: state.workspacePath,
         timestamp: new Date(),
+        attentionGeneration,
       });
     }
   }
@@ -218,8 +266,9 @@ export class SessionStateManager extends EventEmitter {
    * meta-agent child's row may not be committed when its first tick fires, and
    * the tray keys liveness by session id alone.
    */
-  markTurnAlive(sessionId: string): void {
+  markTurnAlive(sessionId: string, attentionGeneration?: string): void {
     const state = this.activeSessions.get(sessionId);
+    if (attentionGeneration && state && state.attentionGeneration !== attentionGeneration) return;
     if (state) state.lastActivity = new Date();
 
     this.emitEvent({
@@ -227,14 +276,17 @@ export class SessionStateManager extends EventEmitter {
       sessionId,
       workspacePath: state?.workspacePath,
       timestamp: new Date(),
+      attentionGeneration: attentionGeneration ?? state?.attentionGeneration,
     });
   }
 
   /**
    * End a session (mark as idle)
    */
-  async endSession(sessionId: string): Promise<void> {
+  async endSession(sessionId: string, options: EndSessionOptions = {}): Promise<void> {
     const state = this.activeSessions.get(sessionId);
+    if (state && options.attentionGeneration && state.attentionGeneration !== options.attentionGeneration) return;
+    const attentionGeneration = options.attentionGeneration ?? state?.attentionGeneration;
     if (!state) {
       // Session not in memory (e.g., app restarted while session was running).
       // Still update the database to ensure it's not left as 'running',
@@ -242,13 +294,16 @@ export class SessionStateManager extends EventEmitter {
       // Without the event, the renderer thinks the session is still running and
       // queued prompts will never be triggered.
       const workspacePath = await this.getWorkspacePathForSession(sessionId);
+      if (this.activeSessions.has(sessionId)) return;
       console.warn(`[SessionStateManager] endSession called for session not in activeSessions: ${sessionId}, updating DB directly`);
       await this.updateDatabase(sessionId, 'idle');
+      if (this.activeSessions.has(sessionId)) return;
       this.emitEvent({
         type: 'session:completed',
         sessionId,
         workspacePath: workspacePath || undefined,
         timestamp: new Date(),
+        attentionGeneration,
       });
       return;
     }
@@ -266,20 +321,26 @@ export class SessionStateManager extends EventEmitter {
     // Update database
     await this.updateDatabase(sessionId, 'idle');
 
+    // A new generation may have started while the terminal write was pending.
+    if (this.activeSessions.has(sessionId)) return;
+
     // Emit event
     this.emitEvent({
       type: 'session:completed',
       sessionId,
       workspacePath: state.workspacePath,
       timestamp: new Date(),
+      attentionGeneration,
     });
   }
 
   /**
    * Mark a session as interrupted (for crashes or force stops)
    */
-  async interruptSession(sessionId: string): Promise<void> {
+  async interruptSession(sessionId: string, options: EndSessionOptions = {}): Promise<void> {
     const state = this.activeSessions.get(sessionId);
+    if (state && options.attentionGeneration && state.attentionGeneration !== options.attentionGeneration) return;
+    const attentionGeneration = options.attentionGeneration ?? state?.attentionGeneration;
     if (state) {
       this.activeSessions.delete(sessionId);
     }
@@ -287,12 +348,16 @@ export class SessionStateManager extends EventEmitter {
     // Update database -- interrupted is just idle (SDK process died)
     await this.updateDatabase(sessionId, 'idle');
 
+    // Do not emit a terminal event for a replacement installed during the write.
+    if (this.activeSessions.has(sessionId)) return;
+
     // Emit event (event type stays 'interrupted' for tray/UI to react to)
     this.emitEvent({
       type: 'session:interrupted',
       sessionId,
       workspacePath: state?.workspacePath,
       timestamp: new Date(),
+      attentionGeneration,
     });
   }
 
@@ -455,17 +520,24 @@ export class SessionStateManager extends EventEmitter {
    * should only change when messages are added to the session, so that session
    * history sorting accurately reflects when the last message was sent/received.
    */
-  private async updateDatabase(sessionId: string, status: SessionStatus): Promise<void> {
+  private async updateDatabase(
+    sessionId: string,
+    status: SessionStatus,
+    propagateError = false,
+  ): Promise<void> {
     if (!this.database) return;
 
-    try {
-      await this.database.query(
-        `UPDATE ai_sessions SET status = $1, last_activity = CURRENT_TIMESTAMP WHERE id = $2`,
-        [status, sessionId]
-      );
-    } catch (error) {
-      console.error(`[SessionStateManager] Failed to update database for session ${sessionId}:`, error);
-    }
+    await this.enqueueDatabaseUpdate(sessionId, async () => {
+      try {
+        await this.database!.query(
+          `UPDATE ai_sessions SET status = $1, last_activity = CURRENT_TIMESTAMP WHERE id = $2`,
+          [status, sessionId]
+        );
+      } catch (error) {
+        console.error(`[SessionStateManager] Failed to update database for session ${sessionId}:`, error);
+        if (propagateError) throw error;
+      }
+    });
   }
 
   /**
@@ -474,14 +546,29 @@ export class SessionStateManager extends EventEmitter {
   private async updateLastActivity(sessionId: string): Promise<void> {
     if (!this.database) return;
 
-    try {
-      await this.database.query(
-        `UPDATE ai_sessions SET last_activity = CURRENT_TIMESTAMP WHERE id = $1`,
-        [sessionId]
-      );
-    } catch (error) {
-      console.error(`[SessionStateManager] Failed to update last_activity for session ${sessionId}:`, error);
-    }
+    await this.enqueueDatabaseUpdate(sessionId, async () => {
+      try {
+        await this.database!.query(
+          `UPDATE ai_sessions SET last_activity = CURRENT_TIMESTAMP WHERE id = $1`,
+          [sessionId]
+        );
+      } catch (error) {
+        console.error(`[SessionStateManager] Failed to update last_activity for session ${sessionId}:`, error);
+      }
+    });
+  }
+
+  private async enqueueDatabaseUpdate(sessionId: string, update: () => Promise<void>): Promise<void> {
+    const prior = this.databaseUpdateTails.get(sessionId) ?? Promise.resolve();
+    const next = prior.catch(() => undefined).then(update);
+    const tail = next.then(() => undefined, () => undefined);
+    this.databaseUpdateTails.set(sessionId, tail);
+    void tail.then(() => {
+      if (this.databaseUpdateTails.get(sessionId) === tail) {
+        this.databaseUpdateTails.delete(sessionId);
+      }
+    });
+    await next;
   }
 
   /**
@@ -489,6 +576,11 @@ export class SessionStateManager extends EventEmitter {
    */
   private emitEvent(event: SessionStateEvent): void {
     this.emit(event.type, event);
+  }
+
+  private createAttentionGeneration(sessionId: string): string {
+    this.attentionGenerationCounter += 1;
+    return `${sessionId}:${Date.now().toString(36)}:${this.attentionGenerationCounter.toString(36)}`;
   }
 
   private async getWorkspacePathForSession(sessionId: string): Promise<string | null> {
