@@ -100,6 +100,11 @@ const state: SyncManagerState = {
   sessionKeepAliveInterval: null,
 };
 
+// Every initialization owns a monotonically increasing lease. A later
+// initialization or shutdown invalidates older asynchronous work before it can
+// replace the active provider, even when the caller is still awaiting it.
+let syncInitializationGeneration = 0;
+
 // Guard against overlapping incremental syncs (initial + triggered) and enforce minimum interval
 let incrementalSyncInFlight = false;
 let lastIncrementalSyncAt = 0;
@@ -335,8 +340,16 @@ function getDeviceInfo(personalMemberId: PersonalMemberId): DeviceInfo {
  * Initialize sync if configured.
  * Returns a wrapped session store if sync is enabled, or the original store if not.
  */
-export async function initializeSync(baseStore: SessionStore): Promise<SessionStore> {
+export async function initializeSync(
+  baseStore: SessionStore,
+  lifetimeStillCurrent: () => boolean = () => true,
+): Promise<SessionStore> {
+  const initializationGeneration = ++syncInitializationGeneration;
+  const isInitializationCurrent = () => (
+    initializationGeneration === syncInitializationGeneration && lifetimeStillCurrent()
+  );
   logger.main.info('[SyncManager] initializeSync called');
+  if (!isInitializationCurrent()) return baseStore;
 
   // Label every sync WebSocket connection with this client build so the server
   // can attribute connect/disconnect telemetry to a platform + version.
@@ -399,6 +412,7 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
     // (NIM-859). resolvePersonalUserId() falls back to the cached value when it
     // can't reach the server, so offline init is unchanged.
     let personalUserId = await resolvePersonalUserId(serverUrl);
+    if (!isInitializationCurrent()) return baseStore;
     if (!personalUserId) {
       personalUserId = getPersonalUserId();
     }
@@ -422,6 +436,7 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
     // CollabV3 uses the encryption key seed from CredentialService for E2E encryption
     // Use personalUserId for salt to ensure same encryption key across devices
     const encryptionKey = await deriveEncryptionKey(credentials.encryptionKeySeed, personalSyncEncryptionSalt(personalUserId));
+    if (!isInitializationCurrent()) return baseStore;
     state.encryptionKey = encryptionKey;
 
     connectionTime = Date.now(); // Reset connection time on init
@@ -594,6 +609,11 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
     // Create message sync handler
     const messageSyncHandler = createMessageSyncHandler(provider);
 
+    if (!isInitializationCurrent()) {
+      provider.disconnectAll();
+      return baseStore;
+    }
+
     // Keep the Stytch session token alive while sync is active.
     // The WebSocket only refreshes JWT on reconnect, so if it stays connected
     // for hours the session token can expire. This breaks HTTP endpoints
@@ -641,10 +661,15 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
     const syncedStore = createSyncedSessionStore(baseStore, provider, {
       autoConnect: true,
     });
+    if (!isInitializationCurrent()) {
+      provider.disconnectAll();
+      return baseStore;
+    }
 
     // Sync existing sessions and projects to index using delta sync
     // logger.main.info('[SyncManager] Setting up incremental sync...');
     setTimeout(async () => {
+      if (!isInitializationCurrent()) return;
       const syncStart = performance.now();
       // logger.main.info('[SyncManager] Starting initial incremental sync...');
       // Prevent triggered syncs from overlapping with the initial sync
@@ -846,6 +871,7 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
 
     // Sync current OpenAI API key to mobile (in case mobile connects after key was set)
     setTimeout(async () => {
+      if (!isInitializationCurrent()) return;
       try {
 
         // Always sync so the mobile model picker gets the available-models list
@@ -1008,6 +1034,7 @@ export function getPersonalDocSyncConfig(): {
  * Shutdown sync and disconnect all sessions.
  */
 export function shutdownSync(): void {
+  syncInitializationGeneration += 1;
   remoteSessions.setProvider(null);
   shutdownSleepPrevention();
 
@@ -1043,9 +1070,13 @@ export function shutdownSync(): void {
  * Reinitialize sync with new configuration.
  * Useful when settings change.
  */
-export async function reinitializeSync(baseStore: SessionStore): Promise<SessionStore> {
-  shutdownSync();
-  return initializeSync(baseStore);
+export async function reinitializeSync(
+  baseStore: SessionStore,
+  lifetimeStillCurrent: () => boolean = () => true,
+): Promise<SessionStore> {
+  await shutdownSync();
+  if (!lifetimeStillCurrent()) return baseStore;
+  return initializeSync(baseStore, lifetimeStillCurrent);
 }
 
 /**
