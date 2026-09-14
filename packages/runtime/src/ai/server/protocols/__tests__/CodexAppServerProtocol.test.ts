@@ -1079,10 +1079,12 @@ describe('CodexAppServerProtocol', () => {
     child.emitLine({ method: 'turn/completed', params: { threadId: 't-multi', turn: { id: 'turn-2', status: 'completed' } } });
     await collector2;
 
-    // Exactly one raw_event per notification on turn 2 (turn/started would be
-    // missing here -- we only sent agentMessage/delta + turn/completed).
+    // Two notifications plus the synchronous ownership receipt emitted from
+    // the turn/start response. The latter must remain singular across reused
+    // protocol sessions, otherwise a queued row could bind twice.
     const rawEvents2 = events2.filter((e) => e.type === 'raw_event');
-    expect(rawEvents2).toHaveLength(2);
+    expect(rawEvents2).toHaveLength(3);
+    expect(rawEvents2.filter((event) => event.metadata?.method === 'turn/started')).toHaveLength(1);
     const textEvents2 = events2.filter((e) => e.type === 'text');
     expect(textEvents2).toHaveLength(1);
     expect(textEvents2[0].content).toBe('two');
@@ -1092,6 +1094,37 @@ describe('CodexAppServerProtocol', () => {
     // Spawn count must still be 1: no extra child for the second turn.
     expect(spawnMock).toHaveBeenCalledTimes(1);
 
+    protocol.cleanupSession(session);
+  });
+
+  it('interrupts only the exact active turn after a schema-correct thread read', async () => {
+    const protocol = new CodexAppServerProtocol();
+    const sessionPromise = protocol.createSession({ workspacePath: '/tmp/ws' });
+    const initReq = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: initReq.id, result: { codexHome: '/fake', platformFamily: 'unix', platformOs: 'macos', userAgent: 'fake/0' } });
+    const startReq = await nextWrittenMatching(child, 'thread/start');
+    child.emitLine({ id: startReq.id, result: { thread: { id: 'thread-owned' } } });
+    const session = await sessionPromise;
+    child.writtenLines.length = 0;
+
+    const interrupted = protocol.interruptTurn(session, {
+      threadId: 'thread-owned', turnId: 'turn-owned',
+    });
+    const readReq = await nextWrittenMatching(child, 'thread/read');
+    expect(readReq.params).toEqual({ threadId: 'thread-owned', includeTurns: true });
+    child.emitLine({
+      id: readReq.id,
+      result: { thread: { id: 'thread-owned', turns: [{ id: 'turn-owned', status: 'inProgress' }] } },
+    });
+
+    await expect(interrupted).resolves.toBe(true);
+    expect(child.writtenLines).toContainEqual(expect.objectContaining({
+      method: 'turn/interrupt',
+      params: { threadId: 'thread-owned', turnId: 'turn-owned' },
+    }));
+    await expect(protocol.interruptTurn(session, {
+      threadId: 'thread-replacement', turnId: 'turn-owned',
+    })).resolves.toBe(false);
     protocol.cleanupSession(session);
   });
 

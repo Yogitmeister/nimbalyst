@@ -84,14 +84,8 @@ export function selectStalePendingPromptSessions(params: {
 }
 
 export interface PendingPromptTerminalClearDeps {
-  /**
-   * Read the current persisted `hasPendingPrompt` bit for a session. Returns
-   * `null` when the value can't be determined (e.g. the row is gone); in that
-   * case we do nothing rather than churn a write.
-   */
-  readHasPendingPrompt: (sessionId: string) => Promise<boolean | null>;
-  /** Clear the persisted bit (DB write + mobile sync push). */
-  clearPendingPrompt: (sessionId: string) => Promise<void>;
+  /** Atomically clear only the exact generation named by the terminal event. */
+  clearPendingPrompt: (sessionId: string, attentionGeneration: string) => Promise<boolean>;
   onError?: (err: unknown) => void;
 }
 
@@ -102,15 +96,12 @@ export interface PendingPromptTerminalClearDeps {
  * completion. Returns true when a clear was performed.
  */
 export async function clearStalePendingPromptOnTerminal(
-  event: { type: string; sessionId: string },
+  event: { type: string; sessionId: string; attentionGeneration?: string },
   deps: PendingPromptTerminalClearDeps,
 ): Promise<boolean> {
-  if (!isTerminalSessionEvent(event.type) || !event.sessionId) return false;
+  if (!isTerminalSessionEvent(event.type) || !event.sessionId || !event.attentionGeneration) return false;
   try {
-    const current = await deps.readHasPendingPrompt(event.sessionId);
-    if (current !== true) return false;
-    await deps.clearPendingPrompt(event.sessionId);
-    return true;
+    return await deps.clearPendingPrompt(event.sessionId, event.attentionGeneration);
   } catch (err) {
     deps.onError?.(err);
     return false;

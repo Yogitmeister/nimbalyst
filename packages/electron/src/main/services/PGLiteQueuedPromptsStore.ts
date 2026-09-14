@@ -88,6 +88,21 @@ export interface QueuedPrompt {
   streamEventSequence?: number;
   terminalStatus?: 'streaming' | 'completed' | 'failed';
   terminalAt?: number;
+  attentionGeneration?: string;
+  hostDispatchId?: string;
+  providerThreadId?: string;
+  providerTurnId?: string;
+  providerTurnAttachedAt?: number;
+  providerTurnState?: 'unbound' | 'active' | 'completed' | 'failed' | 'interrupted' | 'uncertain';
+}
+
+export interface QueuedProviderTurnIdentity {
+  promptId: string;
+  sessionId: string;
+  claimToken: string;
+  attentionGeneration: string;
+  providerThreadId: string;
+  providerTurnId: string;
 }
 
 export interface QueuedPromptInterruptReceipt {
@@ -154,6 +169,9 @@ export interface QueuedPromptsStore {
   /** Current-upstream queue-driver compatibility alias. */
   listSessionIdsWithPending(): Promise<string[]>;
 
+  /** Discover exact executing owners for reconciliation without mutating them. */
+  listExecutingSessionIds(): Promise<string[]>;
+
   /** Terminally fail every pending row when its workspace can no longer be delivered. */
   failAllPendingForSession(sessionId: string, errorMessage: string): Promise<number>;
 
@@ -180,13 +198,16 @@ export interface QueuedPromptsStore {
 
   /** Atomically mark an admitted prompt as completed for its owning session. */
   /** Persist dispatch intent immediately before the provider/PTY boundary. */
-  beginDispatch(id: string, expectedSessionId: string, claimToken: string): Promise<QueueSettlementResult>;
+  beginDispatch(id: string, expectedSessionId: string, claimToken: string, attentionGeneration?: string): Promise<QueueSettlementResult>;
+
+  /** Atomically bind an admitted claim to its real provider turn. */
+  attachProviderTurn(identity: QueuedProviderTurnIdentity): Promise<QueueSettlementResult>;
 
   /** Release an exact claim that failed before dispatch intent was persisted. */
   releaseClaim(id: string, expectedSessionId: string, claimToken: string): Promise<QueueSettlementResult>;
 
   /** Complete only the exact claim that owns the external dispatch. */
-  completeAfterDispatch(id: string, expectedSessionId: string, claimToken: string, terminal?: QueueTerminalReceipt): Promise<QueueSettlementResult>;
+  completeAfterDispatch(id: string, expectedSessionId: string, claimToken: string, terminal?: QueueTerminalReceipt, attentionGeneration?: string): Promise<QueueSettlementResult>;
 
   /** Fail only the exact claim that owns the external dispatch. */
   failAfterDispatch(
@@ -195,6 +216,7 @@ export interface QueuedPromptsStore {
     expectedSessionId: string,
     claimToken: string,
     terminal?: QueueTerminalReceipt,
+    attentionGeneration?: string,
   ): Promise<QueueSettlementResult>;
 
   /** Atomically replace the contents of an admitted pending prompt. */
@@ -347,6 +369,12 @@ function rowToQueuedPrompt(row: any): QueuedPrompt {
     streamEventSequence: row.stream_event_sequence == null ? undefined : Number(row.stream_event_sequence),
     terminalStatus: row.terminal_status || undefined,
     terminalAt: toMillis(row.terminal_at) ?? undefined,
+    attentionGeneration: row.attention_generation || undefined,
+    hostDispatchId: row.host_dispatch_id || undefined,
+    providerThreadId: row.provider_thread_id || undefined,
+    providerTurnId: row.provider_turn_id || undefined,
+    providerTurnAttachedAt: toMillis(row.provider_turn_attached_at) ?? undefined,
+    providerTurnState: row.provider_turn_state || undefined,
   };
 }
 
@@ -684,6 +712,17 @@ export function createPGLiteQueuedPromptsStore(
       return rows.map((row) => row.session_id);
     },
 
+    async listExecutingSessionIds(): Promise<string[]> {
+      await ensureReady();
+      const { rows } = await db.query<{ session_id: string }>(
+        `SELECT DISTINCT session_id
+         FROM queued_prompts
+         WHERE status = 'executing'
+         ORDER BY session_id`,
+      );
+      return rows.map((row) => row.session_id);
+    },
+
     async failAllPendingForSession(sessionId: string, errorMessage: string): Promise<number> {
       await ensureReady();
       const { rows } = await db.query<{ id: string }>(
@@ -866,7 +905,13 @@ export function createPGLiteQueuedPromptsStore(
              error_message = NULL,
              claim_trigger = $4,
              claim_triggered_at = CURRENT_TIMESTAMP,
-             turn_id = 'turn:' || id || ':' || $3,
+             -- This is host provenance, never the provider turn identity.
+             turn_id = NULL,
+             host_dispatch_id = 'dispatch:' || id || ':' || $3,
+             attention_generation = NULL,
+             provider_thread_id = NULL,
+             provider_turn_id = NULL,
+             provider_turn_state = 'unbound',
              provider_input_message_id = 'input:' || id || ':' || $3,
              provider_output_message_id = 'output:' || id || ':' || $3,
              stream_event_sequence = 0,
@@ -899,13 +944,15 @@ export function createPGLiteQueuedPromptsStore(
       id: string,
       expectedSessionId: string,
       claimToken: string,
+      attentionGeneration?: string,
     ): Promise<QueueSettlementResult> {
       await ensureReady();
       const metadataReadyClause = await getMetadataReadyClause();
       const { rows } = await db.query<any>(
         `UPDATE queued_prompts
          SET dispatch_started_at = CURRENT_TIMESTAMP,
-             settlement_provenance = $4
+             settlement_provenance = $4,
+             attention_generation = COALESCE($5::text, attention_generation)
          WHERE id = $1
            AND session_id = $2::text
            AND claim_token = $3
@@ -917,7 +964,7 @@ export function createPGLiteQueuedPromptsStore(
                AND ${metadataReadyClause}
            )
          RETURNING *`,
-        [id, expectedSessionId, claimToken, PROVENANCE_DISPATCH_STARTED],
+        [id, expectedSessionId, claimToken, PROVENANCE_DISPATCH_STARTED, attentionGeneration ?? null],
       );
       if (rows.length > 0) return { outcome: 'settled', row: rowToQueuedPrompt(rows[0]) };
       return classifyMutationMiss(
@@ -925,6 +972,50 @@ export function createPGLiteQueuedPromptsStore(
         expectedSessionId,
         claimToken,
         (row) => row.status === 'executing' && row.dispatchStartedAt !== undefined,
+      );
+    },
+
+    async attachProviderTurn(identity: QueuedProviderTurnIdentity): Promise<QueueSettlementResult> {
+      await ensureReady();
+      const metadataReadyClause = await getMetadataReadyClause();
+      const { rows } = await db.query<any>(
+        `UPDATE queued_prompts
+         SET attention_generation = $4,
+             provider_thread_id = $5,
+             provider_turn_id = $6,
+             provider_turn_attached_at = CURRENT_TIMESTAMP,
+             provider_turn_state = 'active'
+         WHERE id = $1
+           AND session_id = $2::text
+           AND claim_token = $3
+           AND status = 'executing'
+           AND dispatch_started_at IS NOT NULL
+           AND (attention_generation IS NULL OR attention_generation = $4)
+           AND (provider_thread_id IS NULL OR provider_thread_id = $5)
+           AND (provider_turn_id IS NULL OR provider_turn_id = $6)
+           AND EXISTS (
+             SELECT 1 FROM ai_sessions s
+             WHERE s.id = queued_prompts.session_id
+               AND ${metadataReadyClause}
+           )
+         RETURNING *`,
+        [
+          identity.promptId,
+          identity.sessionId,
+          identity.claimToken,
+          identity.attentionGeneration,
+          identity.providerThreadId,
+          identity.providerTurnId,
+        ],
+      );
+      if (rows.length > 0) return { outcome: 'settled', row: rowToQueuedPrompt(rows[0]) };
+      return classifyMutationMiss(
+        identity.promptId,
+        identity.sessionId,
+        identity.claimToken,
+        (row) => row.attentionGeneration === identity.attentionGeneration
+          && row.providerThreadId === identity.providerThreadId
+          && row.providerTurnId === identity.providerTurnId,
       );
     },
 
@@ -966,6 +1057,7 @@ export function createPGLiteQueuedPromptsStore(
       expectedSessionId: string,
       claimToken: string,
       terminal?: QueueTerminalReceipt,
+      attentionGeneration?: string,
     ): Promise<QueueSettlementResult> {
       await ensureReady();
       const dialect = await getDialect();
@@ -988,11 +1080,13 @@ export function createPGLiteQueuedPromptsStore(
              settlement_provenance = $4,
              terminal_status = 'completed',
              terminal_at = ${terminalTimeSql},
-             stream_event_sequence = ${terminalSequenceSql}
+             stream_event_sequence = ${terminalSequenceSql},
+             provider_turn_state = CASE WHEN provider_turn_id IS NULL THEN provider_turn_state ELSE 'completed' END
          WHERE id = $1
            AND session_id = $2::text
            AND claim_token = $3
            AND dispatch_started_at IS NOT NULL
+           AND ($9::text IS NULL OR attention_generation = $9::text)
            AND (
              status = 'executing'
              OR (
@@ -1015,6 +1109,7 @@ export function createPGLiteQueuedPromptsStore(
           PROVENANCE_SWEEP_BOOT,
           terminal ? new Date(terminal.terminalAt).toISOString() : null,
           terminal?.eventSequence ?? null,
+          attentionGeneration ?? null,
         ],
       );
       if (rows.length > 0) return { outcome: 'settled', row: rowToQueuedPrompt(rows[0]) };
@@ -1032,6 +1127,7 @@ export function createPGLiteQueuedPromptsStore(
       expectedSessionId: string,
       claimToken: string,
       terminal?: QueueTerminalReceipt,
+      attentionGeneration?: string,
     ): Promise<QueueSettlementResult> {
       await ensureReady();
       const dialect = await getDialect();
@@ -1054,12 +1150,14 @@ export function createPGLiteQueuedPromptsStore(
              settlement_provenance = $5,
              terminal_status = 'failed',
              terminal_at = ${terminalTimeSql},
-             stream_event_sequence = ${terminalSequenceSql}
+             stream_event_sequence = ${terminalSequenceSql},
+             provider_turn_state = CASE WHEN provider_turn_id IS NULL THEN provider_turn_state ELSE 'failed' END
          WHERE id = $1
            AND session_id = $2::text
            AND claim_token = $3
            AND status = 'executing'
            AND dispatch_started_at IS NOT NULL
+           AND ($8::text IS NULL OR attention_generation = $8::text)
            AND EXISTS (
              SELECT 1 FROM ai_sessions s
              WHERE s.id = queued_prompts.session_id
@@ -1074,6 +1172,7 @@ export function createPGLiteQueuedPromptsStore(
           PROVENANCE_DISPATCH_FAILED,
           terminal ? new Date(terminal.terminalAt).toISOString() : null,
           terminal?.eventSequence ?? null,
+          attentionGeneration ?? null,
         ],
       );
       if (rows.length > 0) return { outcome: 'settled', row: rowToQueuedPrompt(rows[0]) };

@@ -1,13 +1,13 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-const updateMetadata = vi.fn();
+const compareAndSetPendingPrompt = vi.fn();
 const getSession = vi.fn();
 const requestMobilePush = vi.fn();
 const trayManager = { onPromptCreated: vi.fn(), onPromptResolved: vi.fn() };
 
 vi.mock('@nimbalyst/runtime', () => ({
   AISessionsRepository: {
-    updateMetadata: (...args: unknown[]) => updateMetadata(...args),
+    compareAndSetPendingPrompt: (...args: unknown[]) => compareAndSetPendingPrompt(...args),
     get: (...args: unknown[]) => getSession(...args),
   },
 }));
@@ -31,7 +31,7 @@ import {
 describe('pending-prompt in-memory mirror (NIM-2208)', () => {
   beforeEach(() => {
     resetPendingPromptTracking();
-    updateMetadata.mockReset().mockResolvedValue(undefined);
+    compareAndSetPendingPrompt.mockReset().mockResolvedValue(true);
     trayManager.onPromptCreated.mockReset();
     trayManager.onPromptResolved.mockReset();
   });
@@ -56,7 +56,7 @@ describe('pending-prompt in-memory mirror (NIM-2208)', () => {
   it('does not track a session whose write failed', async () => {
     // The mirror stands in for the DB during the reconcile, so it must not claim
     // a bit that was never persisted.
-    updateMetadata.mockRejectedValueOnce(new Error('db down'));
+    compareAndSetPendingPrompt.mockRejectedValueOnce(new Error('db down'));
     await setSessionPendingPrompt('s1', true);
     expect(getSessionsWithPendingPrompt()).toEqual([]);
   });
@@ -64,7 +64,23 @@ describe('pending-prompt in-memory mirror (NIM-2208)', () => {
   it('ignores an empty session id', async () => {
     await setSessionPendingPrompt('', true);
     expect(getSessionsWithPendingPrompt()).toEqual([]);
-    expect(updateMetadata).not.toHaveBeenCalled();
+    expect(compareAndSetPendingPrompt).not.toHaveBeenCalled();
+  });
+
+  it('passes the terminal generation into the atomic compare-and-clear', async () => {
+    compareAndSetPendingPrompt.mockResolvedValueOnce(false);
+    const result = await setSessionPendingPrompt(
+      's1',
+      false,
+      'approval',
+      { attentionGeneration: 'generation-a' },
+    );
+
+    expect(compareAndSetPendingPrompt).toHaveBeenCalledWith(
+      's1', false, null, 'generation-a',
+    );
+    expect(result).toMatchObject({ applied: false, superseded: true });
+    expect(trayManager.onPromptResolved).not.toHaveBeenCalled();
   });
 });
 
@@ -78,7 +94,7 @@ describe('pending-prompt in-memory mirror (NIM-2208)', () => {
 describe('tray notification is part of persisting the bit', () => {
   beforeEach(() => {
     resetPendingPromptTracking();
-    updateMetadata.mockReset().mockResolvedValue(undefined);
+    compareAndSetPendingPrompt.mockReset().mockResolvedValue(true);
     trayManager.onPromptCreated.mockReset();
     trayManager.onPromptResolved.mockReset();
   });
@@ -105,14 +121,12 @@ describe('tray notification is part of persisting the bit', () => {
     expect(trayManager.onPromptCreated).not.toHaveBeenCalled();
   });
 
-  it('still notifies the tray when the database write fails', async () => {
-    // The tray is in-memory state; a failed row update must not leave the menu
-    // bar claiming a blocked session is merely running.
-    updateMetadata.mockRejectedValue(new Error('db down'));
+  it('does not publish in-memory attention when the database CAS fails', async () => {
+    compareAndSetPendingPrompt.mockRejectedValue(new Error('db down'));
 
     await setSessionPendingPrompt('s1', true);
 
-    expect(trayManager.onPromptCreated).toHaveBeenCalledWith('s1', 'approval');
+    expect(trayManager.onPromptCreated).not.toHaveBeenCalled();
   });
 });
 
@@ -125,7 +139,7 @@ describe('tray notification is part of persisting the bit', () => {
 describe('blocked session pages the phone', () => {
   beforeEach(() => {
     resetPendingPromptTracking();
-    updateMetadata.mockReset().mockResolvedValue(undefined);
+    compareAndSetPendingPrompt.mockReset().mockResolvedValue(true);
     getSession.mockReset().mockResolvedValue({ title: 'Fix the parser' });
     requestMobilePush.mockReset().mockResolvedValue({
       accepted: true,

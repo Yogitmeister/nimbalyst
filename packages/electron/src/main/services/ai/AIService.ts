@@ -127,6 +127,7 @@ import {
 import { MessageStreamingHandler } from './MessageStreamingHandler';
 import { setSessionPendingPrompt } from './pendingPromptPersistence';
 import { shouldForceIdleOnCancel } from './sessionSettlePolicy';
+import { reconcileQueuedTurnsBeforeControl } from './queuedTurnRecovery';
 import {
   hasTerminalizedAskUserQuestion,
   persistAskUserQuestionTerminalResult,
@@ -145,6 +146,7 @@ import { publishQueuedPromptsToSync } from './queuedPromptSyncPublisher';
 import { onWorkspaceWindowAvailable } from '../../window/workspaceWindowAvailability';
 import { dispatchQueuedPromptToClaudeCli } from './claudeCliQueueDispatch';
 import { ensureClaudeCliSession, claudeCliSessionSupportsPlugins } from './claudeCliLauncherSingleton';
+import { createAIServiceQueuedChainSettlement } from './aiServiceQueuedChainSettlement';
 import { supportsWorkspaceSlashWorkflowProvider } from '../../../shared/agentWorkflowProviders';
 
 const execFileAsync = promisify(execFile);
@@ -1036,7 +1038,11 @@ export class AIService {
     // dead child. endSession (in onChainSettled, which runs before onAfterSettled)
     // evicts the child from the state manager, so its terminal status must be
     // read in onChainSettled before that happens.
-    let settledChildErrored = false;
+    const chainSettlement = createAIServiceQueuedChainSettlement({
+      scheduleStop: (settledSessionId, delayMs) =>
+        this.hooklessWatcher.scheduleStop(settledSessionId, delayMs),
+      logInfo: (message) => logger.main.info(message),
+    });
 
     return tryClaimAndDispatchNextQueuedPrompt({
       continueQueuedPromptChain: (nextSessionId, nextWorkspacePath, nextTargetWindow, nextSource) =>
@@ -1065,7 +1071,7 @@ export class AIService {
           // spin loop. Native children settle 'completed', so this is a no-op for
           // them. settledChildErrored is captured in onChainSettled before
           // endSession evicts the child's in-memory state.
-          if (settledChildErrored) return;
+          if (chainSettlement.settledChildErrored) return;
 
           const metaSession = await AISessionsRepository.get(childSession.createdBySessionId);
           if (!metaSession?.workspacePath) return;
@@ -1081,21 +1087,7 @@ export class AIService {
           logger.main.error(`[AIService] ${source}: error checking meta-agent wakeup:`, metaErr);
         }
       },
-      onChainSettled: async ({ sessionId: settledSessionId, source: settledSource }) => {
-        // The completion handler in MessageStreamingHandler deferred endSession
-        // because processingSet still contained this session while the inner
-        // sendMessage was running. Now that the chain has fully drained, mark
-        // the session idle and stop its file watcher.
-        const stateManager = getSessionStateManager();
-        // Capture the child's terminal status BEFORE endSession evicts it from
-        // the state manager, so onAfterSettled can avoid waking the parent for a
-        // child that just failed. getSessionState reads the in-memory map, which
-        // endSession clears on the next line.
-        settledChildErrored = stateManager.getSessionState(settledSessionId)?.status === 'error';
-        logger.main.info(`[AIService] ${settledSource}: chain settled for session ${settledSessionId}, ending session`);
-        await stateManager.endSession(settledSessionId);
-        this.hooklessWatcher.scheduleStop(settledSessionId, 500);
-      },
+      onChainSettled: chainSettlement.onChainSettled,
       onPromptClaimed: ({ sessionId: claimedSessionId, promptId }) => {
         targetWindow?.webContents.send('ai:promptClaimed', {
           sessionId: claimedSessionId,
@@ -1820,15 +1812,15 @@ export class AIService {
       initMobileSessionControlHandler(syncProvider, findWindowByWorkspace, {
         triggerQueuedPromptProcessing: (sessionId, workspacePath) =>
           this.triggerQueuedPromptProcessingForSession(sessionId, workspacePath, 'mobile-control'),
-        rollbackExecutingPrompts: async (sessionId) => {
-          // Use the delivery-aware sweep so that a mobile-initiated cancel
-          // doesn't re-deliver a prompt that already landed in the
-          // conversation. Returns the count of rows that actually moved
-          // back to pending (matches the prior contract).
+        reconcileQueuedTurnControl: async (sessionId, capability) => {
           const { getQueuedPromptsStore } = await import('../RepositoryManager');
-          const { rolledBack } = await getQueuedPromptsStore().sweepExecutingForSession(sessionId);
+          const result = await reconcileQueuedTurnsBeforeControl(
+            sessionId,
+            getQueuedPromptsStore(),
+            capability,
+          );
           await this.publishQueueStateToSync(sessionId);
-          return rolledBack;
+          return result;
         },
       });
     } catch (error) {
@@ -3307,27 +3299,30 @@ export class AIService {
           reason: 'user_cancel'
         });
 
-        // Defensive cleanup: if the in-flight turn was processing a queued
-        // prompt, drop the in-memory guard and unwedge any DB row stuck in
-        // 'executing'. sweepExecutingForSession is delivery-aware -- a
-        // prompt whose user message already landed in ai_agent_messages is
-        // marked completed instead of rolled back, so the queue trigger
-        // that follows the abort doesn't immediately re-claim and re-send
-        // the same input (NIM-615).
-        this.queueProcessingLeases.delete(sessionId);
+        // A queued row is externally owned by an exact provider turn. Re-read
+        // that turn before aborting or clearing the in-memory lease; active,
+        // foreign, and unknown turns retain the writer fence.
         try {
           const { getQueuedPromptsStore } = await import('../RepositoryManager');
           const queueStore = getQueuedPromptsStore();
-          const { completed, failed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
-          if (completed > 0 || failed > 0 || rolledBack > 0) {
-            logger.main.info(
-              `[AIService] cancelRequest: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`
-            );
-            await this.publishQueueStateToSync(sessionId);
+          const reconciliation = await reconcileQueuedTurnsBeforeControl(
+            sessionId,
+            queueStore,
+            provider.getQueuedTurnControlCapability?.() ?? null,
+          );
+          if (!reconciliation.allowControl) {
+            return { success: false, error: `Queued turn remains fenced (${reconciliation.states.join(', ')})` };
           }
-        } catch (sweepErr) {
-          logger.main.error('[AIService] cancelRequest: sweepExecutingForSession failed:', sweepErr);
+          await this.publishQueueStateToSync(sessionId);
+          if (reconciliation.queuedTurnHandled) {
+            this.analytics.sendEvent('cancel_ai_request', { provider: providerType });
+            return { success: true };
+          }
+        } catch (reconcileErr) {
+          logger.main.error('[AIService] cancelRequest: queued-turn reconciliation failed:', reconcileErr);
+          return { success: false, error: 'Queued turn reconciliation failed; ownership retained' };
         }
+        this.queueProcessingLeases.delete(sessionId);
 
         provider.abort();
         // console.log(`[AIService] Cancelled request for session ${sessionId}`);
@@ -3383,20 +3378,29 @@ export class AIService {
         return { success: false, error: 'No active provider for session' };
       }
 
-      this.queueProcessingLeases.delete(sessionId);
       try {
         const { getQueuedPromptsStore } = await import('../RepositoryManager');
         const queueStore = getQueuedPromptsStore();
-        const { completed, failed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
-        if (completed > 0 || failed > 0 || rolledBack > 0) {
-          logger.main.info(
-            `[AIService] interruptCurrentTurn: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`
-          );
-          await this.publishQueueStateToSync(sessionId);
+        const reconciliation = await reconcileQueuedTurnsBeforeControl(
+          sessionId,
+          queueStore,
+          provider.getQueuedTurnControlCapability?.() ?? null,
+        );
+        if (!reconciliation.allowControl) {
+          return { success: false, error: `Queued turn remains fenced (${reconciliation.states.join(', ')})` };
         }
-      } catch (sweepErr) {
-        logger.main.error('[AIService] interruptCurrentTurn: sweepExecutingForSession failed:', sweepErr);
+        await this.publishQueueStateToSync(sessionId);
+        if (reconciliation.queuedTurnHandled) {
+          return {
+            success: true,
+            method: reconciliation.exactInterruptSent ? 'provider-exact-interrupt' : 'provider-terminal',
+          };
+        }
+      } catch (reconcileErr) {
+        logger.main.error('[AIService] interruptCurrentTurn: queued-turn reconciliation failed:', reconcileErr);
+        return { success: false, error: 'Queued turn reconciliation failed; ownership retained' };
       }
+      this.queueProcessingLeases.delete(sessionId);
 
       const result = await provider.interruptCurrentTurn();
       logger.main.info(`[AIService] Interrupted current turn for session ${sessionId} (method=${result.method})`);

@@ -13,6 +13,7 @@ import {
 } from '@nimbalyst/runtime/ai/server/types';
 import { agentCapabilitiesForProviderType } from '@nimbalyst/runtime/ai/server/agentCapabilities';
 import { safeSend } from '../aiServiceUtils';
+import { reconcileQueuedTurnsBeforeControl } from '../queuedTurnRecovery';
 import type { AIServiceContext } from './AIServiceContext';
 
 /**
@@ -71,31 +72,30 @@ export function registerTurnControlHandlers(ctx: AIServiceContext): void {
         reason: 'user_cancel'
       });
 
-      // Defensive cleanup: if the in-flight turn was processing a queued
-      // prompt, drop the in-memory guard and unwedge any DB row stuck in
-      // 'executing'. sweepExecutingForSession is delivery-aware -- a
-      // prompt whose user message already landed in ai_agent_messages is
-      // marked completed instead of rolled back, so the queue trigger
-      // that follows the abort doesn't immediately re-claim and re-send
-      // the same input (NIM-615). The delete also clears the guard's
-      // ownership lease, so when the dispatch this cancel displaced finally
-      // settles it releases nothing rather than releasing whatever prompt
-      // took the session next (#1018).
+      // Reconcile the exact provider turn before aborting. A queued writer
+      // that is active, foreign, or uncertain remains fenced.
       await sessionInbox.end(sessionInbox.current(sessionId), false).catch(err => logger.main.error('[AIService] Inbox retirement failed during interruption:', err));
-      ctx.sessionsProcessingQueue.delete(sessionId);
       try {
         const { getQueuedPromptsStore } = await import('../../RepositoryManager');
         const queueStore = getQueuedPromptsStore();
-        const { completed, failed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
-        if (completed > 0 || failed > 0 || rolledBack > 0) {
-          logger.main.info(
-            `[AIService] cancelRequest: swept session ${sessionId} -- ${completed} answered marked completed, ${failed} delivered-but-unanswered marked failed, ${rolledBack} undelivered rolled back`
-          );
-          await ctx.publishQueueStateToSync(sessionId);
+        const reconciliation = await reconcileQueuedTurnsBeforeControl(
+          sessionId,
+          queueStore,
+          provider.getQueuedTurnControlCapability?.() ?? null,
+        );
+        if (!reconciliation.allowControl) {
+          return { success: false, error: `Queued turn remains fenced (${reconciliation.states.join(', ')})` };
         }
-      } catch (sweepErr) {
-        logger.main.error('[AIService] cancelRequest: sweepExecutingForSession failed:', sweepErr);
+        await ctx.publishQueueStateToSync(sessionId);
+        if (reconciliation.queuedTurnHandled) {
+          ctx.analytics.sendEvent('cancel_ai_request', { provider: providerType });
+          return { success: true };
+        }
+      } catch (reconcileErr) {
+        logger.main.error('[AIService] cancelRequest: queued-turn reconciliation failed:', reconcileErr);
+        return { success: false, error: 'Queued turn reconciliation failed; ownership retained' };
       }
+      ctx.sessionsProcessingQueue.delete(sessionId);
 
       provider.abort();
       // console.log(`[AIService] Cancelled request for session ${sessionId}`);

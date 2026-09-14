@@ -571,7 +571,7 @@ export interface StreamChunk {
   // liveness -- the Git journal behind the menu-bar indicator -- can see the
   // call end. It carries the same `toolCall` object as that earlier chunk, so it
   // is a completion signal only, never a second tool call.
-  type: 'text' | 'tool_call' | 'tool_result' | 'tool_error' | 'error' | 'complete' | 'context_usage' | 'stream_edit_start' | 'stream_edit_content' | 'stream_edit_end' | 'pre_edit_snapshot' | 'post_edit_snapshot';
+  type: 'text' | 'tool_call' | 'tool_result' | 'tool_error' | 'error' | 'complete' | 'context_usage' | 'turn_started' | 'stream_edit_start' | 'stream_edit_content' | 'stream_edit_end' | 'pre_edit_snapshot' | 'post_edit_snapshot';
   content?: string;
   isSystem?: boolean; // For system messages like slash command output
   toolCall?: {
@@ -601,6 +601,8 @@ export interface StreamChunk {
   isCodexAuthRequired?: boolean; // True when a Codex app-server session was blocked because the user is not signed in to OpenAI
   isProcessCrash?: boolean; // True when the agent subprocess died from a native fault (#1361), so the turn must settle as errored despite the follow-up 'complete'
   isComplete?: boolean;
+  /** Actual provider identity from Codex app-server `turn/start`. */
+  providerTurn?: { threadId: string; turnId: string };
   config?: unknown; // For stream_edit_start
   usage?: {
     input_tokens: number;

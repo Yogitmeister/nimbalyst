@@ -36,7 +36,7 @@ import { EventEmitter } from 'events';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import { mkdirSync } from 'fs';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { app, utilityProcess, UtilityProcess } from 'electron';
 import { Worker } from 'worker_threads';
 import type {
@@ -79,7 +79,7 @@ import type {
 import { serializeError } from './extensionBackendRpc';
 import { AgentMessagesRepository } from '@nimbalyst/runtime/storage/repositories/AgentMessagesRepository';
 import { getProviderApiKeyFromSettings } from '../utils/store';
-import { dispatchMetaAgentTool } from '../mcp/metaAgentServer';
+import { dispatchExtensionMetaAgentTool } from '../mcp/metaAgentServer';
 import { dispatchDevAgentTool } from '../mcp/devAgentTools';
 import { registerBackendTools } from '../mcp/backendToolRegistry';
 
@@ -158,7 +158,19 @@ type RpcCallback = {
   reject: (err: Error) => void;
   streaming: boolean;
   chunkHandler?: (chunk: unknown) => void;
+  visibilityAuthority?: Readonly<ExtensionAgentTurnAuthority>;
+  visibilityCapability?: string;
 };
+
+interface ExtensionAgentTurnAuthority {
+  actorSessionId: string;
+  workspacePath: string;
+}
+
+interface PreparedExtensionAgentTurn {
+  capability: string;
+  authority: Readonly<ExtensionAgentTurnAuthority>;
+}
 
 interface ManagedRuntime {
   send: (msg: HostToBackendMessage) => void;
@@ -229,16 +241,42 @@ interface ManagedModule {
    * first attempt is parked on a consent/trust prompt).
    */
   startInFlight?: Promise<ModuleHandle>;
+  /** Agent modules never regain authority through a backend-supplied session id. */
+  loggingPrincipalPolicy: 'ordinary-session-id' | 'host-turn-capability';
 }
 
 const HOST_EVENT_STATE_CHANGED = 'state-changed';
 
 export class PrivilegedExtensionHost extends EventEmitter {
   private modules = new Map<ModuleKey, ManagedModule>();
+  private nextTurnAuthorities = new Map<ModuleKey, Map<string, Readonly<ExtensionAgentTurnAuthority>>>();
+  private preparedExtensionAgentTurns = new Map<ModuleKey, Map<string, PreparedExtensionAgentTurn>>();
 
   constructor() {
     super();
     this.setMaxListeners(50);
+  }
+
+  /** Register a trusted streaming turn before its extension backend is created. */
+  bindNextExtensionAgentTurnAuthority(args: {
+    extensionId: string;
+    moduleId: string;
+    runtimeWorkspacePath: string;
+    actorSessionId: string;
+    canonicalWorkspacePath: string;
+  }): void {
+    const actorSessionId = args.actorSessionId.trim();
+    const workspacePath = args.canonicalWorkspacePath.trim();
+    if (!actorSessionId || !workspacePath) {
+      throw new Error('Extension-agent visibility authority is incomplete');
+    }
+    const key = moduleKey(args.extensionId, args.moduleId, args.runtimeWorkspacePath);
+    let bindings = this.nextTurnAuthorities.get(key);
+    if (!bindings) {
+      bindings = new Map();
+      this.nextTurnAuthorities.set(key, bindings);
+    }
+    bindings.set(actorSessionId, Object.freeze({ actorSessionId, workspacePath }));
   }
 
   /**
@@ -317,6 +355,7 @@ export class PrivilegedExtensionHost extends EventEmitter {
         grantedPermissions: [],
         pending: new Map(),
         nextRpcId: 1,
+        loggingPrincipalPolicy: 'ordinary-session-id',
       };
       this.modules.set(key, managed);
     } else {
@@ -528,6 +567,8 @@ export class PrivilegedExtensionHost extends EventEmitter {
     opts: { failPendingWith?: string } = {}
   ): Promise<void> {
     const key = moduleKey(extensionId, moduleId, workspacePath);
+    this.nextTurnAuthorities.delete(key);
+    this.preparedExtensionAgentTurns.delete(key);
     const managed = this.modules.get(key);
     if (!managed || !managed.runtime) {
       return;
@@ -693,6 +734,7 @@ export class PrivilegedExtensionHost extends EventEmitter {
     }
 
     const id = String(managed.nextRpcId++);
+    const effectiveParams = this.prepareExtensionAgentTurn(key, args.method, args.params);
     const timeoutMs = args.timeoutMs ?? RPC_REQUEST_TIMEOUT_MS;
     return new Promise<T>((resolve, reject) => {
       // Cleared by whichever of the three settle paths wins: a reply routed
@@ -737,7 +779,7 @@ export class PrivilegedExtensionHost extends EventEmitter {
           kind: 'rpc-request',
           id,
           method: args.method,
-          params: args.params,
+          params: effectiveParams,
         });
       } catch (err) {
         managed.pending.delete(id);
@@ -783,6 +825,11 @@ export class PrivilegedExtensionHost extends EventEmitter {
 
     const id = String(managed.nextRpcId++);
     let chunkHandler: ((c: TChunk) => void) | undefined;
+    const preparedTurn = this.consumePreparedExtensionAgentTurn(key, args.method, args.params);
+    if (preparedTurn) managed.loggingPrincipalPolicy = 'host-turn-capability';
+    const effectiveParams = preparedTurn && args.params && typeof args.params === 'object'
+      ? { ...(args.params as Record<string, unknown>), sessionId: preparedTurn.capability }
+      : args.params;
 
     const done = new Promise<void>((resolve, reject) => {
       managed.pending.set(id, {
@@ -790,13 +837,15 @@ export class PrivilegedExtensionHost extends EventEmitter {
         reject,
         streaming: true,
         chunkHandler: (chunk) => chunkHandler?.(chunk as TChunk),
+        visibilityAuthority: preparedTurn?.authority,
+        visibilityCapability: preparedTurn?.capability,
       });
       try {
         managed.runtime!.send({
           kind: 'rpc-request',
           id,
           method: args.method,
-          params: args.params,
+          params: effectiveParams,
           streaming: true,
         });
       } catch (err) {
@@ -809,6 +858,11 @@ export class PrivilegedExtensionHost extends EventEmitter {
       id,
       done,
       cancel: () => {
+        const pending = managed.pending.get(id);
+        if (pending) {
+          pending.visibilityAuthority = undefined;
+          pending.visibilityCapability = undefined;
+        }
         try {
           managed.runtime?.send({ kind: 'rpc-cancel', id });
         } catch {
@@ -838,7 +892,78 @@ export class PrivilegedExtensionHost extends EventEmitter {
       })
     );
     this.modules.clear();
+    this.nextTurnAuthorities.clear();
+    this.preparedExtensionAgentTurns.clear();
     this.removeAllListeners();
+  }
+
+  private prepareExtensionAgentTurn(key: ModuleKey, method: string, params: unknown): unknown {
+    if (method !== 'createSession' || !params || typeof params !== 'object') return params;
+    const sessionId = (params as { sessionId?: unknown }).sessionId;
+    if (typeof sessionId !== 'string' || !sessionId.trim()) return params;
+    const actorSessionId = sessionId.trim();
+    const bindings = this.nextTurnAuthorities.get(key);
+    const authority = bindings?.get(actorSessionId);
+    if (!authority) return params;
+    const managed = this.modules.get(key);
+    if (managed) managed.loggingPrincipalPolicy = 'host-turn-capability';
+    bindings!.delete(actorSessionId);
+    if (bindings!.size === 0) this.nextTurnAuthorities.delete(key);
+    const prepared = Object.freeze({
+      capability: `svturn-${randomBytes(32).toString('hex')}`,
+      authority,
+    });
+    let turns = this.preparedExtensionAgentTurns.get(key);
+    if (!turns) {
+      turns = new Map();
+      this.preparedExtensionAgentTurns.set(key, turns);
+    }
+    turns.set(actorSessionId, prepared);
+    return { ...(params as Record<string, unknown>), sessionId: prepared.capability };
+  }
+
+  private consumePreparedExtensionAgentTurn(
+    key: ModuleKey,
+    method: string,
+    params: unknown,
+  ): PreparedExtensionAgentTurn | undefined {
+    if (method !== 'sendMessage' || !params || typeof params !== 'object') return undefined;
+    const sessionId = (params as { sessionId?: unknown }).sessionId;
+    if (typeof sessionId !== 'string' || !sessionId.trim()) return undefined;
+    const turns = this.preparedExtensionAgentTurns.get(key);
+    const prepared = turns?.get(sessionId.trim());
+    if (!prepared) return undefined;
+    turns!.delete(sessionId.trim());
+    if (turns!.size === 0) this.preparedExtensionAgentTurns.delete(key);
+    return prepared;
+  }
+
+  private requireExactActiveExtensionAgentAuthority(
+    managed: ManagedModule,
+    capability: unknown,
+  ): Readonly<ExtensionAgentTurnAuthority> {
+    if (typeof capability !== 'string' || !capability.startsWith('svturn-')) {
+      throw new Error('Extension-agent tool authority is unavailable');
+    }
+    for (const pending of managed.pending.values()) {
+      if (pending.visibilityCapability === capability && pending.visibilityAuthority) {
+        return pending.visibilityAuthority;
+      }
+    }
+    throw new Error('Extension-agent tool authority is unavailable');
+  }
+
+  private originalSessionIdForCapability(
+    managed: ManagedModule,
+    capability: unknown,
+  ): string | null {
+    if (typeof capability !== 'string') return null;
+    for (const pending of managed.pending.values()) {
+      if (pending.visibilityCapability === capability && pending.visibilityAuthority) {
+        return pending.visibilityAuthority.actorSessionId;
+      }
+    }
+    return null;
   }
 
   // ---------------------------------------------------------------------
@@ -1309,7 +1434,7 @@ export class PrivilegedExtensionHost extends EventEmitter {
         outcome: 'allowed',
         method,
       });
-      const result = await this.dispatchBrokerMethod(method, payload, ctx);
+      const result = await this.dispatchBrokerMethod(method, payload, ctx, managed);
       managed.runtime?.send({
         kind: 'broker-response',
         requestId,
@@ -1349,7 +1474,8 @@ export class PrivilegedExtensionHost extends EventEmitter {
   private async dispatchBrokerMethod(
     method: BrokerMethodName,
     rawPayload: unknown,
-    ctx: BackendRuntimeContext
+    ctx: BackendRuntimeContext,
+    managed: ManagedModule,
   ): Promise<BrokerResults[BrokerMethodName]> {
     switch (method) {
       case 'logRaw': {
@@ -1360,8 +1486,12 @@ export class PrivilegedExtensionHost extends EventEmitter {
         // first-party providers (e.g. claude-code) over the broker.
         const source = `${ctx.extensionId}/${ctx.moduleId}`;
         const direction = payload.direction === 'inbound' ? 'input' : 'output';
+        const translatedSessionId = this.originalSessionIdForCapability(managed, payload.sessionId);
+        if (managed.loggingPrincipalPolicy === 'host-turn-capability' && !translatedSessionId) {
+          throw new Error('Extension-agent logging authority is unavailable');
+        }
         await AgentMessagesRepository.create({
-          sessionId: payload.sessionId,
+          sessionId: translatedSessionId ?? payload.sessionId,
           source,
           direction,
           content: payload.content,
@@ -1424,16 +1554,11 @@ export class PrivilegedExtensionHost extends EventEmitter {
       }
       case 'toolExecutor': {
         const payload = rawPayload as BrokerPayloads['toolExecutor'];
-        // Scope the tool to the AI session that emitted it (so spawn_session
-        // can find the caller) and the workspace it ran in. dispatchMetaAgentTool
-        // normalizes worktree workspace paths to the parent repo internally.
-        // The workspace falls back to the runtime's bound workspacePath when the
-        // backend didn't supply one.
-        const text = await dispatchMetaAgentTool(
+        const authority = this.requireExactActiveExtensionAgentAuthority(managed, payload.sessionId);
+        const text = await dispatchExtensionMetaAgentTool(
           payload.name,
-          payload.sessionId,
-          payload.workspacePath ?? ctx.workspacePath,
-          payload.args
+          payload.args,
+          authority,
         );
         const result: BrokerResults['toolExecutor'] = { result: text };
         return result;

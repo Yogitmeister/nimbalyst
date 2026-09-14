@@ -17,6 +17,7 @@ function queueStoreFor(row: ClaimedQueuedPrompt): QueuedPromptStoreLike {
     listPending: vi.fn(async () => [row]),
     claim: vi.fn(async () => row),
     beginDispatch: vi.fn(async () => settled),
+    attachProviderTurn: vi.fn(async () => settled),
     releaseClaim: vi.fn(async () => settled),
     completeAfterDispatch: vi.fn(async () => settled),
     failAfterDispatch: vi.fn(async () => settled),
@@ -43,7 +44,7 @@ function optionsFor(queueStore: QueuedPromptStoreLike, overrides: Record<string,
     sendMessageHandler: vi.fn(async () => ({ content: 'ok' })),
     sessionId: 'session-1',
     source: 'test queue',
-    startSession: vi.fn(async () => {}),
+    startSession: vi.fn(async () => 'generation-a'),
     targetWindow: windowFixture(),
     workspacePath: '/workspace/project',
     ...overrides,
@@ -67,7 +68,7 @@ describe('queuedPromptDispatcher token owner', () => {
       return settled;
     });
     const options = optionsFor(store, {
-      startSession: vi.fn(async () => { order.push('start'); }),
+      startSession: vi.fn(async () => { order.push('start'); return 'generation-a'; }),
       onPromptClaimed: vi.fn(() => { order.push('notify'); }),
       sendMessageHandler: vi.fn(async () => { order.push('send'); return { content: 'ok' }; }),
       continueQueuedPromptChain: vi.fn(async () => { order.push('continue'); }),
@@ -77,11 +78,27 @@ describe('queuedPromptDispatcher token owner', () => {
     expect(order).toEqual(['start', 'notify']);
     await vi.runAllTimersAsync();
     expect(order).toEqual(['start', 'notify', 'begin', 'send', 'complete', 'continue']);
-    expect(store.beginDispatch).toHaveBeenCalledWith('prompt-1', 'session-1', 'token-prompt-1');
-    expect(store.completeAfterDispatch).toHaveBeenCalledWith(
-      'prompt-1', 'session-1', 'token-prompt-1',
+    expect(store.beginDispatch).toHaveBeenCalledWith(
+      'prompt-1', 'session-1', 'token-prompt-1', 'generation-a',
     );
-    expect(options.onChainSettled).toHaveBeenCalledTimes(1);
+    expect(store.completeAfterDispatch).toHaveBeenCalledWith(
+      'prompt-1', 'session-1', 'token-prompt-1', undefined, 'generation-a',
+    );
+    expect(options.sendMessageHandler).toHaveBeenCalledWith(
+      expect.anything(),
+      'continue',
+      expect.anything(),
+      'session-1',
+      '/workspace/project',
+      expect.objectContaining({ attentionGeneration: 'generation-a' }),
+    );
+    expect(options.onChainSettled).toHaveBeenCalledWith({
+      sessionId: 'session-1',
+      workspacePath: '/workspace/project',
+      source: 'test queue',
+      attentionGeneration: 'generation-a',
+      outcome: 'completed',
+    });
   });
 
   it('makes notification best-effort without releasing or wedging the claim', async () => {
@@ -108,6 +125,97 @@ describe('queuedPromptDispatcher token owner', () => {
     expect(store.beginDispatch).not.toHaveBeenCalled();
     expect(options.sendMessageHandler).not.toHaveBeenCalled();
     expect(options.processingLeases.has('session-1')).toBe(false);
+  });
+
+  it('reconciles a suppressed terminal by exact provider identity before draining', async () => {
+    vi.useFakeTimers();
+    const store = queueStoreFor(claimed());
+    const inspect = vi.fn(async () => ({
+      threadId: 'thread-1',
+      identityProven: true,
+      turns: [{ id: 'turn-1', status: 'completed' as const }],
+    }));
+    const options = optionsFor(store, {
+      sendMessageHandler: vi.fn(async (...args: any[]) => {
+        const turnContext = args[5];
+        await turnContext.onProviderTurnStarted({
+          providerThreadId: 'thread-1', providerTurnId: 'turn-1',
+        });
+        const terminal = await turnContext.onProviderTerminalSuppressed({
+          mode: 'drop-terminal-after-final',
+          capability: { inspect, interruptExact: vi.fn() },
+        });
+        return { content: 'durable final', queuedPromptTerminal: terminal };
+      }),
+    });
+
+    await expect(tryClaimAndDispatchNextQueuedPrompt(options)).resolves.toBe(true);
+    await vi.runAllTimersAsync();
+    expect(inspect).toHaveBeenCalledWith('session-1');
+    expect(store.attachProviderTurn).toHaveBeenCalledWith(expect.objectContaining({
+      providerThreadId: 'thread-1', providerTurnId: 'turn-1',
+      attentionGeneration: 'generation-a',
+    }));
+    expect(store.failAfterDispatch).not.toHaveBeenCalled();
+    expect(options.continueQueuedPromptChain).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails rather than fabricating success when final and terminal were suppressed', async () => {
+    vi.useFakeTimers();
+    const store = queueStoreFor(claimed());
+    const options = optionsFor(store, {
+      sendMessageHandler: vi.fn(async (...args: any[]) => {
+        const turnContext = args[5];
+        await turnContext.onProviderTurnStarted({
+          providerThreadId: 'thread-1', providerTurnId: 'turn-1',
+        });
+        const terminal = await turnContext.onProviderTerminalSuppressed({
+          mode: 'drop-terminal-without-final',
+          capability: {
+            inspect: vi.fn(async () => ({
+              threadId: 'thread-1',
+              identityProven: true,
+              turns: [{ id: 'turn-1', status: 'completed' as const }],
+            })),
+            interruptExact: vi.fn(),
+          },
+        });
+        return { content: '', queuedPromptTerminal: terminal };
+      }),
+    });
+
+    await expect(tryClaimAndDispatchNextQueuedPrompt(options)).resolves.toBe(true);
+    await vi.runAllTimersAsync();
+    expect(store.failAfterDispatch).toHaveBeenCalledWith(
+      'prompt-1',
+      'Provider terminal recovered without a durable final response',
+      'session-1',
+      'token-prompt-1',
+      expect.objectContaining({ lifecycle: 'failed' }),
+      'generation-a',
+    );
+    expect(options.onChainSettled).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed' }));
+    expect(options.continueQueuedPromptChain).toHaveBeenCalledTimes(1);
+  });
+
+  it('settles the generation installed by a failed session start', async () => {
+    const row = claimed();
+    const store = queueStoreFor(row);
+    const startError = Object.assign(new Error('listener failed'), {
+      attentionGeneration: 'generation-start-failure',
+    });
+    const options = optionsFor(store, {
+      startSession: vi.fn(async () => { throw startError; }),
+    });
+
+    await expect(tryClaimAndDispatchNextQueuedPrompt(options)).rejects.toThrow('listener failed');
+    expect(options.onChainSettled).toHaveBeenCalledWith({
+      sessionId: 'session-1',
+      workspacePath: '/workspace/project',
+      source: 'test queue',
+      attentionGeneration: 'generation-start-failure',
+      outcome: 'failed',
+    });
   });
 
   it('releases instead of failing when the production send handler is unavailable', async () => {
@@ -147,6 +255,8 @@ describe('queuedPromptDispatcher token owner', () => {
       'provider failed',
       'session-1',
       row.claimToken,
+      undefined,
+      'generation-a',
     );
     expect(options.continueQueuedPromptChain).toHaveBeenCalledTimes(1);
   });

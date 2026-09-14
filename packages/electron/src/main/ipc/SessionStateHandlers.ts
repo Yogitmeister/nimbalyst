@@ -26,6 +26,10 @@ import {
 } from '../services/ai/pendingPromptTerminalClear';
 import { hasLiveInteractivePrompt } from '../mcp/tools/interactivePromptLiveness';
 import { getGitOperationLogService } from '../services/GitOperationLogService';
+import {
+  endHostBoundAiSession,
+  terminateHostBoundAiSession,
+} from '../services/ai/aiServiceQueuedChainSettlement';
 
 // Track if handlers are registered to prevent double registration
 let handlersRegistered = false;
@@ -70,27 +74,6 @@ async function getCanonicalWorkspacePathForSession(sessionId: string): Promise<s
     return workspacePath;
   } catch (error) {
     console.error('[SessionStateHandlers] Failed to resolve canonical workspace path:', error);
-    return null;
-  }
-}
-
-/**
- * Read the authoritative persisted `hasPendingPrompt` bit for a session.
- * Returns null when the row is missing or unreadable so callers can no-op
- * instead of churning a write. Parses the metadata column with the
- * backend-divergent helper (SQLite hands back a raw JSON string).
- */
-async function readPersistedHasPendingPrompt(sessionId: string): Promise<boolean | null> {
-  try {
-    const { rows } = await database.query<{ metadata: unknown }>(
-      `SELECT metadata FROM ai_sessions WHERE id = $1 LIMIT 1`,
-      [sessionId]
-    );
-    if (rows.length === 0) return null;
-    const metadata = parseJsonObjectColumn(rows[0].metadata);
-    return metadata.hasPendingPrompt === true;
-  } catch (error) {
-    console.error('[SessionStateHandlers] Failed to read hasPendingPrompt:', error);
     return null;
   }
 }
@@ -191,8 +174,15 @@ export async function registerSessionStateHandlers() {
   // read-guard inside avoids a metadata write on every prompt-free turn end.
   stateManager.subscribe((event: SessionStateEvent) => {
     void clearStalePendingPromptOnTerminal(event, {
-      readHasPendingPrompt: readPersistedHasPendingPrompt,
-      clearPendingPrompt: (sessionId) => setSessionPendingPrompt(sessionId, false),
+      clearPendingPrompt: async (sessionId, attentionGeneration) => {
+        const result = await setSessionPendingPrompt(
+          sessionId,
+          false,
+          'approval',
+          { attentionGeneration },
+        );
+        return result.applied;
+      },
       onError: (err) =>
         console.error('[SessionStateHandlers] Failed to clear stale pending prompt on terminal event:', err),
     });
@@ -423,7 +413,18 @@ export async function registerSessionStateHandlers() {
   // End tracking a session (called when AI completes)
   safeHandle('ai-session-state:end', async (_event, sessionId: string) => {
     try {
-      await stateManager.endSession(sessionId);
+      const attentionGeneration = stateManager.getSessionState(sessionId)?.attentionGeneration;
+      if (!attentionGeneration) {
+        return { success: false, error: 'session turn is no longer active' };
+      }
+      const ended = await endHostBoundAiSession(
+        stateManager,
+        sessionId,
+        attentionGeneration,
+      );
+      if (!ended) {
+        return { success: false, error: 'session turn is no longer active' };
+      }
       return { success: true };
     } catch (error) {
       console.error('[SessionStateHandlers] Error ending session:', error);
@@ -434,7 +435,18 @@ export async function registerSessionStateHandlers() {
   // Interrupt a session (called on error or force stop)
   safeHandle('ai-session-state:interrupt', async (_event, sessionId: string) => {
     try {
-      await stateManager.interruptSession(sessionId);
+      const attentionGeneration = stateManager.getSessionState(sessionId)?.attentionGeneration;
+      if (!attentionGeneration) {
+        return { success: false, error: 'session turn is no longer active' };
+      }
+      const interrupted = await terminateHostBoundAiSession(
+        sessionId,
+        () => stateManager.interruptSession(sessionId, { attentionGeneration }),
+        () => stateManager.getSessionState(sessionId)?.attentionGeneration === attentionGeneration,
+      );
+      if (!interrupted) {
+        return { success: false, error: 'session turn is no longer active' };
+      }
       return { success: true };
     } catch (error) {
       console.error('[SessionStateHandlers] Error interrupting session:', error);

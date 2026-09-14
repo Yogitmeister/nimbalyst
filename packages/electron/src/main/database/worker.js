@@ -1884,6 +1884,21 @@ class PGLiteWorker {
         ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS stream_event_sequence INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS terminal_status TEXT;
         ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS terminal_at TIMESTAMPTZ;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS attention_generation TEXT;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS host_dispatch_id TEXT;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS provider_thread_id TEXT;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS provider_turn_id TEXT;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS provider_turn_attached_at TIMESTAMPTZ;
+        ALTER TABLE queued_prompts ADD COLUMN IF NOT EXISTS provider_turn_state TEXT NOT NULL DEFAULT 'unbound';
+
+        UPDATE queued_prompts
+        SET provider_turn_state = 'uncertain'
+        WHERE provider_turn_state NOT IN ('unbound', 'active', 'completed', 'failed', 'interrupted', 'uncertain');
+        DO $$ BEGIN
+          ALTER TABLE queued_prompts ADD CONSTRAINT queued_prompts_provider_turn_state_check
+            CHECK (provider_turn_state IN ('unbound', 'active', 'completed', 'failed', 'interrupted', 'uncertain'));
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$;
 
         WITH ranked AS (
           SELECT id, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY created_at, id) AS sequence
@@ -1911,6 +1926,13 @@ class PGLiteWorker {
           ON queued_prompts(client_submission_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_queued_prompts_source_sequence
           ON queued_prompts(source_session_id, submission_sequence);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_queued_prompts_provider_turn
+          ON queued_prompts(provider_thread_id, provider_turn_id)
+          WHERE provider_thread_id IS NOT NULL AND provider_turn_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_queued_prompts_active_turn_owner
+          ON queued_prompts(session_id, status, attention_generation, provider_turn_state)
+          WHERE status = 'executing';
         CREATE TABLE IF NOT EXISTS queued_prompt_source_sequences (
           source_session_id TEXT PRIMARY KEY,
           next_sequence INTEGER NOT NULL

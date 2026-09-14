@@ -25,6 +25,7 @@ import { requestMobilePush } from './mobilePushRequest';
 import { TrayManager } from '../../tray/TrayManager';
 import type { PromptKind } from '../../tray/fleetSnapshot';
 import { logger } from '../../utils/logger';
+import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 
 /**
  * NIM-2208: session ids whose bit this process has set since startup.
@@ -48,6 +49,17 @@ export function resetPendingPromptTracking(): void {
   sessionsWithPendingPrompt.clear();
 }
 
+export interface PendingPromptPersistenceOptions {
+  /** Generation that opened the prompt, or the exact generation allowed to clear it. */
+  attentionGeneration?: string;
+}
+
+export interface PendingPromptPersistenceResult {
+  applied: boolean;
+  superseded: boolean;
+  attentionGeneration: string | null;
+}
+
 /**
  * `kind` is what the prompt is asking for: `approval` for a tool permission or
  * commit proposal (a tap), `decision` for a question, a plan, or a structured
@@ -60,30 +72,32 @@ export async function setSessionPendingPrompt(
   sessionId: string,
   hasPendingPrompt: boolean,
   kind: PromptKind = 'approval',
-): Promise<void> {
-  if (!sessionId) return;
+  options: PendingPromptPersistenceOptions = {},
+): Promise<PendingPromptPersistenceResult> {
+  const attentionGeneration = options.attentionGeneration?.trim()
+    || getSessionStateManager().getSessionState(sessionId)?.attentionGeneration
+    || null;
+  if (!sessionId) {
+    return { applied: false, superseded: false, attentionGeneration };
+  }
+
+  const liveGeneration = getSessionStateManager().getSessionState(sessionId)?.attentionGeneration;
+  if (hasPendingPrompt && attentionGeneration && liveGeneration && liveGeneration !== attentionGeneration) {
+    return { applied: false, superseded: true, attentionGeneration };
+  }
 
   // A prompt that is already open must not push again -- repeated sets would
   // burn the server's forced-push budget on a single blocked session.
   const wasAlreadyPending = sessionsWithPendingPrompt.has(sessionId);
 
-  // Before the awaits: the tray is in-memory, so a slow or failed row update
-  // must not leave the menu bar showing a blocked session as merely running.
-  if (hasPendingPrompt) {
-    TrayManager.getInstance().onPromptCreated(sessionId, kind);
-  } else {
-    TrayManager.getInstance().onPromptResolved(sessionId);
-  }
-
+  let localApplied = false;
   try {
-    await AISessionsRepository.updateMetadata(sessionId, {
-      metadata: { hasPendingPrompt },
-    });
-    if (hasPendingPrompt) {
-      sessionsWithPendingPrompt.add(sessionId);
-    } else {
-      sessionsWithPendingPrompt.delete(sessionId);
-    }
+    localApplied = await AISessionsRepository.compareAndSetPendingPrompt(
+      sessionId,
+      hasPendingPrompt,
+      hasPendingPrompt ? attentionGeneration : null,
+      !hasPendingPrompt && attentionGeneration ? attentionGeneration : undefined,
+    );
   } catch (err) {
     logger.main.warn(
       `[pendingPromptPersistence] Failed to persist hasPendingPrompt=${hasPendingPrompt} for session ${sessionId}:`,
@@ -91,12 +105,46 @@ export async function setSessionPendingPrompt(
     );
   }
 
+  if (!localApplied) {
+    return { applied: false, superseded: attentionGeneration !== null, attentionGeneration };
+  }
+
+  // A replacement may start while the database CAS is in flight. Undo only
+  // this generation if it lost ownership; a newer prompt remains untouched.
+  if (hasPendingPrompt && attentionGeneration) {
+    const currentGeneration = getSessionStateManager().getSessionState(sessionId)?.attentionGeneration;
+    if (currentGeneration && currentGeneration !== attentionGeneration) {
+      await AISessionsRepository.compareAndSetPendingPrompt(
+        sessionId,
+        false,
+        null,
+        attentionGeneration,
+      ).catch(() => false);
+      return { applied: false, superseded: true, attentionGeneration };
+    }
+  }
+
+  if (hasPendingPrompt) {
+    sessionsWithPendingPrompt.add(sessionId);
+    TrayManager.getInstance().onPromptCreated(sessionId, kind);
+  } else {
+    sessionsWithPendingPrompt.delete(sessionId);
+    TrayManager.getInstance().onPromptResolved(sessionId);
+  }
+
   try {
     const sp = getSyncProvider();
-    if (sp) {
+    if (sp && localApplied) {
+      const metadata = attentionGeneration
+        ? {
+            hasPendingPrompt,
+            pendingPromptGeneration: hasPendingPrompt ? attentionGeneration : null,
+            updatedAt: Date.now(),
+          }
+        : { hasPendingPrompt, updatedAt: Date.now() };
       sp.pushChange(sessionId, {
         type: 'metadata_updated',
-        metadata: { hasPendingPrompt, updatedAt: Date.now() } as any,
+        metadata: metadata as any,
       });
     }
   } catch (err) {
@@ -106,9 +154,15 @@ export async function setSessionPendingPrompt(
     );
   }
 
-  if (hasPendingPrompt && !wasAlreadyPending) {
+  if (hasPendingPrompt && localApplied && !wasAlreadyPending) {
     void notifyMobileOfBlockedSession(sessionId);
   }
+
+  return {
+    applied: localApplied,
+    superseded: false,
+    attentionGeneration,
+  };
 }
 
 /**

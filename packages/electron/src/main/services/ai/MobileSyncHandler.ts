@@ -1,4 +1,3 @@
-import { sessionInbox } from './sessionInboxService';
 import type { BrowserWindow } from 'electron';
 import { applyRemoteReadReceipt } from '../../ipc/ReadReceiptHandlers';
 import { applyRemoteTrackerPersonalState } from '../../ipc/TrackerPersonalStateHandlers';
@@ -642,16 +641,16 @@ export class MobileSyncHandler {
       initMobileSessionControlHandler(syncProvider, findWindowByWorkspace, {
         triggerQueuedPromptProcessing: (sessionId, workspacePath) =>
           this.ctx.triggerQueuedPromptProcessingForSession(sessionId, workspacePath, 'mobile-control'),
-        rollbackExecutingPrompts: async (sessionId) => {
-          await sessionInbox.end(sessionInbox.current(sessionId), false).catch(err => logger.main.error('[AIService] Inbox retirement failed during mobile interruption:', err));
-          // Use the delivery-aware sweep so that a mobile-initiated cancel
-          // doesn't re-deliver a prompt that already landed in the
-          // conversation. Returns the count of rows that actually moved
-          // back to pending (matches the prior contract).
+        reconcileQueuedTurnControl: async (sessionId, capability) => {
           const { getQueuedPromptsStore } = await import('../RepositoryManager');
-          const { rolledBack } = await getQueuedPromptsStore().sweepExecutingForSession(sessionId);
+          const { reconcileQueuedTurnsBeforeControl } = await import('./queuedTurnRecovery');
+          const result = await reconcileQueuedTurnsBeforeControl(
+            sessionId,
+            getQueuedPromptsStore(),
+            capability,
+          );
           await this.ctx.publishQueueStateToSync(sessionId);
-          return rolledBack;
+          return result;
         },
       });
     } catch (error) {

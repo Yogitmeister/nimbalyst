@@ -826,6 +826,49 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
       }
     },
 
+    async compareAndSetPendingPrompt(
+      sessionId: string,
+      hasPendingPrompt: boolean,
+      attentionGeneration: string | null,
+      expectedGeneration?: string,
+    ): Promise<boolean> {
+      await ensureReady();
+      const sqlite = isSQLiteStoreAdapter(db);
+      const sql = sqlite
+        ? `UPDATE ai_sessions
+           SET metadata = json_set(
+             CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+             '$.hasPendingPrompt', json($2),
+             '$.pendingPromptGeneration', CASE WHEN $3 IS NULL THEN json('null') ELSE $3 END
+           )
+           WHERE id = $1
+             AND ($4 IS NULL OR (
+               json_extract(metadata, '$.hasPendingPrompt') = 1
+               AND json_extract(metadata, '$.pendingPromptGeneration') = $4
+             ))
+           RETURNING id`
+        : `UPDATE ai_sessions
+           SET metadata = jsonb_set(
+             jsonb_set(COALESCE(metadata, '{}'::jsonb), '{hasPendingPrompt}', to_jsonb($2::boolean), true),
+             '{pendingPromptGeneration}',
+             CASE WHEN $3::text IS NULL THEN 'null'::jsonb ELSE to_jsonb($3::text) END,
+             true
+           )
+           WHERE id = $1
+             AND ($4::text IS NULL OR (
+               metadata->>'hasPendingPrompt' = 'true'
+               AND metadata->>'pendingPromptGeneration' = $4::text
+             ))
+           RETURNING id`;
+      const { rows } = await db.query<{ id: string }>(sql, [
+        sessionId,
+        sqlite ? (hasPendingPrompt ? 'true' : 'false') : hasPendingPrompt,
+        attentionGeneration,
+        expectedGeneration ?? null,
+      ]);
+      return rows.length === 1;
+    },
+
     async applyVisibilityMutation(
       sessionId: string,
       mutation: SessionVisibilityStoreMutation,

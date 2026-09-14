@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
-import { driveStrandedQueuesOnBoot } from '../bootQueueRecovery';
+import { driveStrandedQueuesOnBoot, reconcileExecutingQueuesOnBoot } from '../bootQueueRecovery';
 
 type DepOverrides = Partial<Omit<Parameters<typeof driveStrandedQueuesOnBoot>[0], 'requestDrive'>>;
 
@@ -96,6 +96,55 @@ describe('driveStrandedQueuesOnBoot', () => {
     expect(deps.requestDrive).toHaveBeenCalledExactlyOnceWith('ok', '/ws');
     expect(deps.logWarn).toHaveBeenCalledExactlyOnceWith(
       '[Main] Boot recovery: failed to recover one session; continuing',
+    );
+  });
+});
+
+describe('reconcileExecutingQueuesOnBoot', () => {
+  it('retains provider-bound active ownership and settles only exact terminal/unbound claims', async () => {
+    const rows = [
+      {
+        id: 'bound-active', sessionId: 's1', status: 'executing' as const,
+        claimToken: 'claim-active', dispatchStartedAt: 1, attentionGeneration: 'generation-active',
+        providerThreadId: 'thread-a', providerTurnId: 'turn-a', providerTurnState: 'active' as const,
+      },
+      {
+        id: 'terminal', sessionId: 's1', status: 'executing' as const,
+        claimToken: 'claim-terminal', dispatchStartedAt: 1, attentionGeneration: 'generation-terminal',
+        providerTurnState: 'completed' as const,
+      },
+      {
+        id: 'pre-dispatch', sessionId: 's1', status: 'executing' as const,
+        claimToken: 'claim-release', attentionGeneration: 'generation-release',
+      },
+      {
+        id: 'unbound-dispatched', sessionId: 's1', status: 'executing' as const,
+        claimToken: 'claim-fail', dispatchStartedAt: 1, attentionGeneration: 'generation-fail',
+        providerTurnState: 'unbound' as const,
+      },
+    ];
+    const store = {
+      listExecutingSessionIds: vi.fn(async () => ['s1']),
+      listForSession: vi.fn(async () => rows),
+      releaseClaim: vi.fn(async () => ({ outcome: 'settled' as const })),
+      completeAfterDispatch: vi.fn(async () => ({ outcome: 'settled' as const })),
+      failAfterDispatch: vi.fn(async () => ({ outcome: 'settled' as const })),
+    };
+
+    await expect(reconcileExecutingQueuesOnBoot(store)).resolves.toEqual({
+      completed: 1, failed: 1, released: 1, retained: 1,
+    });
+    expect(store.completeAfterDispatch).toHaveBeenCalledWith(
+      'terminal', 's1', 'claim-terminal', undefined, 'generation-terminal',
+    );
+    expect(store.releaseClaim).toHaveBeenCalledWith('pre-dispatch', 's1', 'claim-release');
+    expect(store.failAfterDispatch).toHaveBeenCalledWith(
+      'unbound-dispatched',
+      'Host restarted before provider turn identity was available',
+      's1',
+      'claim-fail',
+      undefined,
+      'generation-fail',
     );
   });
 });

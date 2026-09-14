@@ -25,6 +25,13 @@ vi.mock('../../../utils/store', () => ({ getDefaultEffortLevel: () => undefined 
 vi.mock('../../attachments/attachmentStagingRoot', () => ({
   resolveAttachmentStagingAllowDirectories: () => [],
 }));
+vi.mock('../aiServiceQueuedChainSettlement', () => ({
+  endHostBoundAiSession: async (manager: any, sessionId: string, attentionGeneration: string) => {
+    if (manager.getSessionState(sessionId)?.attentionGeneration !== attentionGeneration) return false;
+    await manager.endSession(sessionId, { attentionGeneration });
+    return true;
+  },
+}));
 
 describe('claudeCliLauncherSingleton', () => {
   beforeEach(() => {
@@ -34,6 +41,7 @@ describe('claudeCliLauncherSingleton', () => {
 
   async function loadHarness(opts?: {
     claudeInstalled?: boolean;
+    startError?: Error & { attentionGeneration?: string };
     /** When set, the mocked session resolves to this worktree (id + on-disk path). */
     worktree?: { id: string; path: string } | null;
   }) {
@@ -42,10 +50,20 @@ describe('claudeCliLauncherSingleton', () => {
     const manager = {
       isTerminalActive: vi.fn(() => false),
     };
+    let state: { status: string; attentionGeneration: string } | undefined;
     const stateManager = {
-      startSession: vi.fn(async () => undefined),
+      startSession: vi.fn(async () => {
+        state = { status: 'running', attentionGeneration: 'generation-a' };
+        if (opts?.startError) throw opts.startError;
+        return 'generation-a';
+      }),
       endSession: vi.fn(async () => undefined),
-      updateActivity: vi.fn(async () => undefined),
+      getSessionState: vi.fn(() => state),
+      updateActivity: vi.fn(async (input: { status?: string; attentionGeneration?: string }) => {
+        if (!state) return;
+        state.status = input.status ?? state.status;
+        if (input.attentionGeneration) state.attentionGeneration = input.attentionGeneration;
+      }),
     };
     const launch = vi.fn(async (_input?: any): Promise<void> => undefined);
 
@@ -107,7 +125,15 @@ describe('claudeCliLauncherSingleton', () => {
     }));
 
     const mod = await import('../claudeCliLauncherSingleton');
-    return { ...mod, manager, stateManager, launch };
+    return {
+      ...mod,
+      manager,
+      stateManager,
+      launch,
+      replaceState: (attentionGeneration: string) => {
+        state = { status: 'running', attentionGeneration };
+      },
+    };
   }
 
   it('coalesces concurrent ensure calls for the same session', async () => {
@@ -149,7 +175,37 @@ describe('claudeCliLauncherSingleton', () => {
     await h.ensureClaudeCliSession({ sessionId: 'session-1', workspacePath: '/work' });
     onExit?.(7);
 
-    expect(h.stateManager.endSession).toHaveBeenCalledWith('session-1');
+    await vi.waitFor(() => expect(h.stateManager.endSession).toHaveBeenCalledWith(
+      'session-1',
+      { attentionGeneration: 'generation-a' },
+    ));
+  }, 20000);
+
+  it('does not let a delayed CLI exit end a replacement generation', async () => {
+    const h = await loadHarness();
+    let onExit: ((exitCode: number) => void) | undefined;
+    h.launch.mockImplementationOnce(async (input: { onExit?: (exitCode: number) => void }) => {
+      onExit = input.onExit;
+    });
+    await h.ensureClaudeCliSession({ sessionId: 'session-1', workspacePath: '/work' });
+    h.replaceState('generation-b');
+    onExit?.(7);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(h.stateManager.endSession).not.toHaveBeenCalled();
+  }, 20000);
+
+  it('cleans up the exact generation when session start persistence fails', async () => {
+    const startError = Object.assign(new Error('database unavailable'), {
+      attentionGeneration: 'generation-a',
+    });
+    const h = await loadHarness({ startError });
+
+    await expect(h.ensureClaudeCliSession({
+      sessionId: 'session-1', workspacePath: '/work',
+    })).resolves.toMatchObject({ success: false });
+    expect(h.stateManager.endSession).toHaveBeenCalledWith(
+      'session-1', { attentionGeneration: 'generation-a' },
+    );
   }, 20000);
 
   it('short-circuits without launching when claude is not installed (NIM-852)', async () => {

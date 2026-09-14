@@ -524,6 +524,26 @@ describe('PGLiteSessionStore.updateMetadata nullable column clears', () => {
   });
 });
 
+describe('PGLiteSessionStore pending-prompt generation CAS', () => {
+  it('binds the expected generation in the same statement that clears attention', async () => {
+    const db = {
+      query: vi.fn()
+        .mockResolvedValueOnce({ rows: [{ id: 's1' }] })
+        .mockResolvedValueOnce({ rows: [] }),
+    };
+    const store = createPGLiteSessionStore(db as any);
+
+    await expect(store.compareAndSetPendingPrompt?.('s1', false, null, 'generation-b'))
+      .resolves.toBe(true);
+    await expect(store.compareAndSetPendingPrompt?.('s1', false, null, 'generation-a'))
+      .resolves.toBe(false);
+    const [sql, params] = db.query.mock.calls[0];
+    expect(sql).toContain("metadata->>'pendingPromptGeneration' = $4::text");
+    expect(sql).toContain('RETURNING id');
+    expect(params).toEqual(['s1', false, null, 'generation-b']);
+  });
+});
+
 describe('PGLiteSessionStore visibility mutation CAS', () => {
   const mutation = {
     mutationId: 'mutation-a',

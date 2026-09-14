@@ -59,6 +59,14 @@ export type CodexTransport = 'sdk' | 'app-server';
  */
 export interface CodexProtocol extends AgentProtocol {
   setApiKey?(apiKey: string): void;
+  readThreadTurns?(session: ProtocolSession): Promise<{
+    threadId: string;
+    turns: Array<{ id: string; status: string }>;
+  }>;
+  interruptTurn?(
+    session: ProtocolSession,
+    identity: { threadId: string; turnId: string },
+  ): Promise<boolean>;
 }
 
 interface ProtocolSessionIdleScheduler {
@@ -331,6 +339,56 @@ export class OpenAICodexProvider extends BaseAgentProvider {
 
   public static setCodexAuthGate(gate: (() => Promise<{ requiresOpenaiAuth: boolean }>) | null): void {
     OpenAICodexProvider.codexAuthGate = gate;
+  }
+
+  /**
+   * Provider-authoritative view for queued-turn recovery. A missing live
+   * protocol or unsupported transport intentionally returns null so callers
+   * retain the writer fence instead of projecting idle.
+   */
+  async inspectQueuedTurn(sessionId: string): Promise<{
+    identityProven: boolean;
+    threadId: string;
+    turns: Array<{ id: string; status: 'active' | 'completed' | 'failed' | 'interrupted' | 'unknown' }>;
+  } | null> {
+    const session = this.liveProtocolSessions.get(sessionId);
+    if (!session || !this.protocol.readThreadTurns) return null;
+    try {
+      const read = await this.protocol.readThreadTurns(session);
+      return {
+        identityProven: Boolean(read.threadId),
+        threadId: read.threadId,
+        turns: read.turns.map((turn) => ({
+          id: turn.id,
+          status: turn.status === 'inProgress' || turn.status === 'active'
+            ? 'active'
+            : turn.status === 'completed'
+              ? 'completed'
+              : turn.status === 'failed'
+                ? 'failed'
+                : turn.status === 'interrupted'
+                  ? 'interrupted'
+                  : 'unknown',
+        })),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  override getQueuedTurnControlCapability() {
+    if (!this.protocol.readThreadTurns || !this.protocol.interruptTurn) return null;
+    return {
+      inspect: (sessionId: string) => this.inspectQueuedTurn(sessionId),
+      interruptExact: async (
+        sessionId: string,
+        identity: { threadId: string; turnId: string },
+      ) => {
+        const session = this.liveProtocolSessions.get(sessionId);
+        if (!session) return false;
+        return this.protocol.interruptTurn!(session, identity);
+      },
+    };
   }
 
   constructor(config?: { apiKey?: string }, deps?: OpenAICodexProviderDeps) {
@@ -1304,6 +1362,27 @@ export class OpenAICodexProvider extends BaseAgentProvider {
           && (event as { metadata?: { transport?: string } }).metadata?.transport === 'app-server';
 
         if (isAppServerEvent) {
+          const metadata = (event as { metadata?: { method?: unknown; params?: unknown } }).metadata;
+          const params = metadata?.params as {
+            threadId?: unknown;
+            turnId?: unknown;
+            turn?: { id?: unknown };
+          } | undefined;
+          const providerTurnId = typeof params?.turn?.id === 'string'
+            ? params.turn.id
+            : typeof params?.turnId === 'string'
+              ? params.turnId
+              : undefined;
+          if (
+            metadata?.method === 'turn/started'
+            && typeof params?.threadId === 'string'
+            && providerTurnId
+          ) {
+            yield {
+              type: 'turn_started',
+              providerTurn: { threadId: params.threadId, turnId: providerTurnId },
+            };
+          }
           // NIM-2962: surface MCP server health instead of discarding it.
           this.handleAppServerMcpStatus(event, sessionId);
           try {

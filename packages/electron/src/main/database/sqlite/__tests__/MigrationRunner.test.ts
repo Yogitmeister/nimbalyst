@@ -98,6 +98,7 @@ describe('runMigrations', () => {
     fs.writeFileSync(path.join(tmp, '0031_queued_prompt_dispatch_fencing.sql'), '-- noop\n');
     fs.writeFileSync(path.join(tmp, '0032_queued_prompt_truth_provenance.sql'), '-- noop\n');
     fs.writeFileSync(path.join(tmp, '0043_host_control_schema_foundation.sql'), '-- noop\n');
+    fs.writeFileSync(path.join(tmp, '0044_queued_turn_ownership.sql'), '-- noop\n');
 
     const db = new FakeDb();
     // Hack: inject our own migration list via reflection-equivalent. Re-using
@@ -111,13 +112,13 @@ describe('runMigrations', () => {
     // a stand-in implementation; for now, test the file-backed path with the
     // bundled migrations.
     const result = runMigrations(db as unknown as import('better-sqlite3').Database, tmp);
-    expect(result.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 43]);
+    expect(result.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 43, 44]);
     expect(result.skipped).toEqual([]);
 
     // Second invocation: nothing to apply, all skipped.
     const result2 = runMigrations(db as unknown as import('better-sqlite3').Database, tmp);
     expect(result2.applied).toEqual([]);
-    expect(result2.skipped).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 43]);
+    expect(result2.skipped).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 43, 44]);
 
     // Anti-flake: unused locals lint silencer.
     void customs;
@@ -244,6 +245,7 @@ describe('runMigrations', () => {
     fs.writeFileSync(path.join(tmp, '0031_queued_prompt_dispatch_fencing.sql'), '-- noop\n');
     fs.writeFileSync(path.join(tmp, '0032_queued_prompt_truth_provenance.sql'), '-- noop\n');
     fs.writeFileSync(path.join(tmp, '0043_host_control_schema_foundation.sql'), '-- noop\n');
+    fs.writeFileSync(path.join(tmp, '0044_queued_turn_ownership.sql'), '-- noop\n');
     const db = new FakeDb();
     runMigrations(db as unknown as import('better-sqlite3').Database, tmp);
     expect(db.execs.some((s) => s.includes('CREATE TABLE foo'))).toBe(true);
@@ -344,6 +346,8 @@ describe('runMigrations against the real schema dir', () => {
         CREATE TABLE _migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT 'test');
         CREATE TABLE queued_prompts (
           id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL DEFAULT 'legacy-session',
+          status TEXT NOT NULL DEFAULT 'pending',
           interrupt_target_generation TEXT,
           interrupt_reservation_owner TEXT,
           interrupt_receipt TEXT
@@ -356,7 +360,16 @@ describe('runMigrations against the real schema dir', () => {
         VALUES ('legacy-unknown', 'generation-a', NULL)
       `).run();
 
-      expect(runMigrations(db, schemaDir).applied).toEqual([43]);
+      expect(runMigrations(db, schemaDir).applied).toEqual([43, 44]);
+      expect(db.prepare(`PRAGMA table_info(queued_prompts)`).all().map((row: { name: string }) => row.name))
+        .toEqual(expect.arrayContaining([
+          'attention_generation',
+          'host_dispatch_id',
+          'provider_thread_id',
+          'provider_turn_id',
+          'provider_turn_attached_at',
+          'provider_turn_state',
+        ]));
       expect(db.prepare(`
         SELECT interrupt_application_state AS state, interrupt_reservation_owner AS owner,
                interrupt_operation_id AS operationId, interrupt_fence AS fence

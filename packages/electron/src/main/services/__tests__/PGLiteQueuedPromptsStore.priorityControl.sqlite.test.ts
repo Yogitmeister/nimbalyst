@@ -5,6 +5,7 @@ import * as path from 'path';
 import { SQLiteDatabase } from '../../database/sqlite/SQLiteDatabase';
 import { createSQLiteStoreAdapter } from '../../database/sqlite/SQLiteStoreAdapter';
 import { createPGLiteQueuedPromptsStore } from '../PGLiteQueuedPromptsStore';
+import { createPGLiteSessionStore } from '../PGLiteSessionStore';
 
 describe('PGLiteQueuedPromptsStore SQLite parity', () => {
   let tmpDir: string;
@@ -184,6 +185,45 @@ describe('PGLiteQueuedPromptsStore SQLite parity', () => {
     await expect(store.deletePending('editable', 'wrong-session')).resolves.toBe(false);
     await expect(store.deletePending('editable', 'session-1')).resolves.toBe(true);
     await expect(store.deletePending('owned', 'session-1')).resolves.toBe(false);
+  });
+
+  it('matches provider-turn ownership CAS and attachment timestamp semantics', async () => {
+    const store = createPGLiteQueuedPromptsStore(createSQLiteStoreAdapter(database));
+    await store.create({ id: 'provider-owner', sessionId: 'session-1', prompt: 'owned' });
+    const claimed = await store.claim('provider-owner', 'session-1');
+    const token = claimed!.claimToken!;
+    await store.beginDispatch('provider-owner', 'session-1', token, 'generation-a');
+    const identity = {
+      promptId: 'provider-owner', sessionId: 'session-1', claimToken: token,
+      attentionGeneration: 'generation-a', providerThreadId: 'thread-a', providerTurnId: 'turn-a',
+    };
+
+    await expect(store.attachProviderTurn(identity)).resolves.toMatchObject({ outcome: 'settled' });
+    await expect(store.get('provider-owner')).resolves.toMatchObject({
+      attentionGeneration: 'generation-a', providerThreadId: 'thread-a', providerTurnId: 'turn-a',
+      providerTurnState: 'active', turnId: undefined,
+    });
+    expect((await store.get('provider-owner'))?.providerTurnAttachedAt).toEqual(expect.any(Number));
+    await expect(store.attachProviderTurn({ ...identity, attentionGeneration: 'generation-stale' }))
+      .resolves.toMatchObject({ outcome: 'terminal_conflict' });
+  });
+
+  it('keeps a newer pending-prompt generation when an older terminal clear arrives', async () => {
+    const store = createPGLiteSessionStore(createSQLiteStoreAdapter(database));
+    await expect(store.compareAndSetPendingPrompt?.('session-1', true, 'generation-b'))
+      .resolves.toBe(true);
+    await expect(store.compareAndSetPendingPrompt?.('session-1', false, null, 'generation-a'))
+      .resolves.toBe(false);
+    await expect(store.compareAndSetPendingPrompt?.('session-1', false, null, 'generation-b'))
+      .resolves.toBe(true);
+    const { rows } = await database.query<{ metadata: string }>(
+      `SELECT metadata FROM ai_sessions WHERE id = $1`,
+      ['session-1'],
+    );
+    expect(JSON.parse(rows[0].metadata)).toMatchObject({
+      hasPendingPrompt: false,
+      pendingPromptGeneration: null,
+    });
   });
 
   it('serializes distinct control rows on one target lifecycle generation', async () => {

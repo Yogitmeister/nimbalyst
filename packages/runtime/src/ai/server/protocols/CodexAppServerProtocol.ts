@@ -370,6 +370,20 @@ export class CodexAppServerProtocol implements AgentProtocol {
       turnStartResultId = turnStart?.turn?.id ?? null;
       raw.activeTurnId = turnStartResultId;
       turnStartResolved = true;
+      // This is the authoritative ownership receipt for the generator. It is
+      // deliberately emitted before any buffered notification so the host can
+      // durably attach a queued claim before accepting later liveness/terminal
+      // callbacks for this turn.
+      if (turnStartResultId) {
+        yield {
+          type: 'raw_event',
+          metadata: {
+            transport: 'app-server',
+            method: 'turn/started',
+            params: { threadId: raw.threadId, turn: { id: turnStartResultId }, source: 'turn/start' },
+          },
+        };
+      }
       for (const pending of pendingTurnNotifications.splice(0)) {
         dispatchOwnedNotification(pending.method, pending.params);
       }
@@ -488,6 +502,45 @@ export class CodexAppServerProtocol implements AgentProtocol {
       unsubscribe();
       raw.compactionInProgress = false;
     }
+  }
+
+  /** Read provider turns without trusting the host's cached running state. */
+  async readThreadTurns(session: ProtocolSession): Promise<{
+    threadId: string;
+    turns: Array<{ id: string; status: string }>;
+  }> {
+    const raw = this.assertRaw(session);
+    const result = await raw.client.request<{
+      thread?: { turns?: Array<{ id?: unknown; status?: unknown }> };
+      turns?: Array<{ id?: unknown; status?: unknown }>;
+    }>('thread/read', { threadId: raw.threadId, includeTurns: true });
+    const candidates = result.thread?.turns ?? result.turns ?? [];
+    return {
+      threadId: raw.threadId,
+      turns: candidates.flatMap((turn) => (
+        typeof turn.id === 'string' && typeof turn.status === 'string'
+          ? [{ id: turn.id, status: turn.status }]
+          : []
+      )),
+    };
+  }
+
+  /** Interrupt only the provider turn named by durable queue ownership. */
+  async interruptTurn(
+    session: ProtocolSession,
+    identity: { threadId: string; turnId: string },
+  ): Promise<boolean> {
+    const raw = this.assertRaw(session);
+    if (raw.threadId !== identity.threadId) return false;
+    const read = await this.readThreadTurns(session);
+    const owned = read.turns.find((turn) => turn.id === identity.turnId);
+    if (!owned || (owned.status !== 'inProgress' && owned.status !== 'active')) return false;
+    const params: TurnInterruptParams = {
+      threadId: identity.threadId,
+      turnId: identity.turnId,
+    };
+    raw.client.notify('turn/interrupt', params);
+    return true;
   }
 
   abortSession(session: ProtocolSession): void {

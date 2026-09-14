@@ -9,11 +9,16 @@
  */
 
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import { randomUUID } from 'crypto';
 import {
   AISessionsRepository,
   SessionFilesRepository,
 } from "@nimbalyst/runtime";
 import type { SessionMeta } from "@nimbalyst/runtime";
+import {
+  SessionVisibilityControlService,
+  toSessionVisibilityErrorPayload,
+} from '../services/SessionVisibilityControlService';
 import {
   appendPendingPromptSection,
   collectPendingPromptDescriptionsFromRawRows,
@@ -883,6 +888,104 @@ export const SESSION_CONTEXT_TOOL_SCHEMAS = [
   },
 ];
 
+export const SESSION_VISIBILITY_TOOL_NAMES = [
+  'session_set_pinned',
+  'session_set_workstream',
+  'session_rename',
+] as const;
+
+const SESSION_VISIBILITY_TOOL_NAME_SET = new Set<string>(SESSION_VISIBILITY_TOOL_NAMES);
+
+/** OpenAI function-calling schemas for extension-agent hosts. The host still
+ * supplies its own bound principal/workspace to the dispatcher below. */
+export function getSessionVisibilityOpenAITools() {
+  return SESSION_CONTEXT_TOOL_SCHEMAS
+    .filter((tool) => SESSION_VISIBILITY_TOOL_NAME_SET.has(tool.name))
+    .map((tool) => ({
+      type: 'function' as const,
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.inputSchema,
+      },
+    }));
+}
+
+export interface HostBoundSessionVisibilityAuthority {
+  actorSessionId: string;
+  workspacePath: string;
+}
+
+export function deriveHostBoundSessionVisibilityAuthority(
+  actorSessionId: string | undefined,
+  boundState: { workspacePath?: string } | null | undefined,
+): Readonly<HostBoundSessionVisibilityAuthority> | null {
+  if (!actorSessionId || !boundState?.workspacePath?.trim()) return null;
+  return Object.freeze({
+    actorSessionId,
+    workspacePath: boundState.workspacePath.trim(),
+  });
+}
+
+/** Extension/broker-safe visibility dispatcher. Backend tool arguments cannot
+ * replace the host-bound actor or canonical workspace. */
+export async function dispatchHostBoundSessionVisibilityTool(
+  name: string,
+  args: Record<string, any> | undefined,
+  authority: Readonly<Partial<HostBoundSessionVisibilityAuthority>> | null | undefined,
+) {
+  const toolName = name.replace(/^mcp__nimbalyst-[a-z-]+__/, '');
+  if (!SESSION_VISIBILITY_TOOL_NAME_SET.has(toolName)) {
+    throw new Error(`Unknown session visibility tool: ${name}`);
+  }
+  return dispatchVisibilityControl(
+    toolName as typeof SESSION_VISIBILITY_TOOL_NAMES[number],
+    args,
+    typeof authority?.actorSessionId === 'string' ? authority.actorSessionId : '',
+    typeof authority?.workspacePath === 'string' && authority.workspacePath.trim()
+      ? authority.workspacePath.trim()
+      : '',
+  );
+}
+
+async function dispatchVisibilityControl(
+  toolName: typeof SESSION_VISIBILITY_TOOL_NAMES[number],
+  args: Record<string, any> | undefined,
+  actorSessionId: string,
+  workspacePath: string,
+): Promise<{ content: Array<{ type: string; text: string }>; isError: boolean }> {
+  const service = SessionVisibilityControlService.getInstance();
+  const allowedKeys = toolName === 'session_set_pinned'
+    ? new Set(['sessionId', 'pinned'])
+    : toolName === 'session_set_workstream'
+      ? new Set(['sessionId', 'workstreamId'])
+      : new Set(['sessionId', 'name']);
+  const requestArgumentsValid = Boolean(
+    args && typeof args === 'object' && !Array.isArray(args) &&
+    Object.keys(args).every((key) => allowedKeys.has(key)),
+  );
+  const context = {
+    actorSessionId,
+    workspacePath,
+    source: 'mcp-host' as const,
+    correlationId: `mcp-${randomUUID()}`,
+    requestArgumentsValid,
+  };
+  try {
+    const receipt = toolName === 'session_set_pinned'
+      ? await service.setPinned(context, args?.sessionId, args?.pinned)
+      : toolName === 'session_set_workstream'
+        ? await service.setWorkstream(context, args?.sessionId, args?.workstreamId)
+        : await service.rename(context, args?.sessionId, args?.name);
+    return { content: [{ type: 'text', text: JSON.stringify(receipt) }], isError: false };
+  } catch (error) {
+    return {
+      content: [{ type: 'text', text: JSON.stringify(toSessionVisibilityErrorPayload(error)) }],
+      isError: true,
+    };
+  }
+}
+
 /**
  * Dispatch a session-context tool call and return the MCP `{content, isError}`
  * shape. `name` may carry the `mcp__nimbalyst-session-context__` (or `-host`)
@@ -899,6 +1002,11 @@ export async function dispatchSessionContextTool(
 
   try {
     switch (toolName) {
+      case 'session_set_pinned':
+      case 'session_set_workstream':
+      case 'session_rename':
+        return dispatchVisibilityControl(toolName, args, aiSessionId, workspaceId);
+
       case "get_session_summary": {
         const result = await handleGetSessionSummary(
           args?.sessionId as string | undefined,

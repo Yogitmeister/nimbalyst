@@ -1,5 +1,7 @@
 import type { DocumentContext } from '@nimbalyst/runtime/ai/server/types';
-import type { QueueSettlementResult } from '../PGLiteQueuedPromptsStore';
+import type { QueuedTurnControlCapability } from '@nimbalyst/runtime/ai/server';
+import type { AcceptanceFaultMode } from './acceptanceFaultSeams';
+import type { QueuedProviderTurnIdentity, QueueSettlementResult } from '../PGLiteQueuedPromptsStore';
 import { payloadReceiptsMatch, queueTruthMismatchError, type QueuedPromptPayloadReceipt } from './queuedPromptTruth';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 export type SessionPromptDispatchPreflight = (sessionId: string) => Promise<boolean>;
@@ -59,10 +61,11 @@ export interface ClaimedQueuedPrompt {
 export interface QueuedPromptStoreLike {
   listPending(sessionId: string): Promise<ClaimedQueuedPrompt[]>;
   claim(promptId: string, expectedSessionId: string, claimTrigger?: string): Promise<ClaimedQueuedPrompt | null>;
-  beginDispatch(promptId: string, expectedSessionId: string, claimToken: string): Promise<QueueSettlementResult>;
+  beginDispatch(promptId: string, expectedSessionId: string, claimToken: string, attentionGeneration?: string): Promise<QueueSettlementResult>;
+  attachProviderTurn(identity: QueuedProviderTurnIdentity): Promise<QueueSettlementResult>;
   releaseClaim(promptId: string, expectedSessionId: string, claimToken: string): Promise<QueueSettlementResult>;
-  completeAfterDispatch(promptId: string, expectedSessionId: string, claimToken: string, terminal?: QueuedPromptTerminalReceipt): Promise<QueueSettlementResult>;
-  failAfterDispatch(promptId: string, errorMessage: string, expectedSessionId: string, claimToken: string, terminal?: QueuedPromptTerminalReceipt): Promise<QueueSettlementResult>;
+  completeAfterDispatch(promptId: string, expectedSessionId: string, claimToken: string, terminal?: QueuedPromptTerminalReceipt, attentionGeneration?: string): Promise<QueueSettlementResult>;
+  failAfterDispatch(promptId: string, errorMessage: string, expectedSessionId: string, claimToken: string, terminal?: QueuedPromptTerminalReceipt, attentionGeneration?: string): Promise<QueueSettlementResult>;
 }
 
 export interface QueuedPromptTerminalReceipt {
@@ -70,6 +73,21 @@ export interface QueuedPromptTerminalReceipt {
   terminalAt: number;
   eventSequence: number;
 }
+
+/** Immutable identity of the exact lifecycle turn opened for a queued prompt. */
+export interface QueuedPromptTurnContext {
+  readonly attentionGeneration: string;
+  readonly onProviderTurnStarted: (identity: {
+    providerThreadId: string;
+    providerTurnId: string;
+  }) => Promise<void>;
+  readonly onProviderTerminalSuppressed: (input: {
+    mode: Exclude<AcceptanceFaultMode, 'sync-disconnect'>;
+    capability: QueuedTurnControlCapability;
+  }) => Promise<QueuedPromptTerminalReceipt>;
+}
+
+export type QueuedPromptDispatchOutcome = 'completed' | 'failed';
 
 const settlementAccepted = (result: QueueSettlementResult) =>
   result.outcome === 'settled' || result.outcome === 'idempotent_same_claim';
@@ -84,7 +102,13 @@ interface DispatchClaimedQueuedPromptOptions {
   ) => Promise<void>;
   logError: (message: string, error: unknown) => void;
   onAfterSettled?: () => Promise<void>;
-  onChainSettled?: (payload: { sessionId: string; workspacePath: string; source: string }) => Promise<void>;
+  onChainSettled?: (payload: {
+    sessionId: string;
+    workspacePath: string;
+    source: string;
+    attentionGeneration?: string;
+    outcome: QueuedPromptDispatchOutcome;
+  }) => Promise<void>;
   onPromptClaimed: (payload: { sessionId: string; promptId: string }) => void;
   processingLeases: Map<string, symbol>;
   queueStore: QueuedPromptStoreLike;
@@ -94,10 +118,11 @@ interface DispatchClaimedQueuedPromptOptions {
     documentContext?: DocumentContext,
     sessionId?: string,
     workspacePath?: string,
+    turnContext?: QueuedPromptTurnContext,
   ) => Promise<{ content: string; queuedPromptTerminal?: QueuedPromptTerminalReceipt }>;
   sessionId: string;
   source: string;
-  startSession: (options: { sessionId: string; workspacePath: string }) => Promise<void>;
+  startSession: (options: { sessionId: string; workspacePath: string }) => Promise<string>;
   targetWindow: Electron.BrowserWindow;
   workspacePath: string;
 }
@@ -129,14 +154,40 @@ export async function dispatchClaimedQueuedPrompt(
   }
   processingLeases.set(sessionId, dispatchLease);
 
+  let attentionGeneration: string | undefined;
   try {
-    await startSession({ sessionId, workspacePath });
+    attentionGeneration = await startSession({ sessionId, workspacePath });
+    if (!attentionGeneration.trim()) {
+      throw new Error(`Queued turn ${claimed.id} started without an attention generation`);
+    }
   } catch (error) {
+    if (
+      !attentionGeneration &&
+      typeof error === 'object' &&
+      error !== null &&
+      'attentionGeneration' in error &&
+      typeof (error as { attentionGeneration?: unknown }).attentionGeneration === 'string'
+    ) {
+      attentionGeneration = (error as { attentionGeneration: string }).attentionGeneration;
+    }
     const release = await queueStore.releaseClaim(claimed.id, sessionId, claimToken);
     if (!settlementAccepted(release)) {
       logError(`[AIService] Failed to release pre-dispatch claim ${claimed.id} (${release.outcome})`, error);
     }
     if (processingLeases.get(sessionId) === dispatchLease) processingLeases.delete(sessionId);
+    if (onChainSettled) {
+      try {
+        await onChainSettled({
+          sessionId,
+          workspacePath,
+          source,
+          attentionGeneration,
+          outcome: 'failed',
+        });
+      } catch (settledErr) {
+        logError(`[AIService] ${source}: start-failure settlement hook failed:`, settledErr);
+      }
+    }
     throw error;
   }
 
@@ -173,12 +224,19 @@ export async function dispatchClaimedQueuedPrompt(
   setImmediate(async () => {
     let dispatchStarted = false;
     let compatibleSettlement = false;
+    let outcome: QueuedPromptDispatchOutcome = 'completed';
+    let attachedProviderTurn: { providerThreadId: string; providerTurnId: string } | null = null;
     try {
       if (processingLeases.get(sessionId) !== dispatchLease) return;
       if (claimed.payloadReceipt && !payloadReceiptsMatch(claimed.prompt, claimed.payloadReceipt)) {
         throw queueTruthMismatchError();
       }
-      const begin = await queueStore.beginDispatch(claimed.id, sessionId, claimToken);
+      const begin = await queueStore.beginDispatch(
+        claimed.id,
+        sessionId,
+        claimToken,
+        attentionGeneration,
+      );
       if (!settlementAccepted(begin)) {
         logError(`[AIService] Dispatch intent rejected for queued prompt ${claimed.id} (${begin.outcome})`, new Error(begin.outcome));
         return;
@@ -190,7 +248,79 @@ export async function dispatchClaimedQueuedPrompt(
         senderFrame: targetWindow.webContents.mainFrame,
       } as Electron.IpcMainInvokeEvent;
 
-      const result = await sendMessageHandler(mockEvent, claimed.prompt, docContext, sessionId, workspacePath);
+      const result = await sendMessageHandler(
+        mockEvent,
+        claimed.prompt,
+        docContext,
+        sessionId,
+        workspacePath,
+        Object.freeze({
+          attentionGeneration,
+          onProviderTurnStarted: async ({
+            providerThreadId,
+            providerTurnId,
+          }: {
+            providerThreadId: string;
+            providerTurnId: string;
+          }) => {
+            const ownership = await queueStore.attachProviderTurn({
+              promptId: claimed.id,
+              sessionId,
+              claimToken,
+              attentionGeneration,
+              providerThreadId,
+              providerTurnId,
+            });
+            if (!settlementAccepted(ownership)) {
+              throw new Error(`Queued provider-turn ownership rejected (${ownership.outcome})`);
+            }
+            attachedProviderTurn = { providerThreadId, providerTurnId };
+          },
+          onProviderTerminalSuppressed: async ({ mode, capability }: {
+            mode: Exclude<AcceptanceFaultMode, 'sync-disconnect'>;
+            capability: QueuedTurnControlCapability;
+          }) => {
+            if (!attachedProviderTurn) {
+              throw new Error('Acceptance terminal suppression observed before provider ownership attachment');
+            }
+            const snapshot = await capability.inspect(sessionId);
+            const exactTurn = snapshot?.identityProven && snapshot.threadId === attachedProviderTurn.providerThreadId
+              ? snapshot.turns.find((turn) => turn.id === attachedProviderTurn!.providerTurnId)
+              : null;
+            if (!exactTurn || exactTurn.status === 'active' || exactTurn.status === 'unknown') {
+              throw new Error('Acceptance terminal suppression could not prove the exact provider turn terminal');
+            }
+            const lifecycle: QueuedPromptTerminalReceipt['lifecycle'] =
+              mode === 'drop-terminal-after-final' && exactTurn.status === 'completed'
+                ? 'completed'
+                : 'failed';
+            const terminal: QueuedPromptTerminalReceipt = {
+              lifecycle,
+              terminalAt: Date.now(),
+              eventSequence: Date.now(),
+            };
+            const settlement = lifecycle === 'completed'
+              ? await queueStore.completeAfterDispatch(
+                  claimed.id, sessionId, claimToken, terminal, attentionGeneration,
+                )
+              : await queueStore.failAfterDispatch(
+                  claimed.id,
+                  mode === 'drop-terminal-without-final'
+                    ? 'Provider terminal recovered without a durable final response'
+                    : `Provider turn ended as ${exactTurn.status}`,
+                  sessionId,
+                  claimToken,
+                  terminal,
+                  attentionGeneration,
+                );
+            if (!settlementAccepted(settlement)) {
+              throw new Error(`Acceptance provider reconciliation rejected (${settlement.outcome})`);
+            }
+            return terminal;
+          },
+        }),
+      );
+      outcome = result.queuedPromptTerminal?.lifecycle === 'failed' ? 'failed' : 'completed';
       const completion = result.queuedPromptTerminal?.lifecycle === 'failed'
         ? await queueStore.failAfterDispatch(
             claimed.id,
@@ -198,15 +328,17 @@ export async function dispatchClaimedQueuedPrompt(
             sessionId,
             claimToken,
             result.queuedPromptTerminal,
+            attentionGeneration,
           )
         : result.queuedPromptTerminal
-          ? await queueStore.completeAfterDispatch(claimed.id, sessionId, claimToken, result.queuedPromptTerminal)
-          : await queueStore.completeAfterDispatch(claimed.id, sessionId, claimToken);
+          ? await queueStore.completeAfterDispatch(claimed.id, sessionId, claimToken, result.queuedPromptTerminal, attentionGeneration)
+          : await queueStore.completeAfterDispatch(claimed.id, sessionId, claimToken, undefined, attentionGeneration);
       compatibleSettlement = settlementAccepted(completion);
       if (!compatibleSettlement) {
         logError(`[AIService] Completion rejected for queued prompt ${claimed.id} (${completion.outcome})`, new Error(completion.outcome));
       }
     } catch (queueError) {
+      outcome = 'failed';
       logError(`[AIService] Failed to process queued prompt ${claimed.id}:`, queueError);
       const terminal = (queueError as Error & { queuedPromptTerminal?: QueuedPromptTerminalReceipt }).queuedPromptTerminal;
       const settlement = dispatchStarted
@@ -217,12 +349,15 @@ export async function dispatchClaimedQueuedPrompt(
               sessionId,
               claimToken,
               terminal,
+              attentionGeneration,
             )
           : await queueStore.failAfterDispatch(
               claimed.id,
               queueError instanceof Error ? queueError.message : 'Unknown error',
               sessionId,
               claimToken,
+              undefined,
+              attentionGeneration,
             )
         : await queueStore.releaseClaim(claimed.id, sessionId, claimToken);
       compatibleSettlement = settlementAccepted(settlement);
@@ -249,7 +384,13 @@ export async function dispatchClaimedQueuedPrompt(
       // delete yet), so nobody has marked the session idle. Do it now.
       if (!processingLeases.has(sessionId) && onChainSettled) {
         try {
-          await onChainSettled({ sessionId, workspacePath, source });
+          await onChainSettled({
+            sessionId,
+            workspacePath,
+            source,
+            attentionGeneration,
+            outcome,
+          });
         } catch (settledErr) {
           logError(`[AIService] ${source} finally: chain-settled hook failed:`, settledErr);
         }

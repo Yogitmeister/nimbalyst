@@ -105,6 +105,26 @@ export const AISessionsRepository = {
     await withSessionWriteLocks([sessionId], () => requireStore().updateMetadata(sessionId, metadata));
   },
 
+  async compareAndSetPendingPrompt(
+    sessionId: string,
+    hasPendingPrompt: boolean,
+    attentionGeneration: string | null,
+    expectedGeneration?: string,
+  ): Promise<boolean> {
+    return withSessionWriteLocks([sessionId], async () => {
+      const store = requireStore();
+      if (!store.compareAndSetPendingPrompt) {
+        throw new Error('SESSION_PENDING_PROMPT_CAS_UNAVAILABLE');
+      }
+      return store.compareAndSetPendingPrompt(
+        sessionId,
+        hasPendingPrompt,
+        attentionGeneration,
+        expectedGeneration,
+      );
+    });
+  },
+
   /** Dedicated visibility-control primitive; generic metadata cannot widen it. */
   async setPinnedVisibility(
     sessionId: string,

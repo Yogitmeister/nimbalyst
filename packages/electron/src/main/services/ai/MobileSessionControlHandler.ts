@@ -133,12 +133,11 @@ export interface MobileSessionControlCallbacks {
    */
   triggerQueuedPromptProcessing(sessionId: string, workspacePath: string): Promise<boolean>;
 
-  /**
-   * Reset any prompts stuck in 'executing' back to 'pending' for the given
-   * session. Used by `case 'cancel'` so a queued prompt in-flight when
-   * mobile cancels isn't left permanently wedged.
-   */
-  rollbackExecutingPrompts(sessionId: string): Promise<number>;
+  /** Reconcile and, when owned-active, exactly interrupt a durable queued turn. */
+  reconcileQueuedTurnControl(
+    sessionId: string,
+    capability: import('@nimbalyst/runtime/ai/server').QueuedTurnControlCapability | null,
+  ): Promise<{ allowControl: boolean; queuedTurnHandled: boolean; states: string[] }>;
 }
 
 /**
@@ -389,20 +388,6 @@ async function handleCancel(
   sessionId: string,
   callbacks: MobileSessionControlCallbacks
 ): Promise<void> {
-  // Defensive cleanup (provider-agnostic): if a queued prompt was in-flight when
-  // mobile cancelled, the DB row would otherwise stay 'executing' and be invisible
-  // to listPending. Rollback so the queue isn't wedged after this cancel.
-  const rollbackQueuedPrompts = async () => {
-    try {
-      const rolledBack = await callbacks.rollbackExecutingPrompts(sessionId);
-      if (rolledBack > 0) {
-        log.info(`Mobile cancel: rolled back ${rolledBack} executing prompt(s) for session ${sessionId}`);
-      }
-    } catch (rollbackErr) {
-      log.error('Mobile cancel: rollbackExecutingPrompts failed:', rollbackErr);
-    }
-  };
-
   // claude-code-cli is an external CLI process with NO in-process provider —
   // abort it by sending Ctrl-C to the terminal PTY, mirroring the desktop
   // `ai:cancelRequest` handler (AIService.ts).
@@ -414,7 +399,6 @@ async function handleCancel(
       log.warn('Mobile cancel: no active claude-code-cli terminal for session:', sessionId);
       return;
     }
-    await rollbackQueuedPrompts();
     terminalManager.writeToTerminal(sessionId, '\x03');
     log.info('Mobile cancel: sent Ctrl+C to CLI session', sessionId);
     notifyAllWindows('ai:sessionCancelled', { sessionId });
@@ -422,8 +406,20 @@ async function handleCancel(
   }
 
   if (provider && 'abort' in provider) {
+    const typedProvider = provider as import('@nimbalyst/runtime/ai/server').AIProvider;
+    const reconciliation = await callbacks.reconcileQueuedTurnControl(
+      sessionId,
+      typedProvider.getQueuedTurnControlCapability?.() ?? null,
+    );
+    if (!reconciliation.allowControl) {
+      log.warn(`Mobile cancel retained queued writer fence (${reconciliation.states.join(', ')})`);
+      return;
+    }
+    if (reconciliation.queuedTurnHandled) {
+      notifyAllWindows('ai:sessionCancelled', { sessionId });
+      return;
+    }
     log.info('Aborting session:', sessionId);
-    await rollbackQueuedPrompts();
     (provider as { abort: () => void }).abort();
 
     // Notify renderer to update UI

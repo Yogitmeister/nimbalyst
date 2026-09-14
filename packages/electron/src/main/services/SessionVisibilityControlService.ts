@@ -146,6 +146,10 @@ interface SessionVisibilityControlDependencies {
   reservationOwnerId?: string;
   assertStorageRootOwnership?: () => void;
   withStorageRootWriteFence?: <T>(work: () => Promise<T>) => Promise<T>;
+  withAcceptanceCommitBarrier?: <T>(
+    sessionId: string,
+    work: () => Promise<T>,
+  ) => Promise<T>;
 }
 
 interface RateLimitBucket {
@@ -486,6 +490,10 @@ export class SessionVisibilityControlService {
   private readonly liveReservations = new Set<string>();
   private readonly assertStorageRootOwnership: () => void;
   private readonly withStorageRootWriteFence: <T>(work: () => Promise<T>) => Promise<T>;
+  private readonly withAcceptanceCommitBarrier: <T>(
+    sessionId: string,
+    work: () => Promise<T>,
+  ) => Promise<T>;
 
   static getInstance(deps: SessionVisibilityControlDependencies = {}): SessionVisibilityControlService {
     if (!SessionVisibilityControlService.instance) {
@@ -514,6 +522,26 @@ export class SessionVisibilityControlService {
     this.assertStorageRootOwnership = deps.assertStorageRootOwnership ?? (() => undefined);
     this.withStorageRootWriteFence = deps.withStorageRootWriteFence
       ?? ((work) => this.withStorageRootFence(work));
+    this.withAcceptanceCommitBarrier = deps.withAcceptanceCommitBarrier
+      ?? (async (sessionId, work) => {
+        if (
+          process.env.NIMBALYST_TEST_ACCEPT !== '1' ||
+          process.env.NIMBALYST_ACCEPT_FAULT !== 'sync-disconnect'
+        ) {
+          return work();
+        }
+        const [{ app }, { getSyncProvider }, { withAcceptanceSyncDisconnect }] = await Promise.all([
+          import('electron'),
+          import('./SyncManager'),
+          import('./ai/acceptanceFaultSeams'),
+        ]);
+        return withAcceptanceSyncDisconnect({
+          sessionId,
+          userDataPath: () => app.getPath('userData'),
+          getSyncProvider,
+          run: work,
+        });
+      });
     this.broadcasterReady = deps.broadcast !== undefined;
     this.convergenceOutbox = deps.convergenceOutbox ?? new SessionVisibilityConvergenceOutbox({
       filePath: deps.convergenceOutboxFilePath,
@@ -978,7 +1006,10 @@ export class SessionVisibilityControlService {
         throw error;
       }
       try {
-        await this.withStorageRootWriteFence(write);
+        await this.withAcceptanceCommitBarrier(
+          request.targetSessionId,
+          () => this.withStorageRootWriteFence(write),
+        );
       } catch (error) {
         state.after = before;
         await this.withStorageRootFence(

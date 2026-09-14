@@ -2835,34 +2835,28 @@ app.whenReady().then(async () => {
     aiService = new AIService(runtimeSessionStore);
     markEnd('ai-service-init');
 
-    // Recovery sweep: any queued_prompts row that was 'executing' when the
-    // app shut down is now invisible to listPending. sweepExecutingOnBoot
-    // distinguishes "delivered, but the agent was paused on a user prompt
-    // (AskUserQuestion / ExitPlanMode / permission request) at quit" from
-    // "crashed before the user message was ever sent" by checking whether
-    // an ai_agent_messages input row exists for the session at or after
-    // claimed_at. Delivered rows are marked completed; undelivered rows
-    // are rolled back to pending for retry. Without this split, a session
-    // paused on AskUserQuestion at quit gets its original user prompt
-    // re-sent on next launch (NIM-615).
+    // Reconcile exact durable queue owners before admitting any boot work.
+    // Provider-bound nonterminal rows remain fenced; host-only rows settle by
+    // claim token + generation. Message timestamps never decide ownership.
     try {
       const { getQueuedPromptsStore } = await import('./services/RepositoryManager');
+      const { reconcileExecutingQueuesOnBoot } = await import('./services/ai/bootQueueRecovery');
       const queuedPromptsStore = getQueuedPromptsStore();
-      const { completed, failed, rolledBack } = await queuedPromptsStore.sweepExecutingOnBoot();
-      if (completed > 0 || failed > 0 || rolledBack > 0) {
+      const { completed, failed, released, retained } = await reconcileExecutingQueuesOnBoot(queuedPromptsStore);
+      if (completed > 0 || failed > 0 || released > 0 || retained > 0) {
         logger.main.info(
-          `[Main] Boot sweep: ${completed} answered prompt(s) marked completed, ${failed} delivered-but-unanswered prompt(s) marked failed, ${rolledBack} undelivered prompt(s) rolled back to pending`
+          `[Main] Boot queue reconciliation: completed=${completed}, failed=${failed}, released=${released}, retained=${retained}`
         );
       }
 
-    } catch (sweepErr) {
-      logger.main.error('[Main] Boot sweep failed:', sweepErr);
+    } catch (reconcileErr) {
+      logger.main.error('[Main] Boot queue reconciliation failed:', reconcileErr);
     }
 
     // Check for pending restart continuations and queue continuation prompts
     await checkForRestartContinuation(aiService);
 
-    // The boot sweep normalizes rows to 'pending' but claims none of them, and
+    // Boot reconciliation may release pre-dispatch rows to 'pending', and
     // restart continuation only queues — before this, both sat there until the
     // user happened to open the session's transcript (#962). Hand every session
     // with pending rows to the queue driver, which defers until a window for

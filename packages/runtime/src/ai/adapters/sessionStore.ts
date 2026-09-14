@@ -179,6 +179,13 @@ export interface SessionStore {
     obligationId: string,
   ): Promise<boolean>;
   updateMetadata(sessionId: string, metadata: UpdateSessionMetadataPayload): Promise<void>;
+  /** Atomically set/clear pending attention, optionally only for one generation. */
+  compareAndSetPendingPrompt?(
+    sessionId: string,
+    hasPendingPrompt: boolean,
+    attentionGeneration: string | null,
+    expectedGeneration?: string,
+  ): Promise<boolean>;
   /** Atomically applies the exact visibility write and its recovery identity. */
   applyVisibilityMutation?(
     sessionId: string,

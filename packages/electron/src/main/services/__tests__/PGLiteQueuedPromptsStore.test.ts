@@ -53,7 +53,14 @@ async function createDatabase(): Promise<PGlite> {
       provider_output_message_id TEXT,
       stream_event_sequence INTEGER NOT NULL DEFAULT 0,
       terminal_status TEXT,
-      terminal_at TIMESTAMPTZ
+      terminal_at TIMESTAMPTZ,
+      attention_generation TEXT,
+      host_dispatch_id TEXT,
+      provider_thread_id TEXT,
+      provider_turn_id TEXT,
+      provider_turn_attached_at TIMESTAMPTZ,
+      provider_turn_state TEXT NOT NULL DEFAULT 'unbound'
+        CHECK (provider_turn_state IN ('unbound', 'active', 'completed', 'failed', 'interrupted', 'uncertain'))
     );
     CREATE TABLE ai_agent_messages (
       id BIGSERIAL PRIMARY KEY,
@@ -73,6 +80,9 @@ async function createDatabase(): Promise<PGlite> {
     CREATE UNIQUE INDEX idx_queued_prompts_control_idempotency
       ON queued_prompts(session_id, idempotency_key)
       WHERE idempotency_key IS NOT NULL;
+    CREATE UNIQUE INDEX idx_queued_prompts_provider_turn
+      ON queued_prompts(provider_thread_id, provider_turn_id)
+      WHERE provider_thread_id IS NOT NULL AND provider_turn_id IS NOT NULL;
     INSERT INTO ai_sessions (id, metadata) VALUES
       ('session-a', '{}'::jsonb),
       ('session-b', '{}'::jsonb),
@@ -231,6 +241,55 @@ describe('PGLiteQueuedPromptsStore dispatch fencing', () => {
       status: 'failed',
       settlementProvenance: 'dispatch_failed',
       errorMessage: SWEEP_UNANSWERED_ERROR,
+    });
+  });
+
+  it('binds provider ownership with claim and generation CAS without repurposing host turn provenance', async () => {
+    const db = await createDatabase();
+    const store = createPGLiteQueuedPromptsStore(db as any);
+    await store.create({ id: 'owner-a', sessionId: 'session-a', prompt: 'owned' });
+    await store.create({ id: 'owner-b', sessionId: 'session-b', prompt: 'duplicate' });
+    const ownerA = await store.claim('owner-a', 'session-a');
+    const ownerB = await store.claim('owner-b', 'session-b');
+    await store.beginDispatch('owner-a', 'session-a', ownerA!.claimToken!, 'generation-a');
+    await store.beginDispatch('owner-b', 'session-b', ownerB!.claimToken!, 'generation-b');
+
+    const identity = {
+      promptId: 'owner-a', sessionId: 'session-a', claimToken: ownerA!.claimToken!,
+      attentionGeneration: 'generation-a', providerThreadId: 'thread-a', providerTurnId: 'turn-a',
+    };
+    await expect(store.attachProviderTurn(identity)).resolves.toMatchObject({ outcome: 'settled' });
+    await expect(store.attachProviderTurn(identity)).resolves.toMatchObject({ outcome: 'settled' });
+    await expect(store.get('owner-a')).resolves.toMatchObject({
+      attentionGeneration: 'generation-a',
+      providerThreadId: 'thread-a',
+      providerTurnId: 'turn-a',
+      providerTurnState: 'active',
+      turnId: undefined,
+    });
+    expect((await store.get('owner-a'))?.providerTurnAttachedAt).toEqual(expect.any(Number));
+
+    await expect(store.attachProviderTurn({ ...identity, attentionGeneration: 'stale' }))
+      .resolves.toMatchObject({ outcome: 'terminal_conflict' });
+    await expect(store.attachProviderTurn({
+      ...identity,
+      promptId: 'owner-b', sessionId: 'session-b', claimToken: ownerB!.claimToken!,
+      attentionGeneration: 'generation-b',
+    })).rejects.toThrow();
+  });
+
+  it('settles a provider without turn_started using the generation persisted at dispatch', async () => {
+    const db = await createDatabase();
+    const store = createPGLiteQueuedPromptsStore(db as any);
+    await store.create({ id: 'non-codex', sessionId: 'session-a', prompt: 'ordinary provider' });
+    const claim = await store.claim('non-codex', 'session-a');
+    await store.beginDispatch('non-codex', 'session-a', claim!.claimToken!, 'generation-non-codex');
+
+    await expect(store.completeAfterDispatch(
+      'non-codex', 'session-a', claim!.claimToken!, undefined, 'generation-non-codex',
+    )).resolves.toMatchObject({ outcome: 'settled' });
+    await expect(store.get('non-codex')).resolves.toMatchObject({
+      status: 'completed', attentionGeneration: 'generation-non-codex', providerTurnState: 'unbound',
     });
   });
 

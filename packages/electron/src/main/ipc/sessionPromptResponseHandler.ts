@@ -12,6 +12,8 @@ import {
 } from "../services/ai/gitCommitProposalPromptUtils";
 import { setSessionPendingPrompt } from "../services/ai/pendingPromptPersistence";
 import { deliverCodexQuestionAnswer } from "../services/ai/codexQuestionDelivery";
+import { getSessionStateManager } from "@nimbalyst/runtime/ai/server/SessionStateManager";
+import { settleOrphanedPromptTurn } from "../services/ai/orphanedPromptTurnSettlement";
 
 export function registerSessionPromptResponseHandler(): void {
   /**
@@ -38,6 +40,8 @@ export function registerSessionPromptResponseHandler(): void {
       try {
         const { sessionId, promptId, promptType, response, respondedBy } =
           params;
+        const attentionGeneration = getSessionStateManager()
+          .getSessionState(sessionId)?.attentionGeneration;
         if (
           promptType === "ask_user_question_request" &&
           (await AISessionsRepository.get(sessionId))?.provider ===
@@ -331,11 +335,12 @@ export function registerSessionPromptResponseHandler(): void {
                 `Marking session as idle.`
             );
             try {
-              const { getSessionStateManager } = await import(
-                "@nimbalyst/runtime/ai/server/SessionStateManager"
-              );
-              const stateManager = getSessionStateManager();
-              await stateManager.endSession(sessionId);
+              if (attentionGeneration) {
+                await settleOrphanedPromptTurn(
+                  { sessionId, attentionGeneration },
+                  "interrupted",
+                );
+              }
             } catch (cleanupErr) {
               console.warn(
                 "[SessionHandlers] Failed to mark orphaned session as idle:",
@@ -356,7 +361,14 @@ export function registerSessionPromptResponseHandler(): void {
         // session as idle. The runtime atom clear paths in
         // sessionStateListeners are still in place; this is the durable
         // backstop that survives renderer reloads and reaches mobile.
-        void setSessionPendingPrompt(sessionId, false);
+        if (attentionGeneration) {
+          void setSessionPendingPrompt(
+            sessionId,
+            false,
+            "approval",
+            { attentionGeneration },
+          );
+        }
 
         return { success: true, responseContent };
       } catch (error) {

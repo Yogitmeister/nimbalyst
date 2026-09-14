@@ -34,6 +34,7 @@ import { startClaudeCliProxyObservation, fireClaudeCliTurnCompletion } from './c
 import { flushNextClaudeCliQueuedPromptForSession } from './claudeCliQueueFlushSingleton';
 import { maybeAutoNameClaudeCliSessionProduction } from './claudeCliSessionAutoNameSingleton';
 import type { ClaudeTurnState } from './claudeCliPidState';
+import { endHostBoundAiSession } from './aiServiceQueuedChainSettlement';
 
 interface ClaudeCliLauncherConfig {
   // Internal MCP-server enablement (ports, kill-switches, loaders, auth token)
@@ -280,13 +281,16 @@ export async function ensureClaudeCliSession(
   const stateManager = getSessionStateManager();
 
   const launchPromise = (async (): Promise<EnsureClaudeCliSessionResult> => {
+    let attentionGeneration: string | undefined;
     try {
       // Track the session so the PID watcher's updateActivity has in-memory state.
-      await stateManager.startSession({
+      attentionGeneration = await stateManager.startSession({
         sessionId: input.sessionId,
         workspacePath: input.workspacePath,
         initialStatus: 'running',
       });
+      let currentTurnGeneration = attentionGeneration;
+      let turnStateTail: Promise<void> = Promise.resolve();
 
       const launcher = buildLauncher();
       // Pre-authorize the workspace's chat-attachments root so pasted images
@@ -329,6 +333,64 @@ export async function ensureClaudeCliSession(
       // its own default rather than blocking the launch.
       const effortLevel = await resolveClaudeCliEffortLevel(input);
 
+      const handleTurnState = async (state: ClaudeTurnState): Promise<void> => {
+        const status = state === 'idle'
+          ? 'idle'
+          : state === 'running'
+          ? 'running'
+          : 'waiting_for_input';
+        const isStreaming = state === 'running';
+        const stateBefore = stateManager.getSessionState(input.sessionId);
+        const beginsNewTurn = state !== 'idle'
+          && (stateBefore?.status === 'idle' || stateBefore?.status === 'error');
+
+        if (beginsNewTurn) {
+          await stateManager.updateActivity({ sessionId: input.sessionId, status, isStreaming });
+          const rotatedState = stateManager.getSessionState(input.sessionId);
+          if (!rotatedState?.attentionGeneration || rotatedState.status !== status) return;
+          currentTurnGeneration = rotatedState.attentionGeneration;
+        } else {
+          if (
+            state !== 'idle'
+            && stateBefore?.attentionGeneration
+            && stateBefore.attentionGeneration !== currentTurnGeneration
+          ) {
+            currentTurnGeneration = stateBefore.attentionGeneration;
+          }
+          await stateManager.updateActivity({
+            sessionId: input.sessionId,
+            status,
+            isStreaming,
+            attentionGeneration: currentTurnGeneration,
+          });
+        }
+
+        const currentState = stateManager.getSessionState(input.sessionId);
+        if (
+          !currentState
+          || currentState.attentionGeneration !== currentTurnGeneration
+          || currentState.status !== status
+        ) return;
+
+        const watchRoot = resolvedCwd ?? input.workspacePath;
+        if (state === 'idle') {
+          cliFileWatcher.scheduleStop(input.sessionId, 500);
+          fireClaudeCliTurnCompletion(input.sessionId, input.workspacePath);
+          void maybeAutoNameClaudeCliSessionProduction(input.sessionId);
+          void flushNextClaudeCliQueuedPromptForSession(input.sessionId, input.workspacePath);
+        } else if (state === 'running') {
+          await cliFileWatcher.ensureForSession(input.sessionId, watchRoot);
+        }
+      };
+
+      const enqueueTurnState = (state: ClaudeTurnState): Promise<void> => {
+        const run = turnStateTail.then(() => handleTurnState(state));
+        turnStateTail = run.catch((err) => {
+          console.warn('[ClaudeCliLauncher] Failed to apply CLI turn state:', err);
+        });
+        return run;
+      };
+
       await launcher.launch({
         sessionId: input.sessionId,
         workspacePath: input.workspacePath,
@@ -339,40 +401,19 @@ export async function ensureClaudeCliSession(
         cols: input.cols,
         rows: input.rows,
         additionalDirectories,
-        onTurnState: (state: ClaudeTurnState) => {
-          // idle is the terminal turn boundary; running/waiting are mid-turn.
-          // Root the file watcher at the spawn cwd (the worktree for worktree
-          // sessions), where edits actually land.
-          const watchRoot = resolvedCwd ?? input.workspacePath;
-          if (state === 'idle') {
-            void stateManager.updateActivity({ sessionId: input.sessionId, status: 'idle', isStreaming: false });
-            // Delay the watcher stop so post-turn fs events still attribute.
-            cliFileWatcher.scheduleStop(input.sessionId, 500);
-            // PID idle is the authoritative whole-turn boundary (covers in-process
-            // Task sub-agents) — fire completion notification/sound/analytics here,
-            // not per proxy message, so sub-agent end_turns don't spuriously notify.
-            fireClaudeCliTurnCompletion(input.sessionId, input.workspacePath);
-            // NIM-822: deterministic host-driven naming — if the agent's
-            // opportunistic update_session_meta call didn't name the session by
-            // its first completed turn, derive a title from the first prompt.
-            void maybeAutoNameClaudeCliSessionProduction(input.sessionId);
-            // Flush the next queued prompt (if any) into the now-idle CLI. The
-            // write restarts the CLI, so the following idle drains the next one.
-            void flushNextClaudeCliQueuedPromptForSession(input.sessionId, input.workspacePath);
-          } else if (state === 'running') {
-            void stateManager.updateActivity({ sessionId: input.sessionId, status: 'running', isStreaming: true });
-            // Idempotent; cancels any pending scheduled-stop from a prior turn.
-            void cliFileWatcher
-              .ensureForSession(input.sessionId, watchRoot)
-              .catch((err) => console.warn('[ClaudeCliLauncher] file watcher start failed:', err));
-          } else if (state === 'waiting_for_input') {
-            void stateManager.updateActivity({ sessionId: input.sessionId, status: 'waiting_for_input', isStreaming: false });
-          }
-        },
+        onTurnState: (state: ClaudeTurnState) => enqueueTurnState(state),
         onExit: (exitCode) => {
           console.log(`[ClaudeCliLauncher] Claude CLI exited for ${input.sessionId} with code ${exitCode}; ending AI session state`);
-          void cliFileWatcher.stopForSession(input.sessionId).catch(() => {});
-          void stateManager.endSession(input.sessionId).catch((err) => {
+          const exitRun = turnStateTail.then(async () => {
+            const exitGeneration = currentTurnGeneration;
+            const ended = await endHostBoundAiSession(
+              stateManager,
+              input.sessionId,
+              exitGeneration,
+            );
+            if (ended) await cliFileWatcher.stopForSession(input.sessionId);
+          });
+          turnStateTail = exitRun.catch((err) => {
             console.warn('[ClaudeCliLauncher] Failed to end session after CLI exit:', err);
           });
         },
@@ -382,7 +423,22 @@ export async function ensureClaudeCliSession(
     } catch (error) {
       console.error('[ClaudeCliLauncher] Failed to ensure session:', error);
       // Roll the session back out of "running" so the UI doesn't spin forever.
-      void stateManager.endSession(input.sessionId).catch(() => {});
+      if (
+        !attentionGeneration
+        && typeof error === 'object'
+        && error !== null
+        && 'attentionGeneration' in error
+        && typeof (error as { attentionGeneration?: unknown }).attentionGeneration === 'string'
+      ) {
+        attentionGeneration = (error as { attentionGeneration: string }).attentionGeneration;
+      }
+      if (attentionGeneration) {
+        await endHostBoundAiSession(
+          stateManager,
+          input.sessionId,
+          attentionGeneration,
+        ).catch(() => false);
+      }
       return { success: false, error: String(error) };
     } finally {
       launchInFlight.delete(input.sessionId);

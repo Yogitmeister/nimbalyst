@@ -104,53 +104,53 @@ describe('clearStalePendingPromptOnTerminal (NIM-871)', () => {
     // showing "awaiting user input".
     const clearPendingPrompt = vi.fn().mockResolvedValue(undefined);
     const result = await clearStalePendingPromptOnTerminal(
-      { type: 'session:completed', sessionId },
+      { type: 'session:completed', sessionId, attentionGeneration: 'generation-a' },
       {
-        readHasPendingPrompt: async () => true,
-        clearPendingPrompt,
+        clearPendingPrompt: async (...args) => {
+          clearPendingPrompt(...args);
+          return true;
+        },
       },
     );
     expect(result).toBe(true);
-    expect(clearPendingPrompt).toHaveBeenCalledWith(sessionId);
+    expect(clearPendingPrompt).toHaveBeenCalledWith(sessionId, 'generation-a');
   });
 
   it('clears on interruption (stop / crash) too', async () => {
     const clearPendingPrompt = vi.fn().mockResolvedValue(undefined);
     await clearStalePendingPromptOnTerminal(
-      { type: 'session:interrupted', sessionId },
-      { readHasPendingPrompt: async () => true, clearPendingPrompt },
+      { type: 'session:interrupted', sessionId, attentionGeneration: 'generation-a' },
+      { clearPendingPrompt: async (...args) => { clearPendingPrompt(...args); return true; } },
     );
-    expect(clearPendingPrompt).toHaveBeenCalledWith(sessionId);
+    expect(clearPendingPrompt).toHaveBeenCalledWith(sessionId, 'generation-a');
   });
 
-  it('does NOT write on a normal turn end with no pending prompt', async () => {
-    const clearPendingPrompt = vi.fn().mockResolvedValue(undefined);
+  it('does not report an applied clear when the atomic CAS finds no pending prompt', async () => {
+    const clearPendingPrompt = vi.fn().mockResolvedValue(false);
     const result = await clearStalePendingPromptOnTerminal(
-      { type: 'session:completed', sessionId },
-      { readHasPendingPrompt: async () => false, clearPendingPrompt },
+      { type: 'session:completed', sessionId, attentionGeneration: 'generation-a' },
+      { clearPendingPrompt },
     );
     expect(result).toBe(false);
-    expect(clearPendingPrompt).not.toHaveBeenCalled();
+    expect(clearPendingPrompt).toHaveBeenCalledWith(sessionId, 'generation-a');
   });
 
   it('does NOT clear on a non-terminal (in-flight) event', async () => {
-    const readHasPendingPrompt = vi.fn().mockResolvedValue(true);
     const clearPendingPrompt = vi.fn().mockResolvedValue(undefined);
     const result = await clearStalePendingPromptOnTerminal(
       { type: 'session:waiting', sessionId },
-      { readHasPendingPrompt, clearPendingPrompt },
+      { clearPendingPrompt },
     );
     expect(result).toBe(false);
     // A non-terminal event must not even probe the DB.
-    expect(readHasPendingPrompt).not.toHaveBeenCalled();
     expect(clearPendingPrompt).not.toHaveBeenCalled();
   });
 
-  it('does nothing when the bit cannot be determined (null)', async () => {
+  it('does nothing when a legacy terminal event has no generation', async () => {
     const clearPendingPrompt = vi.fn().mockResolvedValue(undefined);
     const result = await clearStalePendingPromptOnTerminal(
       { type: 'session:completed', sessionId },
-      { readHasPendingPrompt: async () => null, clearPendingPrompt },
+      { clearPendingPrompt },
     );
     expect(result).toBe(false);
     expect(clearPendingPrompt).not.toHaveBeenCalled();
@@ -159,12 +159,11 @@ describe('clearStalePendingPromptOnTerminal (NIM-871)', () => {
   it('reports read/clear failures without throwing', async () => {
     const onError = vi.fn();
     const result = await clearStalePendingPromptOnTerminal(
-      { type: 'session:completed', sessionId },
+      { type: 'session:completed', sessionId, attentionGeneration: 'generation-a' },
       {
-        readHasPendingPrompt: async () => {
+        clearPendingPrompt: async () => {
           throw new Error('db down');
         },
-        clearPendingPrompt: vi.fn(),
         onError,
       },
     );

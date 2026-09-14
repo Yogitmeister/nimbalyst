@@ -132,6 +132,34 @@ export interface InterruptTurnResult {
   hadActiveTurn?: boolean;
 }
 
+export type ProviderQueuedTurnStatus =
+  | 'active'
+  | 'completed'
+  | 'failed'
+  | 'interrupted'
+  | 'unknown';
+
+export interface ProviderQueuedTurnSnapshot {
+  identityProven: boolean;
+  threadId: string;
+  turns: Array<{ id: string; status: ProviderQueuedTurnStatus }>;
+}
+
+export interface ProviderQueuedTurnIdentity {
+  threadId: string;
+  turnId: string;
+}
+
+/**
+ * Optional provider capability used by durable queue recovery. The host must
+ * never substitute `abort()` for this contract: exact identity is what keeps a
+ * replacement provider turn from being interrupted by a delayed control.
+ */
+export interface QueuedTurnControlCapability {
+  inspect(sessionId: string): Promise<ProviderQueuedTurnSnapshot | null>;
+  interruptExact(sessionId: string, identity: ProviderQueuedTurnIdentity): Promise<boolean>;
+}
+
 export interface AIProvider extends EventEmitter {
   /**
    * Initialize the provider with configuration
@@ -178,6 +206,9 @@ export interface AIProvider extends EventEmitter {
    * next queued prompt. The return value lets the caller distinguish the two.
    */
   interruptCurrentTurn(): Promise<InterruptTurnResult>;
+
+  /** Exact queued-turn inspection/control, or null when unsupported. */
+  getQueuedTurnControlCapability?(): QueuedTurnControlCapability | null;
 
   /**
    * Get the transport-shape capabilities of this provider (does it stream, does
@@ -299,6 +330,10 @@ export abstract class BaseAIProvider extends EventEmitter implements AIProvider 
   async interruptCurrentTurn(): Promise<InterruptTurnResult> {
     this.abort();
     return { method: 'abort' };
+  }
+
+  getQueuedTurnControlCapability(): QueuedTurnControlCapability | null {
+    return null;
   }
 
   registerToolHandler(handler: ToolHandler): void {

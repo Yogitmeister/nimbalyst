@@ -14,7 +14,7 @@ import { codexQuestionTurns } from './codexQuestionTurns';
  * when it lived inline in `setupIpcHandlers()`.
  */
 
-import { BrowserWindow } from 'electron';
+import { app, BrowserWindow } from 'electron';
 import * as path from 'path';
 import {
   ProviderFactory,
@@ -52,8 +52,16 @@ import {
 import { toolRegistry } from './tools';
 import type { DriveReason } from './QueueDriveService';
 import { resolveExtensionAgentRef, usesHostSuppliedToolLoop } from './providerResolution';
+import { getPrivilegedExtensionHost } from '../../extensions/PrivilegedExtensionHost';
 import { resolveProviderAuthRequirement } from './providerAuthRequirement';
 import { getAgentProviderRegistry } from '../../extensions/AgentProviderRegistry';
+import type {
+  QueuedPromptTerminalReceipt,
+  QueuedPromptTurnContext,
+} from './queuedPromptDispatcher';
+import { endHostBoundAiSession } from './aiServiceQueuedChainSettlement';
+import { settleTerminalAttentionBeforeContinuation } from './terminalAttentionSettlement';
+import { wrapProviderStreamForAcceptance } from './acceptanceFaultSeams';
 
 /**
  * Resolve the human-readable model name (e.g. "Gemini 3.5 Flash (High)") for a
@@ -209,7 +217,28 @@ export type SendMessageHandler = (
   documentContext?: DocumentContext,
   sessionId?: string,
   workspacePath?: string,
-) => Promise<{ content: string }>;
+  turnContext?: QueuedPromptTurnContext,
+) => Promise<{ content: string; queuedPromptTerminal?: QueuedPromptTerminalReceipt }>;
+
+/** Binds a trusted actor/workspace pair before the extension bridge creates the
+ * backend session and starts its stream. */
+export function beginHostBoundExtensionAgentTurn<T>(args: {
+  extensionId: string;
+  moduleId: string;
+  runtimeWorkspacePath: string;
+  actorSessionId: string;
+  canonicalWorkspacePath: string;
+  send: () => AsyncIterableIterator<T>;
+}): AsyncIterableIterator<T> {
+  getPrivilegedExtensionHost().bindNextExtensionAgentTurnAuthority({
+    extensionId: args.extensionId,
+    moduleId: args.moduleId,
+    runtimeWorkspacePath: args.runtimeWorkspacePath,
+    actorSessionId: args.actorSessionId,
+    canonicalWorkspacePath: args.canonicalWorkspacePath,
+  });
+  return args.send();
+}
 
 /**
  * Structural view of the AIService members this handler needs. Keeping it
@@ -392,7 +421,24 @@ export class MessageStreamingHandler {
     documentContext?: DocumentContext,
     sessionId?: string,
     workspacePath?: string,
+    turnContext?: QueuedPromptTurnContext,
   ) => {
+    // Assigned at the authoritative startSession boundary. Every deferred
+    // callback below carries this immutable turn identity, never mutable state.
+    let attentionGeneration: string | undefined;
+    const stateManager = getSessionStateManager();
+    const settleOwnedTurn = async (
+      activeSessionId: string,
+      reason: 'completed' | 'error' | 'cancelled' | 'interrupted',
+    ): Promise<boolean> => {
+      const generation = attentionGeneration;
+      if (!generation) return false;
+      const settlement = await settleTerminalAttentionBeforeContinuation(
+        { sessionId: activeSessionId, attentionGeneration: generation, reason },
+        () => endHostBoundAiSession(stateManager, activeSessionId, generation),
+      );
+      return settlement.continuationResult === true;
+    };
     // Check for queued prompt deduplication - prevents duplicate execution from multiple renderer panels
     const queuedPromptId = (documentContext as any)?.queuedPromptId as string | undefined;
     if (queuedPromptId) {
@@ -941,7 +987,12 @@ export class MessageStreamingHandler {
       hasPendingPrompt: boolean,
       kind: PromptKind = 'approval',
     ) => {
-      void setSessionPendingPrompt(sessionId, hasPendingPrompt, kind);
+      void setSessionPendingPrompt(
+        sessionId,
+        hasPendingPrompt,
+        kind,
+        attentionGeneration ? { attentionGeneration } : {},
+      );
     };
 
     // Listen for ExitPlanMode confirmation requests and forward to renderer
@@ -954,6 +1005,7 @@ export class MessageStreamingHandler {
       getSessionStateManager().updateActivity({
         sessionId: data.sessionId,
         status: 'waiting_for_input',
+        attentionGeneration,
       }).catch((err) => {
         logger.main.error('[AIService] Failed to update session status to waiting_for_input:', err);
       });
@@ -990,6 +1042,7 @@ export class MessageStreamingHandler {
         sessionId: data.sessionId,
         status: 'running',
         isStreaming: true,
+        attentionGeneration,
       }).catch((err) => {
         logger.main.error('[AIService] Failed to update session status to running after ExitPlanMode resolve:', err);
       });
@@ -1006,6 +1059,7 @@ export class MessageStreamingHandler {
       getSessionStateManager().updateActivity({
         sessionId: data.sessionId,
         status: 'waiting_for_input',
+        attentionGeneration,
       }).catch((err) => {
         logger.main.error('[AIService] Failed to update session status to waiting_for_input:', err);
       });
@@ -1032,6 +1086,7 @@ export class MessageStreamingHandler {
         sessionId: data.sessionId,
         status: 'running',
         isStreaming: true,
+        attentionGeneration,
       }).catch(() => {});
     };
     this.installListener(provider, 'askUserQuestion:answered', onAskUserQuestionAnswered);
@@ -1046,6 +1101,7 @@ export class MessageStreamingHandler {
       getSessionStateManager().updateActivity({
         sessionId: data.sessionId,
         status: 'waiting_for_input',
+        attentionGeneration,
       }).catch((err) => {
         logger.main.error('[AIService] Failed to update session status to waiting_for_input:', err);
       });
@@ -1076,6 +1132,7 @@ export class MessageStreamingHandler {
         sessionId: data.sessionId,
         status: 'running',
         isStreaming: true,
+        attentionGeneration,
       }).catch(() => {});
     };
     this.installListener(provider, 'toolPermission:resolved', onToolPermissionResolved);
@@ -1188,7 +1245,8 @@ export class MessageStreamingHandler {
         }
 
         logger.main.info(`[AIService] All teammates completed for session ${data.sessionId}, ending deferred session`);
-        await stateManager.endSession(data.sessionId);
+        const settled = await settleOwnedTurn(data.sessionId, 'completed');
+        if (!settled) return;
         // Stop file watcher - session is fully complete (teammates done)
         await this.svc.hooklessWatcher.stopForSession(data.sessionId);
         codexEditWindowRegistry.clearSession(data.sessionId);
@@ -1217,7 +1275,8 @@ export class MessageStreamingHandler {
       if (this.svc.sessionsProcessingQueue.has(data.sessionId)) return;
 
       logger.main.info(`[AIService] Sub-agent drain settled for session ${data.sessionId}, ending deferred session`);
-      await stateManager.endSession(data.sessionId);
+      const settled = await settleOwnedTurn(data.sessionId, 'completed');
+      if (!settled) return;
       await this.svc.hooklessWatcher.stopForSession(data.sessionId);
       codexEditWindowRegistry.clearSession(data.sessionId);
 
@@ -1270,11 +1329,18 @@ export class MessageStreamingHandler {
     void captureTutorialMilestone(effectiveWorkspacePath, 'prompt_sent');
 
     // Mark session as running/active
-    const stateManager = getSessionStateManager();
-    await stateManager.startSession({
-      sessionId: session.id,
-      workspacePath: session.workspacePath || effectiveWorkspacePath,
-    });
+    if (turnContext) {
+      attentionGeneration = turnContext.attentionGeneration;
+      const currentTurn = stateManager.getSessionState(session.id);
+      if (!currentTurn || currentTurn.attentionGeneration !== attentionGeneration) {
+        throw new Error(`Queued turn ${session.id} no longer owns generation ${attentionGeneration}`);
+      }
+    } else {
+      attentionGeneration = await stateManager.startSession({
+        sessionId: session.id,
+        workspacePath: session.workspacePath || effectiveWorkspacePath,
+      });
+    }
 
     // Mark session as executing for mobile sync (shows "Running" indicator)
     const syncProvider = getSyncProvider();
@@ -1313,7 +1379,8 @@ export class MessageStreamingHandler {
     // `finally` below, for the same reason the git activity journal is.
     const stopTurnLiveness = startTurnLivenessTicker({
       sessionId: session.id,
-      markAlive: (sessionId) => stateManager.markTurnAlive(sessionId),
+      markAlive: (activeSessionId) =>
+        stateManager.markTurnAlive(activeSessionId, attentionGeneration),
     });
 
     let inboxTurn: ReturnType<typeof sessionInbox.current>;
@@ -1332,6 +1399,7 @@ export class MessageStreamingHandler {
       let providerError: string | undefined;
       let providerCrashed = false;  // The agent subprocess died from a native fault (#1361)
       let sawCompleteChunk = false;  // A terminal 'complete' chunk arrived
+      let acceptanceFaultTerminal: QueuedPromptTerminalReceipt | undefined;
       let settledOnErrorChunk = false;  // The error branch already ended the session
       let firstChunkTime: number | undefined;
       let chunkCount = 0;
@@ -1609,7 +1677,45 @@ export class MessageStreamingHandler {
               })
             : undefined;
 
-      for await (const chunk of provider.sendMessage(messageToSend, contextWithSession, session.id, sessionMessages, effectiveWorkspacePath, attachments, toolLoopTools, toolLoopSystemPrompt)) {
+      const extensionAgentRef = resolveExtensionAgentRef(session.provider);
+      const rawProviderStream = isMetaAgentToolLoopSession && extensionAgentRef
+        ? (() => {
+            const extensionEntry = getAgentProviderRegistry().findByContributionId(session.provider);
+            if (!extensionEntry) {
+              throw new Error(`Extension-agent provider disappeared: ${session.provider}`);
+            }
+            return beginHostBoundExtensionAgentTurn({
+              extensionId: extensionEntry.extensionId,
+              moduleId: extensionEntry.backendModuleId,
+              runtimeWorkspacePath: effectiveWorkspacePath,
+              actorSessionId: session.id,
+              canonicalWorkspacePath: session.workspacePath || effectiveWorkspacePath,
+              send: () => provider.sendMessage(
+                messageToSend, contextWithSession, session.id, sessionMessages,
+                effectiveWorkspacePath, attachments, toolLoopTools, toolLoopSystemPrompt,
+              ),
+            });
+          })()
+        : provider.sendMessage(
+            messageToSend, contextWithSession, session.id, sessionMessages,
+            effectiveWorkspacePath, attachments, toolLoopTools, toolLoopSystemPrompt,
+          );
+      const providerStream = wrapProviderStreamForAcceptance({
+        stream: rawProviderStream,
+        sessionId: session.id,
+        userDataPath: () => app.getPath('userData'),
+        onTerminalSuppressed: turnContext?.onProviderTerminalSuppressed
+          ? async (mode) => {
+              const capability = provider.getQueuedTurnControlCapability?.();
+              if (!capability) {
+                throw new Error('Acceptance terminal suppression requires exact provider inspection');
+              }
+              acceptanceFaultTerminal = await turnContext.onProviderTerminalSuppressed({ mode, capability });
+            }
+          : undefined,
+      });
+
+      for await (const chunk of providerStream) {
         if (!chunk) continue;
         chunkCount++;
 
@@ -1624,6 +1730,15 @@ export class MessageStreamingHandler {
           });
         }
         switch (chunk.type) {
+          case 'turn_started': {
+            if (turnContext && chunk.providerTurn) {
+              await turnContext.onProviderTurnStarted({
+                providerThreadId: chunk.providerTurn.threadId,
+                providerTurnId: chunk.providerTurn.turnId,
+              });
+            }
+            break;
+          }
           case 'context_usage': {
             // Mid-turn context-fill snapshot (NIM-868). Updates ONLY
             // currentContext so the indicator refreshes per assistant step
@@ -1678,7 +1793,8 @@ export class MessageStreamingHandler {
             if (textChunks === 1) {
               await stateManager.updateActivity({
                 sessionId: session.id,
-                isStreaming: true
+                isStreaming: true,
+                attentionGeneration,
               });
             }
             // if (isClaudeCode && textChunks <= 5) {
@@ -2364,10 +2480,11 @@ export class MessageStreamingHandler {
               && !this.svc.sessionsProcessingQueue.has(session.id)
             ) {
               try {
-                await stateManager.updateActivity({ sessionId: session.id, status: 'error' });
-                await stateManager.endSession(session.id);
-                await this.svc.hooklessWatcher.stopForSession(session.id);
-                settledOnErrorChunk = true;
+                await stateManager.updateActivity({ sessionId: session.id, status: 'error', attentionGeneration });
+                settledOnErrorChunk = await settleOwnedTurn(session.id, 'error');
+                if (settledOnErrorChunk) {
+                  await this.svc.hooklessWatcher.stopForSession(session.id);
+                }
               } catch (settleErr) {
                 logger.main.error('[AIService] Failed to settle tool-loop agent error chunk:', settleErr);
               }
@@ -2808,7 +2925,8 @@ export class MessageStreamingHandler {
                 : 'queued continuation scheduled';
               // logger.main.info(`[AIService] Deferring endSession for ${session.id} - ${reason}`);
             } else {
-              await stateManager.endSession(session.id);
+              const settled = await settleOwnedTurn(session.id, 'completed');
+              if (!settled) break;
               // Stop file watcher after a brief delay to let pending
               // watcher events drain through WorkspaceFileEditAttributionService.
               // The manager cancels the scheduled stop if a new turn starts
@@ -2991,10 +3109,12 @@ export class MessageStreamingHandler {
             : `[AIService] Provider stream for ${session.id} ended on an error chunk without completing -- settling session`
         );
         try {
-          await stateManager.updateActivity({ sessionId: session.id, status: 'error' });
-          await stateManager.endSession(session.id);
-          await this.svc.hooklessWatcher.stopForSession(session.id);
-          codexEditWindowRegistry.clearSession(session.id);
+          await stateManager.updateActivity({ sessionId: session.id, status: 'error', attentionGeneration });
+          const settled = await settleOwnedTurn(session.id, 'error');
+          if (settled) {
+            await this.svc.hooklessWatcher.stopForSession(session.id);
+            codexEditWindowRegistry.clearSession(session.id);
+          }
         } catch (settleErr) {
           logger.main.error('[AIService] Failed to settle unterminated provider error:', settleErr);
         }
@@ -3026,7 +3146,7 @@ export class MessageStreamingHandler {
       if (syncProvider && !this.svc.sessionsProcessingQueue.has(session.id)) {
         syncProvider.pushChange(session.id, {
           type: 'metadata_updated',
-          metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },
+          metadata: { isExecuting: false, updatedAt: Date.now() },
         });
       }
 
@@ -3036,8 +3156,17 @@ export class MessageStreamingHandler {
         // logger.main.info(`[AIService] Cleared prompt tracking for ${queuedPromptId}`);
       }
 
-      return { content: fullResponse };
+      return { content: fullResponse, queuedPromptTerminal: acceptanceFaultTerminal };
     } catch (error) {
+      if (
+        !attentionGeneration &&
+        typeof error === 'object' &&
+        error !== null &&
+        'attentionGeneration' in error &&
+        typeof (error as { attentionGeneration?: unknown }).attentionGeneration === 'string'
+      ) {
+        attentionGeneration = (error as { attentionGeneration: string }).attentionGeneration;
+      }
       await sessionInbox.end(inboxTurn, false).catch(err => logger.main.error('[AIService] Inbox retirement failed:', err));
       const retirement = codexQuestionTurns.end(questionTurn);
       void retirement.catch(err => logger.main.error('[AIService] Question recovery failed after stream error:', err));
@@ -3080,7 +3209,8 @@ export class MessageStreamingHandler {
       if (session?.id) {
         await stateManager.updateActivity({
           sessionId: session.id,
-          status: 'error'
+          status: 'error',
+          attentionGeneration,
         });
 
         // End the session to remove it from active sessions.
@@ -3113,17 +3243,19 @@ export class MessageStreamingHandler {
             : 'queued continuation scheduled';
           logger.main.info(`[AIService] Deferring endSession for ${session.id} on error - ${reason}`);
         } else {
-          await stateManager.endSession(session.id);
-          // Stop file watcher - session ended on error
-          await this.svc.hooklessWatcher.stopForSession(session.id);
-          codexEditWindowRegistry.clearSession(session.id);
+          const settled = await settleOwnedTurn(session.id, 'error');
+          if (settled) {
+            // Stop file watcher - session ended on error
+            await this.svc.hooklessWatcher.stopForSession(session.id);
+            codexEditWindowRegistry.clearSession(session.id);
+          }
         }
 
         // Clear executing and pending prompt flags for mobile sync on error
         if (syncProvider && !this.svc.sessionsProcessingQueue.has(session.id)) {
           syncProvider.pushChange(session.id, {
             type: 'metadata_updated',
-            metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },
+            metadata: { isExecuting: false, updatedAt: Date.now() },
           });
 
           // Forced (#1268): a session that died unattended is exactly when the

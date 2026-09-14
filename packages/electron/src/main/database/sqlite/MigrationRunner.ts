@@ -227,6 +227,11 @@ export function getMigrations(schemaDir: string): Migration[] {
         ensureHostControlStoreIdentity(db, schemaDir);
       },
     },
+    {
+      version: 44,
+      name: 'queued_turn_ownership',
+      sqlFile: path.join(schemaDir, '0044_queued_turn_ownership.sql'),
+    },
   ];
 }
 
