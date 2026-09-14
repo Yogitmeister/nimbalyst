@@ -24,6 +24,7 @@ import { findSessionAttributionForFile } from '../services/sessionFilesByPath';
 import { normalizeSessionPhaseMetadataUpdate } from '../services/session/sessionPhaseTransition';
 import { destroyProviderForArchivedSession } from '../services/ai/archiveSessionProviderLifecycle';
 import { resolveSessionModelSelection } from '../services/ai/sessionModelSelection';
+import { revokeHostBoundMcpAuthority } from '../mcp/httpServer';
 
 // Initialize session manager
 const sessionManager = new SessionManager();
@@ -287,6 +288,7 @@ export async function registerSessionHandlers() {
     safeHandle('session:delete', async (event, sessionId: string) => {
         ProviderFactory.destroyProvider(sessionId);
         await sessionManager.deleteSession(sessionId);
+        await revokeHostBoundMcpAuthority(sessionId);
     });
 
     // Update session title
@@ -770,6 +772,7 @@ export async function registerSessionHandlers() {
 
             const session = await AISessionsRepository.get(sessionId);
             await AISessionsRepository.delete(sessionId);
+            await revokeHostBoundMcpAuthority(sessionId);
             if (session?.workspacePath) {
                 for (const window of BrowserWindow.getAllWindows()) {
                     if (!window.isDestroyed()) window.webContents.send('sessions:refresh-list', { workspacePath: session.workspacePath });
