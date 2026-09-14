@@ -22,7 +22,10 @@ import type {
   AgentMessage
 } from '@nimbalyst/runtime';
 import { filterSessionsForPersonalSync } from '@nimbalyst/runtime/sync';
-import type { SessionVisibilityStoreMutation } from '@nimbalyst/runtime/ai/adapters/sessionStore';
+import type {
+  SessionSyncPublicationObligation,
+  SessionVisibilityStoreMutation,
+} from '@nimbalyst/runtime/ai/adapters/sessionStore';
 
 type PGliteLike = {
   query<T = any>(sql: string, params?: any[]): Promise<{ rows: T[] }>;
@@ -60,6 +63,8 @@ function buildSessionArchiveFilter(includeArchived: boolean, sessionAlias = 's',
 // for the metadata-corruption postmortem.
 const normalizeJsonObject = parseJsonObjectColumn;
 const VISIBILITY_MUTATION_LEDGER_KEY = '__nimbalystVisibilityMutationIds';
+const SYNC_PUBLICATION_OBLIGATION_KEY = '__nimbalystSyncPublicationObligation';
+const INTERNAL_SYNC_PUBLICATION_OBLIGATION = Symbol('internalSyncPublicationObligation');
 
 function isSQLiteStoreAdapter(db: PGliteLike): boolean {
   return db.getEngine?.() === 'sqlite' || typeof db.searchAgentMessages === 'function';
@@ -67,8 +72,16 @@ function isSQLiteStoreAdapter(db: PGliteLike): boolean {
 
 function publicSessionMetadata(value: unknown): Record<string, any> {
   const metadata = { ...normalizeJsonObject(value) };
-  delete metadata[VISIBILITY_MUTATION_LEDGER_KEY];
+  for (const key of Object.keys(metadata)) {
+    if (key.startsWith('__nimbalyst')) delete metadata[key];
+  }
   return metadata;
+}
+
+function storedSessionMetadata(payload: CreateSessionPayload): Record<string, any> {
+  const metadata = publicSessionMetadata((payload as any).metadata);
+  const obligation = (payload as any)[INTERNAL_SYNC_PUBLICATION_OBLIGATION];
+  return obligation ? { ...metadata, [SYNC_PUBLICATION_OBLIGATION_KEY]: obligation } : metadata;
 }
 
 function visibilityMutationRecords(value: unknown): Record<string, string> {
@@ -514,6 +527,14 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
       const updatedAt = new Date(updatedAtMs);
 
       const branchedAt = payload.branchedAt ? new Date(payload.branchedAt) : null;
+      const mergedMetadata = isSQLiteStoreAdapter(db)
+        ? `json_patch(
+            COALESCE((SELECT json_group_object(key, value) FROM json_each(ai_sessions.metadata)
+              WHERE key LIKE '__nimbalyst%'), '{}'),
+            EXCLUDED.metadata
+          )`
+        : `COALESCE((SELECT jsonb_object_agg(key, value) FROM jsonb_each(ai_sessions.metadata)
+              WHERE key LIKE '__nimbalyst%'), '{}'::jsonb) || EXCLUDED.metadata`;
 
       await db.query(
         `INSERT INTO ai_sessions (
@@ -545,7 +566,7 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
           provider_config = EXCLUDED.provider_config,
           provider_session_id = EXCLUDED.provider_session_id,
           draft_input = EXCLUDED.draft_input,
-          metadata = EXCLUDED.metadata,
+          metadata = ${mergedMetadata},
           has_been_named = EXCLUDED.has_been_named,
           updated_at = EXCLUDED.updated_at,
           branched_from_session_id = EXCLUDED.branched_from_session_id,
@@ -569,7 +590,7 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
           payload.providerConfig ?? null,
           payload.providerSessionId ?? null,
           null,
-          (payload as any).metadata ?? {},
+          storedSessionMetadata(payload),
           (payload as any).hasBeenNamed ?? false,
           createdAt,
           updatedAt,
@@ -581,6 +602,94 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
 
       // TODO: Debug logging - uncomment if needed
       // console.log('[PGLiteSessionStore] Session created successfully in database');
+    },
+
+    async createWithSyncPublicationObligation(
+      payload: CreateSessionPayload,
+      obligation: SessionSyncPublicationObligation,
+    ): Promise<void> {
+      const internalPayload = {
+        ...payload,
+        metadata: publicSessionMetadata((payload as any).metadata),
+      };
+      Object.defineProperty(internalPayload, INTERNAL_SYNC_PUBLICATION_OBLIGATION, {
+        value: {
+          ...obligation,
+          sessionId: payload.id,
+          workspaceId: obligation.workspaceId ?? payload.workspaceId ?? 'default',
+        },
+      });
+      await this.create(internalPayload);
+    },
+
+    async listSyncPublicationObligations(
+      limit: number,
+    ): Promise<SessionSyncPublicationObligation[]> {
+      await ensureReady();
+      const boundedLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+      const sqlite = isSQLiteStoreAdapter(db);
+      const predicate = sqlite
+        ? `CASE WHEN json_valid(metadata) THEN
+            json_type(metadata, '$.${SYNC_PUBLICATION_OBLIGATION_KEY}') = 'object'
+            AND json_type(metadata, '$.${SYNC_PUBLICATION_OBLIGATION_KEY}.obligationId') = 'text'
+            AND json_type(metadata, '$.${SYNC_PUBLICATION_OBLIGATION_KEY}.workspaceId') = 'text'
+            AND json_type(metadata, '$.${SYNC_PUBLICATION_OBLIGATION_KEY}.createdAt') IN ('integer', 'real')
+           ELSE FALSE END`
+        : `metadata ? '${SYNC_PUBLICATION_OBLIGATION_KEY}'
+           AND jsonb_typeof(metadata -> '${SYNC_PUBLICATION_OBLIGATION_KEY}') = 'object'
+           AND jsonb_typeof(metadata -> '${SYNC_PUBLICATION_OBLIGATION_KEY}' -> 'obligationId') = 'string'
+           AND jsonb_typeof(metadata -> '${SYNC_PUBLICATION_OBLIGATION_KEY}' -> 'workspaceId') = 'string'
+           AND jsonb_typeof(metadata -> '${SYNC_PUBLICATION_OBLIGATION_KEY}' -> 'createdAt') = 'number'`;
+      await db.query(`CREATE TABLE IF NOT EXISTS session_sync_publication_cursor (
+        cursor_name TEXT PRIMARY KEY,
+        last_session_id TEXT NOT NULL
+      )`);
+      const cursorName = 'create-publication-v1';
+      const cursorRows = await db.query<{ last_session_id: string }>(
+        'SELECT last_session_id FROM session_sync_publication_cursor WHERE cursor_name = $1',
+        [cursorName],
+      );
+      const cursor = cursorRows.rows[0]?.last_session_id ?? '';
+      let result = await db.query<{ id: string; metadata: unknown }>(
+        `SELECT id, metadata FROM ai_sessions WHERE id > $1 AND ${predicate} ORDER BY id LIMIT $2`,
+        [cursor, boundedLimit],
+      );
+      if (result.rows.length === 0 && cursor) {
+        result = await db.query<{ id: string; metadata: unknown }>(
+          `SELECT id, metadata FROM ai_sessions WHERE ${predicate} ORDER BY id LIMIT $1`,
+          [boundedLimit],
+        );
+      }
+      if (result.rows.length > 0) {
+        await db.query(
+          `INSERT INTO session_sync_publication_cursor (cursor_name, last_session_id) VALUES ($1, $2)
+           ON CONFLICT (cursor_name) DO UPDATE SET last_session_id = EXCLUDED.last_session_id`,
+          [cursorName, result.rows[result.rows.length - 1].id],
+        );
+      }
+      return result.rows.flatMap((row) => {
+        const raw = normalizeJsonObject(row.metadata)[SYNC_PUBLICATION_OBLIGATION_KEY];
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
+        const candidate = raw as Partial<SessionSyncPublicationObligation>;
+        if (typeof candidate.obligationId !== 'string' || typeof candidate.workspaceId !== 'string' || typeof candidate.createdAt !== 'number') return [];
+        return [{
+          obligationId: candidate.obligationId.slice(0, 200),
+          sessionId: row.id,
+          workspaceId: candidate.workspaceId,
+          createdAt: candidate.createdAt,
+        }];
+      });
+    },
+
+    async clearSyncPublicationObligation(sessionId: string, obligationId: string): Promise<boolean> {
+      await ensureReady();
+      const sql = isSQLiteStoreAdapter(db)
+        ? `UPDATE ai_sessions SET metadata = json_remove(metadata, '$.${SYNC_PUBLICATION_OBLIGATION_KEY}')
+           WHERE id = $1 AND json_extract(metadata, '$.${SYNC_PUBLICATION_OBLIGATION_KEY}.obligationId') = $2 RETURNING id`
+        : `UPDATE ai_sessions SET metadata = metadata - '${SYNC_PUBLICATION_OBLIGATION_KEY}'
+           WHERE id = $1 AND metadata -> '${SYNC_PUBLICATION_OBLIGATION_KEY}' ->> 'obligationId' = $2 RETURNING id`;
+      const { rows } = await db.query<{ id: string }>(sql, [sessionId, obligationId]);
+      return rows.length === 1;
     },
 
 

@@ -48,9 +48,22 @@ describe('CollabV3 queued prompt truth', () => {
     await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
     const senderIndex = FakeWebSocket.instances[0];
     senderIndex.open();
+    const fetching = sender.fetchIndex!();
+    await vi.waitFor(() => expect(senderIndex.send.mock.calls.some(([payload]) =>
+      JSON.parse(payload as string).type === 'indexPageRequest',
+    )).toBe(true));
+    const request = senderIndex.send.mock.calls
+      .map(([payload]) => JSON.parse(payload as string))
+      .find((message) => message.type === 'indexPageRequest');
+    senderIndex.receive({
+      type: 'indexPageResponse', protocolVersion: 2, requestId: request.requestId,
+      mode: 'bootstrap', entries: [], complete: true, cursor: 0,
+    });
+    await fetching;
+    const sessionTimestamp = Date.now();
     sender.syncSessionsToIndex?.([{
       id: 'session-1', title: 'Queue truth', provider: 'openai-codex', mode: 'agent', workspaceId: '/workspace',
-      messageCount: 0, updatedAt: 1, createdAt: 1,
+      messageCount: 0, updatedAt: sessionTimestamp, createdAt: sessionTimestamp,
     }]);
     await vi.waitFor(() => expect(latestIndexUpdate(senderIndex)).toBeTruthy());
 

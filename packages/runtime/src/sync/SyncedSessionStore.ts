@@ -19,6 +19,7 @@ import type {
   SessionMeta,
   SessionListOptions,
   ChatSession,
+  SessionSyncPublicationObligation,
 } from '../ai/adapters/sessionStore';
 import type { AgentMessage } from '../ai/server/types';
 import type {
@@ -97,6 +98,10 @@ export function createSyncedSessionStore(
 ): SessionStore {
   const opts = { ...DEFAULT_OPTIONS, ...options };
   const connectedSessions = new Set<string>();
+  const publicationTails = new Map<string, Promise<void>>();
+  const publicationJobs = new Map<string, Promise<void>>();
+  const activeBaseMutations = new Set<Promise<unknown>>();
+  const publicationRetries = new Map<string, { attempts: number; timer?: ReturnType<typeof setTimeout> }>();
   let disposed = false;
   let cancelGeneration!: () => void;
   const generationCancelled = new Promise<void>((resolve) => {
@@ -119,6 +124,26 @@ export function createSyncedSessionStore(
     if (outcome.kind === 'error') throw outcome.error;
     assertActive();
     return outcome.value;
+  }
+
+  function trackBaseMutation<T>(operation: Promise<T>): Promise<T> {
+    activeBaseMutations.add(operation);
+    void operation.then(
+      () => activeBaseMutations.delete(operation),
+      () => activeBaseMutations.delete(operation),
+    );
+    return operation;
+  }
+
+  function withPublicationLock<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    const prior = publicationTails.get(sessionId) ?? Promise.resolve();
+    const next = prior.catch(() => undefined).then(operation);
+    const tail = next.then(() => undefined, () => undefined);
+    publicationTails.set(sessionId, tail);
+    void tail.then(() => {
+      if (publicationTails.get(sessionId) === tail) publicationTails.delete(sessionId);
+    });
+    return next;
   }
 
   // Track which sessions should be synced
@@ -166,26 +191,139 @@ export function createSyncedSessionStore(
     await settleWhileActive(syncProvider.pushChange(sessionId, change));
   }
 
+  function obligationKey(obligation: SessionSyncPublicationObligation): string {
+    return `${obligation.sessionId}:${obligation.obligationId}`;
+  }
+
+  function schedulePublicationRetry(obligation: SessionSyncPublicationObligation): void {
+    if (disposed) return;
+    const key = obligationKey(obligation);
+    const state = publicationRetries.get(key) ?? { attempts: 0 };
+    if (state.timer) return;
+    state.attempts = Math.min(state.attempts + 1, 8);
+    const delay = Math.min(30_000, 250 * 2 ** (state.attempts - 1));
+    state.timer = setTimeout(() => {
+      state.timer = undefined;
+      void publishObligation(obligation);
+    }, delay);
+    publicationRetries.set(key, state);
+  }
+
+  function publishObligation(obligation: SessionSyncPublicationObligation): Promise<void> {
+    const key = obligationKey(obligation);
+    const existing = publicationJobs.get(key);
+    if (existing) return existing;
+    const job = runPublicationObligation(obligation);
+    publicationJobs.set(key, job);
+    void job.then(
+      () => { if (publicationJobs.get(key) === job) publicationJobs.delete(key); },
+      () => { if (publicationJobs.get(key) === job) publicationJobs.delete(key); },
+    );
+    return job;
+  }
+
+  async function runPublicationObligation(obligation: SessionSyncPublicationObligation): Promise<void> {
+    if (disposed) return;
+    await withPublicationLock(obligation.sessionId, async () => {
+      if (disposed) return;
+      if (!shouldSync(obligation.sessionId, obligation.workspaceId)) {
+        if (baseStore.clearSyncPublicationObligation) {
+          await settleWhileActive(trackBaseMutation(baseStore.clearSyncPublicationObligation(
+            obligation.sessionId, obligation.obligationId,
+          )));
+        }
+        return;
+      }
+      try {
+        const session = await settleWhileActive(baseStore.get(obligation.sessionId));
+        if (!session) return;
+        const metadata = buildSyncPayload(session as unknown as Record<string, unknown>, {
+          forceUpdatedAt: true,
+        });
+        metadata.workspaceId = obligation.workspaceId;
+        const result = syncProvider.pushMetadataChangeWithResult
+          ? await settleWhileActive(
+              syncProvider.pushMetadataChangeWithResult(
+                obligation.sessionId,
+                metadata as SyncedSessionMetadata,
+              ),
+            )
+          : (await publishWhileActive(obligation.sessionId, {
+              type: 'metadata_updated',
+              metadata: metadata as SyncedSessionMetadata,
+            }), { outcome: 'index_frame_written' as const });
+        if (result.outcome !== 'index_frame_written') {
+          schedulePublicationRetry(obligation);
+          return;
+        }
+        const cleared = baseStore.clearSyncPublicationObligation
+          ? await settleWhileActive(trackBaseMutation(baseStore.clearSyncPublicationObligation(
+              obligation.sessionId, obligation.obligationId,
+            )))
+          : undefined;
+        if (cleared === false) {
+          schedulePublicationRetry(obligation);
+          return;
+        }
+        const key = obligationKey(obligation);
+        const state = publicationRetries.get(key);
+        if (state?.timer) clearTimeout(state.timer);
+        publicationRetries.delete(key);
+      } catch {
+        schedulePublicationRetry(obligation);
+      }
+    });
+  }
+
+  async function scanPublicationObligations(): Promise<void> {
+    if (disposed || !baseStore.listSyncPublicationObligations) return;
+    try {
+      const obligations = await baseStore.listSyncPublicationObligations(100);
+      for (const obligation of obligations) void publishObligation(obligation);
+    } catch {
+      // A later ensureReady/retry will rescan durable facts.
+    }
+  }
+
   return {
     async dispose(): Promise<void> {
       if (disposed) return;
       disposed = true;
       cancelGeneration();
+      for (const state of publicationRetries.values()) {
+        if (state.timer) clearTimeout(state.timer);
+      }
+      publicationRetries.clear();
       connectedSessions.clear();
+      await Promise.allSettled([...activeBaseMutations]);
     },
 
     async ensureReady(): Promise<void> {
-      return baseStore.ensureReady();
+      await baseStore.ensureReady();
+      void scanPublicationObligations();
     },
 
     async create(payload: CreateSessionPayload): Promise<void> {
-      // Create in base store first
-      await baseStore.create(payload);
+      return withPublicationLock(payload.id, async () => {
+      const syncThisSession = shouldSync(payload.id, payload.workspaceId);
+      const obligation: SessionSyncPublicationObligation = {
+        obligationId: crypto.randomUUID(),
+        sessionId: payload.id,
+        workspaceId: payload.workspaceId ?? 'default',
+        createdAt: Date.now(),
+      };
+      if (syncThisSession && baseStore.createWithSyncPublicationObligation) {
+        await trackBaseMutation(
+          baseStore.createWithSyncPublicationObligation(payload, obligation),
+        );
+      } else {
+        await trackBaseMutation(baseStore.create(payload));
+      }
 
       // Push initial metadata immediately, but do not wait for the session-room
       // WebSocket. metadata_updated can travel through the index channel, and
       // first render for a new empty session should only depend on local persistence.
-      if (shouldSync(payload.id, payload.workspaceId)) {
+      if (syncThisSession) {
         const metadata = buildSyncPayload(payload as unknown as Record<string, unknown>, {
           forceUpdatedAt: true,
         });
@@ -195,23 +333,29 @@ export function createSyncedSessionStore(
         if (payload.workspaceId !== undefined) {
           metadata.workspaceId = payload.workspaceId;
         }
-        pushToSync(payload.id, {
-          type: 'metadata_updated',
-          metadata: metadata as unknown as SyncedSessionMetadata,
-        });
+        if (baseStore.createWithSyncPublicationObligation) {
+          void publishObligation(obligation);
+        } else {
+          pushToSync(payload.id, {
+            type: 'metadata_updated',
+            metadata: metadata as unknown as SyncedSessionMetadata,
+          });
+        }
 
         // Keep the original per-session auto-connect behavior in the background
         // so later room-scoped changes such as message_added can reuse it.
         void ensureSyncConnected(payload.id);
       }
+      });
     },
 
     async updateMetadata(
       sessionId: string,
       metadata: UpdateSessionMetadataPayload
     ): Promise<void> {
+      return withPublicationLock(sessionId, async () => {
       // Update base store
-      await baseStore.updateMetadata(sessionId, metadata);
+      await trackBaseMutation(baseStore.updateMetadata(sessionId, metadata));
 
       // Build the sync payload from SYNC_RELEVANT_FIELDS. The store is the
       // single source of truth for what reaches other devices -- callers do
@@ -235,9 +379,10 @@ export function createSyncedSessionStore(
       // Creating a WebSocket connection for every metadata update (like draft input changes)
       // causes massive performance issues when many session tabs are open.
       // If the session isn't connected yet, the update will be synced when it is.
-      pushToSync(sessionId, {
+      await publishWhileActive(sessionId, {
         type: 'metadata_updated',
         metadata: syncMetadata as unknown as SyncedSessionMetadata,
+      });
       });
     },
 
@@ -247,34 +392,36 @@ export function createSyncedSessionStore(
         throw new Error('SESSION_VISIBILITY_STORE_UNAVAILABLE');
       }
 
-      const applied = await settleWhileActive(
-        baseStore.applyVisibilityMutation(sessionId, mutation),
-      );
-      if (!applied) return false;
+      return withPublicationLock(sessionId, async () => {
+        const applied = await settleWhileActive(
+          trackBaseMutation(baseStore.applyVisibilityMutation!(sessionId, mutation)),
+        );
+        if (!applied) return false;
 
-      const metadata = {} as UpdateSessionMetadataPayload & {
+        const metadata = {} as UpdateSessionMetadataPayload & {
         isPinned?: boolean;
         hasBeenNamed?: boolean;
       };
-      if (mutation.after.isPinned !== undefined) {
+        if (mutation.after.isPinned !== undefined) {
         metadata.isPinned = mutation.after.isPinned;
       }
-      if (mutation.after.parentSessionId !== undefined) {
+        if (mutation.after.parentSessionId !== undefined) {
         metadata.parentSessionId = mutation.after.parentSessionId;
       }
-      if (mutation.after.title !== undefined) metadata.title = mutation.after.title;
-      if (mutation.after.hasBeenNamed !== undefined) {
+        if (mutation.after.title !== undefined) metadata.title = mutation.after.title;
+        if (mutation.after.hasBeenNamed !== undefined) {
         metadata.hasBeenNamed = mutation.after.hasBeenNamed;
       }
 
-      const syncMetadata = buildSyncPayload(metadata as unknown as Record<string, unknown>);
-      if (Object.keys(syncMetadata).length > 0) {
-        await publishWhileActive(sessionId, {
-          type: 'metadata_updated',
-          metadata: syncMetadata as SyncedSessionMetadata,
-        });
-      }
-      return true;
+        const syncMetadata = buildSyncPayload(metadata as unknown as Record<string, unknown>);
+        if (Object.keys(syncMetadata).length > 0) {
+          await publishWhileActive(sessionId, {
+            type: 'metadata_updated',
+            metadata: syncMetadata as SyncedSessionMetadata,
+          });
+        }
+        return true;
+      });
     },
 
     async hasVisibilityMutation(sessionId, mutationId, mutationIdentity): Promise<boolean> {
@@ -313,42 +460,46 @@ export function createSyncedSessionStore(
     },
 
     async delete(sessionId: string): Promise<void> {
+      return withPublicationLock(sessionId, async () => {
       // Push deletion to sync first
       if (connectedSessions.has(sessionId)) {
-        pushToSync(sessionId, { type: 'session_deleted' });
+        await publishWhileActive(sessionId, { type: 'session_deleted' });
         syncProvider.disconnect(sessionId);
         connectedSessions.delete(sessionId);
       }
 
       // Then delete from base store
-      await baseStore.delete(sessionId);
+      await trackBaseMutation(baseStore.delete(sessionId));
+      });
     },
 
     async updateTitleIfNotNamed(
       sessionId: string,
       title: string
     ): Promise<boolean> {
+      return withPublicationLock(sessionId, async () => {
       if (!baseStore.updateTitleIfNotNamed) {
         // Fallback implementation
         const session = await baseStore.get(sessionId);
         if (session?.hasBeenNamed) return false;
-        await baseStore.updateMetadata(sessionId, { title });
+        await trackBaseMutation(baseStore.updateMetadata(sessionId, { title }));
         return true;
       }
 
-      const result = await baseStore.updateTitleIfNotNamed(sessionId, title);
+      const result = await trackBaseMutation(baseStore.updateTitleIfNotNamed(sessionId, title));
 
       // If title was updated, ensure sync connection and push update
       // This is critical for mobile sync - title changes must reach other devices
       if (result) {
         await ensureSyncConnected(sessionId);
-        pushToSync(sessionId, {
+        await publishWhileActive(sessionId, {
           type: 'metadata_updated',
           metadata: { title, updatedAt: Date.now() },
         });
       }
 
       return result;
+      });
     },
   };
 }

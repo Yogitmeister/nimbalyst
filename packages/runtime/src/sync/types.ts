@@ -140,6 +140,20 @@ export interface PushChangeOutcome {
   retryable?: boolean;
 }
 
+/** Receipt for a lifecycle-sensitive metadata publication attempt. */
+export interface MetadataSyncClientWriteResult {
+  outcome: 'skipped' | 'queued' | 'failed' | 'index_frame_written';
+  attempted: boolean;
+  indexFrameWritten: boolean;
+  skippedReason:
+    | 'index_not_connected'
+    | 'encryption_key_unavailable'
+    | 'queued_until_session_indexed'
+    | 'index_frame_send_failed'
+    | null;
+  error?: string;
+}
+
 export interface SyncProvider {
   /** Connect to sync server for a session */
   connect(sessionId: string): Promise<void>;
@@ -191,6 +205,12 @@ export interface SyncProvider {
     sessionId: string,
     change: SessionChange,
   ): void | Promise<void | PushChangeOutcome>;
+
+  /** Observable metadata-only path for durable publication callers. */
+  pushMetadataChangeWithResult?(
+    sessionId: string,
+    metadata: Partial<SyncedSessionMetadata>,
+  ): Promise<MetadataSyncClientWriteResult>;
 
   /** Bulk update the sessions index with existing sessions */
   syncSessionsToIndex?(sessions: SessionIndexData[], options?: {

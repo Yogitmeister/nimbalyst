@@ -146,11 +146,33 @@ export interface SessionVisibilityStoreMutation {
   destinationSessionId?: string;
 }
 
+/** Host-only durable fact that an authoritative create still needs an index frame. */
+export interface SessionSyncPublicationObligation {
+  obligationId: string;
+  sessionId: string;
+  workspaceId: string;
+  createdAt: number;
+}
+
 export interface SessionStore {
   ensureReady(): Promise<void>;
   /** Stop decorator-owned async work before replacing the active store. */
   dispose?(): Promise<void>;
   create(payload: CreateSessionPayload): Promise<void>;
+  /** Atomically commits a create/upsert and its durable publication obligation. */
+  createWithSyncPublicationObligation?(
+    payload: CreateSessionPayload,
+    obligation: SessionSyncPublicationObligation,
+  ): Promise<void>;
+  /** Reads a bounded, starvation-safe page of outstanding durable obligations. */
+  listSyncPublicationObligations?(
+    limit: number,
+  ): Promise<SessionSyncPublicationObligation[]>;
+  /** Compare-and-clear only after the corresponding index frame was accepted. */
+  clearSyncPublicationObligation?(
+    sessionId: string,
+    obligationId: string,
+  ): Promise<boolean>;
   updateMetadata(sessionId: string, metadata: UpdateSessionMetadataPayload): Promise<void>;
   /** Atomically applies the exact visibility write and its recovery identity. */
   applyVisibilityMutation?(

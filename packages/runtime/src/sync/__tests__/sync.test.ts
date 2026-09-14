@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createSyncedSessionStore } from '../SyncedSessionStore';
+import { createMessageSyncHandler, createSyncedSessionStore } from '../SyncedSessionStore';
 import type { SessionStore } from '../../ai/adapters/sessionStore';
 import type { SyncProvider, SessionChange
  } from '../types';
@@ -9,17 +9,27 @@ describe('SyncedSessionStore', () => {
   let mockBaseStore: SessionStore;
   let mockSyncProvider: SyncProvider;
   let capturedChanges: { sessionId: string; change: SessionChange }[];
+  let persistedSessions: Map<string, any>;
 
   beforeEach(() => {
     capturedChanges = [];
+    persistedSessions = new Map();
 
     mockBaseStore = {
       ensureReady: vi.fn().mockResolvedValue(undefined),
-      create: vi.fn().mockResolvedValue(undefined),
+      create: vi.fn(async (payload: any) => {
+        persistedSessions.set(payload.id, {
+          ...payload,
+          workspacePath: payload.workspaceId,
+          messages: [],
+          createdAt: payload.createdAt ?? 1,
+          updatedAt: payload.updatedAt ?? 1,
+        });
+      }),
       updateMetadata: vi.fn().mockResolvedValue(undefined),
       applyVisibilityMutation: vi.fn().mockResolvedValue(true),
       hasVisibilityMutation: vi.fn().mockResolvedValue(true),
-      get: vi.fn().mockResolvedValue(null),
+      get: vi.fn(async (sessionId: string) => persistedSessions.get(sessionId) ?? null),
       list: vi.fn().mockResolvedValue([]),
       search: vi.fn().mockResolvedValue([]),
       delete: vi.fn().mockResolvedValue(undefined),
@@ -346,5 +356,159 @@ describe('SyncedSessionStore', () => {
       // create() always carries a fresh updatedAt so iOS sorts the new session.
       expect(typeof m.updatedAt).toBe('number');
     }
+  });
+
+  it('keeps autoConnect enabled when the option is omitted', async () => {
+    const syncedStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    await syncedStore.create({
+      id: 'default-connect',
+      title: 'Default connect',
+      provider: 'claude-code',
+      workspaceId: 'workspace-1',
+    } as any);
+    expect(mockSyncProvider.connect).toHaveBeenCalledWith('default-connect');
+  });
+
+  it('publishes deletion and disconnects an already connected session', async () => {
+    const syncedStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    await syncedStore.create({
+      id: 'delete-me',
+      title: 'Delete me',
+      provider: 'claude-code',
+      workspaceId: 'workspace-1',
+    } as any);
+    await syncedStore.updateTitleIfNotNamed?.('delete-me', 'Delete me');
+    await syncedStore.delete('delete-me');
+    expect(capturedChanges).toContainEqual({
+      sessionId: 'delete-me',
+      change: { type: 'session_deleted' },
+    });
+    expect(mockSyncProvider.disconnect).toHaveBeenCalledWith('delete-me');
+  });
+
+  it('retains a durable create fact until an index frame is accepted', async () => {
+    const obligations = new Map<string, any>();
+    mockBaseStore.createWithSyncPublicationObligation = vi.fn(async (payload: any, obligation: any) => {
+      await mockBaseStore.create(payload);
+      obligations.set(payload.id, obligation);
+    });
+    mockBaseStore.clearSyncPublicationObligation = vi.fn(async (sessionId: string, obligationId: string) => {
+      const obligation = obligations.get(sessionId);
+      if (!obligation || obligation.obligationId !== obligationId) return false;
+      obligations.delete(sessionId);
+      return true;
+    });
+    mockSyncProvider.pushMetadataChangeWithResult = vi.fn().mockResolvedValue({
+      outcome: 'index_frame_written', attempted: true, indexFrameWritten: true,
+    });
+
+    const syncedStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    await syncedStore.create({
+      id: 'durable-create',
+      title: 'Durable create',
+      provider: 'claude-code',
+      workspaceId: 'workspace-1',
+    } as any);
+    await vi.waitFor(() => expect(mockBaseStore.clearSyncPublicationObligation).toHaveBeenCalled());
+    expect(mockSyncProvider.pushMetadataChangeWithResult).toHaveBeenCalledWith(
+      'durable-create',
+      expect.objectContaining({ workspaceId: 'workspace-1' }),
+    );
+    expect(obligations.size).toBe(0);
+  });
+
+  it('does not create a durable obligation for a filtered session', async () => {
+    mockBaseStore.createWithSyncPublicationObligation = vi.fn();
+    const syncedStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider, {
+      syncFilter: () => false,
+    });
+    await syncedStore.create({
+      id: 'filtered-create',
+      title: 'Filtered',
+      provider: 'claude-code',
+      workspaceId: 'workspace-1',
+    } as any);
+    expect(mockBaseStore.create).toHaveBeenCalled();
+    expect(mockBaseStore.createWithSyncPublicationObligation).not.toHaveBeenCalled();
+  });
+
+  it('rediscovers an unsuccessful durable publication after reconstruction', async () => {
+    const obligation = {
+      obligationId: 'obligation-retry',
+      sessionId: 'retry-session',
+      workspaceId: 'workspace-1',
+      createdAt: 1,
+    };
+    persistedSessions.set('retry-session', {
+      id: 'retry-session', title: 'Retry', workspaceId: 'workspace-1', provider: 'claude-code',
+    });
+    mockBaseStore.listSyncPublicationObligations = vi.fn().mockResolvedValue([obligation]);
+    mockBaseStore.clearSyncPublicationObligation = vi.fn().mockResolvedValue(true);
+    mockSyncProvider.pushMetadataChangeWithResult = vi.fn()
+      .mockResolvedValueOnce({ outcome: 'queued', attempted: true, indexFrameWritten: false })
+      .mockResolvedValueOnce({ outcome: 'index_frame_written', attempted: true, indexFrameWritten: true });
+
+    const firstStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    await firstStore.ensureReady();
+    await vi.waitFor(() => expect(mockSyncProvider.pushMetadataChangeWithResult).toHaveBeenCalledTimes(1));
+    await firstStore.dispose?.();
+
+    const reconstructedStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    await reconstructedStore.ensureReady();
+    await vi.waitFor(() => expect(mockBaseStore.clearSyncPublicationObligation).toHaveBeenCalledWith(
+      'retry-session', 'obligation-retry',
+    ));
+  });
+
+  it('preserves message handler publication outcomes and metadata timestamp', async () => {
+    mockSyncProvider.pushChange = vi.fn()
+      .mockResolvedValueOnce({ published: false, reason: 'queued', retryable: true })
+      .mockResolvedValueOnce({ published: true });
+    const handler = createMessageSyncHandler(mockSyncProvider);
+    const outcome = await handler.onMessageCreated({
+      id: 'message-1', sessionId: 'message-session',
+    } as any, 123);
+    expect(outcome).toEqual({ published: false, reason: 'queued', retryable: true });
+    expect(mockSyncProvider.pushChange).toHaveBeenLastCalledWith('message-session', {
+      type: 'metadata_updated', metadata: { updatedAt: 123 },
+    });
+  });
+
+  it('holds all successor mutations behind an admitted durable create publication', async () => {
+    let releasePublication!: (value: any) => void;
+    const publicationGate = new Promise((resolve) => { releasePublication = resolve; });
+    const events: string[] = [];
+    mockBaseStore.createWithSyncPublicationObligation = vi.fn(async (payload: any) => {
+      await mockBaseStore.create(payload);
+    });
+    mockBaseStore.clearSyncPublicationObligation = vi.fn().mockResolvedValue(true);
+    mockSyncProvider.pushMetadataChangeWithResult = vi.fn(() => publicationGate) as any;
+    mockSyncProvider.pushChange = vi.fn(async (_sessionId: string, change: SessionChange) => {
+      events.push(change.type);
+    });
+    const store = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    await store.create({
+      id: 'ordered-session', title: 'Ordered', provider: 'claude-code', workspaceId: 'workspace-1',
+    } as any);
+    await vi.waitFor(() => expect(mockSyncProvider.pushMetadataChangeWithResult).toHaveBeenCalledTimes(1));
+
+    const metadata = store.updateMetadata('ordered-session', { title: 'Metadata' });
+    const visibility = store.applyVisibilityMutation?.('ordered-session', {
+      mutationId: 'ordered', workspacePath: 'C:\\repo', workspaceComparisonPath: 'c:/repo',
+      operation: 'session_set_pinned' as const, expected: {}, after: { isPinned: true },
+    });
+    const title = store.updateTitleIfNotNamed?.('ordered-session', 'Title');
+    const deleted = store.delete('ordered-session');
+    await Promise.resolve();
+    expect(mockBaseStore.updateMetadata).not.toHaveBeenCalled();
+    expect(mockBaseStore.applyVisibilityMutation).not.toHaveBeenCalled();
+    expect(mockBaseStore.updateTitleIfNotNamed).not.toHaveBeenCalled();
+    expect(mockBaseStore.delete).not.toHaveBeenCalled();
+
+    releasePublication({ outcome: 'index_frame_written', attempted: true, indexFrameWritten: true });
+    await Promise.all([metadata, visibility, title, deleted]);
+    expect(events).toEqual([
+      'metadata_updated', 'metadata_updated', 'metadata_updated', 'session_deleted',
+    ]);
   });
 });

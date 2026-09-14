@@ -611,3 +611,94 @@ describe('PGLiteSessionStore visibility mutation CAS', () => {
     expect(calls.find((sql) => /UPDATE ai_sessions SET/i.test(sql))).toContain('session_visibility_storage_fence');
   });
 });
+
+describe('PGLiteSessionStore durable sync publication obligations', () => {
+  it('stores an obligation only through the atomic host path', async () => {
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    const db = {
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        calls.push({ sql, params });
+        return { rows: [] };
+      }),
+    };
+    const store = createPGLiteSessionStore(db as any);
+    await store.createWithSyncPublicationObligation?.({
+      id: 'session-a', title: 'Visible', provider: 'claude-code', workspaceId: '/workspace',
+      metadata: { visible: 'value', __nimbalystSyncPublicationObligation: { forged: true } },
+    } as any, {
+      obligationId: 'ob-a', sessionId: 'session-a', workspaceId: '/workspace', createdAt: 1,
+    });
+    const insert = calls.find((call) => /INSERT INTO ai_sessions/.test(call.sql));
+    const metadata = insert?.params.find((value) => typeof value === 'object' && value !== null) as any;
+    expect(metadata).toMatchObject({
+      visible: 'value',
+      __nimbalystSyncPublicationObligation: {
+        obligationId: 'ob-a', sessionId: 'session-a', workspaceId: '/workspace', createdAt: 1,
+      },
+    });
+    expect(insert?.sql).toContain("jsonb_object_agg(key, value)");
+    expect(insert?.sql).toContain("key LIKE '__nimbalyst%'");
+  });
+
+  it('keeps the host obligation out of public metadata reads', async () => {
+    const db = {
+      query: vi.fn(async () => ({
+        rows: [{
+          id: 'session-a',
+          workspace_id: '/workspace',
+          metadata: JSON.stringify({
+            visible: 'value',
+            __nimbalystSyncPublicationObligation: {
+              obligationId: 'ob-a', sessionId: 'session-a', workspaceId: '/workspace', createdAt: 1,
+            },
+            __nimbalystHostOnlyFact: { opaque: true },
+          }),
+        }],
+      })),
+    };
+    const store = createPGLiteSessionStore(db as any);
+    const session = await store.get('session-a');
+    expect(session?.metadata).toEqual({ visible: 'value' });
+  });
+
+  it('returns a bounded rotating page of valid durable obligations', async () => {
+    const calls: Array<{ sql: string; params?: unknown[] }> = [];
+    const db = {
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        calls.push({ sql, params });
+        if (/FROM ai_sessions WHERE id >/.test(sql)) {
+          return { rows: [{
+            id: 'session-b',
+            metadata: JSON.stringify({
+              __nimbalystSyncPublicationObligation: {
+                obligationId: 'ob-b', workspaceId: '/workspace', createdAt: 2,
+              },
+            }),
+          }] };
+        }
+        return { rows: [] };
+      }),
+    };
+    const store = createPGLiteSessionStore(db as any);
+    await expect(store.listSyncPublicationObligations?.(999)).resolves.toEqual([{
+      obligationId: 'ob-b', sessionId: 'session-b', workspaceId: '/workspace', createdAt: 2,
+    }]);
+    expect(calls.find((call) => /FROM ai_sessions WHERE id >/.test(call.sql))?.params).toEqual(['', 100]);
+    expect(calls.some((call) => /session_sync_publication_cursor/.test(call.sql))).toBe(true);
+  });
+
+  it('compare-and-clears only the matching durable obligation', async () => {
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    const db = {
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        calls.push({ sql, params });
+        return { rows: [{ id: 'session-a' }] };
+      }),
+    };
+    const store = createPGLiteSessionStore(db as any);
+    await expect(store.clearSyncPublicationObligation?.('session-a', 'ob-a')).resolves.toBe(true);
+    const clear = calls.find((call) => /__nimbalystSyncPublicationObligation/.test(call.sql));
+    expect(clear?.params).toEqual(['session-a', 'ob-a']);
+    expect(clear?.sql).toContain("metadata - '__nimbalystSyncPublicationObligation'");
+  });
+});
