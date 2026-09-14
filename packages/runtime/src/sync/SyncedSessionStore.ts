@@ -101,6 +101,7 @@ export function createSyncedSessionStore(
   const publicationTails = new Map<string, Promise<void>>();
   const publicationJobs = new Map<string, Promise<void>>();
   const activeBaseMutations = new Set<Promise<unknown>>();
+  const activeOperations = new Set<Promise<unknown>>();
   const publicationRetries = new Map<string, { attempts: number; timer?: ReturnType<typeof setTimeout> }>();
   let disposed = false;
   let cancelGeneration!: () => void;
@@ -137,7 +138,15 @@ export function createSyncedSessionStore(
 
   function withPublicationLock<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
     const prior = publicationTails.get(sessionId) ?? Promise.resolve();
-    const next = prior.catch(() => undefined).then(operation);
+    const next = prior.catch(() => undefined).then(() => {
+      assertActive();
+      return operation();
+    });
+    activeOperations.add(next);
+    void next.then(
+      () => activeOperations.delete(next),
+      () => activeOperations.delete(next),
+    );
     const tail = next.then(() => undefined, () => undefined);
     publicationTails.set(sessionId, tail);
     void tail.then(() => {
@@ -209,6 +218,13 @@ export function createSyncedSessionStore(
     publicationRetries.set(key, state);
   }
 
+  function retirePublicationRetry(obligation: SessionSyncPublicationObligation): void {
+    const key = obligationKey(obligation);
+    const state = publicationRetries.get(key);
+    if (state?.timer) clearTimeout(state.timer);
+    publicationRetries.delete(key);
+  }
+
   function publishObligation(obligation: SessionSyncPublicationObligation): Promise<void> {
     const key = obligationKey(obligation);
     const existing = publicationJobs.get(key);
@@ -241,6 +257,17 @@ export function createSyncedSessionStore(
           forceUpdatedAt: true,
         });
         metadata.workspaceId = obligation.workspaceId;
+        if (!baseStore.hasSyncPublicationObligation) return;
+        const isCurrent = await settleWhileActive(
+          baseStore.hasSyncPublicationObligation(
+            obligation.sessionId,
+            obligation.obligationId,
+          ),
+        );
+        if (!isCurrent) {
+          retirePublicationRetry(obligation);
+          return;
+        }
         const result = syncProvider.pushMetadataChangeWithResult
           ? await settleWhileActive(
               syncProvider.pushMetadataChangeWithResult(
@@ -265,10 +292,7 @@ export function createSyncedSessionStore(
           schedulePublicationRetry(obligation);
           return;
         }
-        const key = obligationKey(obligation);
-        const state = publicationRetries.get(key);
-        if (state?.timer) clearTimeout(state.timer);
-        publicationRetries.delete(key);
+        retirePublicationRetry(obligation);
       } catch {
         schedulePublicationRetry(obligation);
       }
@@ -295,7 +319,7 @@ export function createSyncedSessionStore(
       }
       publicationRetries.clear();
       connectedSessions.clear();
-      await Promise.allSettled([...activeBaseMutations]);
+      await Promise.allSettled([...activeOperations, ...activeBaseMutations]);
     },
 
     async ensureReady(): Promise<void> {

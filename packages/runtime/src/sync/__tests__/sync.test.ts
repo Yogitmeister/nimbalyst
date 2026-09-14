@@ -398,6 +398,9 @@ describe('SyncedSessionStore', () => {
       obligations.delete(sessionId);
       return true;
     });
+    mockBaseStore.hasSyncPublicationObligation = vi.fn(async (sessionId: string, obligationId: string) => (
+      obligations.get(sessionId)?.obligationId === obligationId
+    ));
     mockSyncProvider.pushMetadataChangeWithResult = vi.fn().mockResolvedValue({
       outcome: 'index_frame_written', attempted: true, indexFrameWritten: true,
     });
@@ -443,6 +446,7 @@ describe('SyncedSessionStore', () => {
       id: 'retry-session', title: 'Retry', workspaceId: 'workspace-1', provider: 'claude-code',
     });
     mockBaseStore.listSyncPublicationObligations = vi.fn().mockResolvedValue([obligation]);
+    mockBaseStore.hasSyncPublicationObligation = vi.fn().mockResolvedValue(true);
     mockBaseStore.clearSyncPublicationObligation = vi.fn().mockResolvedValue(true);
     mockSyncProvider.pushMetadataChangeWithResult = vi.fn()
       .mockResolvedValueOnce({ outcome: 'queued', attempted: true, indexFrameWritten: false })
@@ -481,6 +485,7 @@ describe('SyncedSessionStore', () => {
     mockBaseStore.createWithSyncPublicationObligation = vi.fn(async (payload: any) => {
       await mockBaseStore.create(payload);
     });
+    mockBaseStore.hasSyncPublicationObligation = vi.fn().mockResolvedValue(true);
     mockBaseStore.clearSyncPublicationObligation = vi.fn().mockResolvedValue(true);
     mockSyncProvider.pushMetadataChangeWithResult = vi.fn(() => publicationGate) as any;
     mockSyncProvider.pushChange = vi.fn(async (_sessionId: string, change: SessionChange) => {
@@ -510,5 +515,131 @@ describe('SyncedSessionStore', () => {
     expect(events).toEqual([
       'metadata_updated', 'metadata_updated', 'metadata_updated', 'session_deleted',
     ]);
+  });
+
+  it('does not let a queued successor mutate after disposal returns', async () => {
+    let releasePublication!: (value: any) => void;
+    const publicationGate = new Promise((resolve) => { releasePublication = resolve; });
+    mockBaseStore.createWithSyncPublicationObligation = vi.fn(async (payload: any) => {
+      await mockBaseStore.create(payload);
+    });
+    mockBaseStore.hasSyncPublicationObligation = vi.fn().mockResolvedValue(true);
+    mockBaseStore.clearSyncPublicationObligation = vi.fn().mockResolvedValue(true);
+    mockSyncProvider.pushMetadataChangeWithResult = vi.fn(() => publicationGate) as any;
+    const store = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    await store.create({
+      id: 'dispose-ordered', title: 'Dispose ordered', provider: 'claude-code', workspaceId: 'workspace-1',
+    } as any);
+    await vi.waitFor(() => expect(mockSyncProvider.pushMetadataChangeWithResult).toHaveBeenCalledTimes(1));
+
+    const successor = store.updateMetadata('dispose-ordered', { title: 'Must not land' });
+    const successorOutcome = successor.catch((error) => error);
+    await store.dispose?.();
+    expect(mockBaseStore.updateMetadata).not.toHaveBeenCalled();
+
+    releasePublication({ outcome: 'index_frame_written', attempted: true, indexFrameWritten: true });
+    await expect(successorOutcome).resolves.toMatchObject({
+      message: 'SYNCED_SESSION_STORE_DISPOSED',
+    });
+    await Promise.resolve();
+    expect(mockBaseStore.updateMetadata).not.toHaveBeenCalled();
+  });
+
+  it('retires a cleared late-scan job without publishing or retrying', async () => {
+    const obligation = {
+      obligationId: 'cleared-obligation', sessionId: 'cleared-session',
+      workspaceId: 'workspace-1', createdAt: 1,
+    };
+    persistedSessions.set(obligation.sessionId, {
+      id: obligation.sessionId, title: 'Cleared', workspaceId: obligation.workspaceId, provider: 'claude-code',
+    });
+    let checked!: () => void;
+    const checkedPromise = new Promise<void>((resolve) => { checked = resolve; });
+    mockBaseStore.listSyncPublicationObligations = vi.fn().mockResolvedValue([obligation]);
+    mockBaseStore.hasSyncPublicationObligation = vi.fn(async () => {
+      checked();
+      return false;
+    });
+    mockBaseStore.clearSyncPublicationObligation = vi.fn().mockResolvedValue(false);
+    mockSyncProvider.pushMetadataChangeWithResult = vi.fn();
+    const timeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+    try {
+      const store = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+      await store.ensureReady();
+      await checkedPromise;
+      await Promise.resolve();
+
+      expect(mockBaseStore.hasSyncPublicationObligation).toHaveBeenCalledWith(
+        obligation.sessionId, obligation.obligationId,
+      );
+      expect(mockSyncProvider.pushMetadataChangeWithResult).not.toHaveBeenCalled();
+      expect(mockBaseStore.clearSyncPublicationObligation).not.toHaveBeenCalled();
+      expect(timeoutSpy).not.toHaveBeenCalled();
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it('retires a replaced job and publishes only the current obligation identity', async () => {
+    const oldObligation = {
+      obligationId: 'old-obligation', sessionId: 'replacement-session',
+      workspaceId: 'workspace-1', createdAt: 1,
+    };
+    const currentObligation = { ...oldObligation, obligationId: 'current-obligation', createdAt: 2 };
+    const session = {
+      id: oldObligation.sessionId, title: 'Replacement',
+      workspaceId: oldObligation.workspaceId, provider: 'claude-code',
+    };
+    let current = oldObligation;
+    let releaseFirstRead!: () => void;
+    let firstReadStarted!: () => void;
+    const firstReadGate = new Promise<void>((resolve) => { releaseFirstRead = resolve; });
+    const firstReadStartedPromise = new Promise<void>((resolve) => { firstReadStarted = resolve; });
+    let readCount = 0;
+    mockBaseStore.get = vi.fn(async () => {
+      readCount += 1;
+      if (readCount === 1) {
+        firstReadStarted();
+        await firstReadGate;
+      }
+      return session as any;
+    });
+    mockBaseStore.listSyncPublicationObligations = vi.fn()
+      .mockResolvedValueOnce([oldObligation])
+      .mockResolvedValueOnce([currentObligation]);
+    let oldCompared!: () => void;
+    const oldComparedPromise = new Promise<void>((resolve) => { oldCompared = resolve; });
+    mockBaseStore.hasSyncPublicationObligation = vi.fn(async (_sessionId, obligationId) => {
+      if (obligationId === oldObligation.obligationId) oldCompared();
+      return current.obligationId === obligationId;
+    });
+    let currentCleared!: () => void;
+    const currentClearedPromise = new Promise<void>((resolve) => { currentCleared = resolve; });
+    mockBaseStore.clearSyncPublicationObligation = vi.fn(async (_sessionId, obligationId) => {
+      if (obligationId !== current.obligationId) return false;
+      currentCleared();
+      return true;
+    });
+    mockSyncProvider.pushMetadataChangeWithResult = vi.fn().mockResolvedValue({
+      outcome: 'index_frame_written', attempted: true, indexFrameWritten: true,
+    });
+    const store = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+
+    await store.ensureReady();
+    await firstReadStartedPromise;
+    current = currentObligation;
+    releaseFirstRead();
+    await oldComparedPromise;
+    await Promise.resolve();
+    expect(mockSyncProvider.pushMetadataChangeWithResult).not.toHaveBeenCalled();
+    expect(mockBaseStore.clearSyncPublicationObligation).not.toHaveBeenCalled();
+
+    await store.ensureReady();
+    await currentClearedPromise;
+    expect(mockSyncProvider.pushMetadataChangeWithResult).toHaveBeenCalledTimes(1);
+    expect(mockBaseStore.clearSyncPublicationObligation).toHaveBeenCalledWith(
+      currentObligation.sessionId, currentObligation.obligationId,
+    );
   });
 });

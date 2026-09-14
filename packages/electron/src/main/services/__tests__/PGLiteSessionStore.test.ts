@@ -687,6 +687,70 @@ describe('PGLiteSessionStore durable sync publication obligations', () => {
     expect(calls.some((call) => /session_sync_publication_cursor/.test(call.sql))).toBe(true);
   });
 
+  it('compares an obligation beyond the first 100 rows without disturbing rotation', async () => {
+    const rows = Array.from({ length: 102 }, (_, index) => ({
+      id: `session-${String(index).padStart(3, '0')}`,
+      metadata: JSON.stringify({
+        __nimbalystSyncPublicationObligation: {
+          obligationId: `ob-${index}`, workspaceId: '/workspace', createdAt: index,
+        },
+      }),
+    }));
+    let cursor = '';
+    const db = {
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        if (/CREATE TABLE IF NOT EXISTS session_sync_publication_cursor/.test(sql)) return { rows: [] };
+        if (/SELECT last_session_id FROM session_sync_publication_cursor/.test(sql)) {
+          return { rows: cursor ? [{ last_session_id: cursor }] : [] };
+        }
+        if (/INSERT INTO session_sync_publication_cursor/.test(sql)) {
+          cursor = params[1] as string;
+          return { rows: [] };
+        }
+        if (/WHERE id = \$1/.test(sql)) {
+          const row = rows.find(({ id, metadata }) => (
+            id === params[0]
+            && JSON.parse(metadata).__nimbalystSyncPublicationObligation.obligationId === params[1]
+          ));
+          return { rows: row ? [{ id: row.id }] : [] };
+        }
+        if (/FROM ai_sessions WHERE id > \$1/.test(sql)) {
+          return { rows: rows.filter(({ id }) => id > (params[0] as string)).slice(0, params[1] as number) };
+        }
+        if (/FROM ai_sessions WHERE/.test(sql)) {
+          return { rows: rows.slice(0, params[0] as number) };
+        }
+        throw new Error(`Unexpected SQL: ${sql}`);
+      }),
+    };
+    const store = createPGLiteSessionStore(db as any);
+
+    await expect(store.listSyncPublicationObligations?.(100)).resolves.toHaveLength(100);
+    await expect(store.hasSyncPublicationObligation?.('session-101', 'ob-101')).resolves.toBe(true);
+    await expect(store.listSyncPublicationObligations?.(100)).resolves.toEqual([
+      expect.objectContaining({ sessionId: 'session-100', obligationId: 'ob-100' }),
+      expect.objectContaining({ sessionId: 'session-101', obligationId: 'ob-101' }),
+    ]);
+    expect(cursor).toBe('session-101');
+  });
+
+  it('uses SQLite JSON comparison for an exact obligation lookup', async () => {
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    const db = {
+      getEngine: () => 'sqlite',
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        calls.push({ sql, params });
+        return { rows: [{ id: 'session-a' }] };
+      }),
+    };
+    const store = createPGLiteSessionStore(db as any);
+
+    await expect(store.hasSyncPublicationObligation?.('session-a', 'ob-a')).resolves.toBe(true);
+    expect(calls[0].sql).toContain('json_valid(metadata)');
+    expect(calls[0].sql).toContain('json_extract(metadata');
+    expect(calls[0].params).toEqual(['session-a', 'ob-a']);
+  });
+
   it('compare-and-clears only the matching durable obligation', async () => {
     const calls: Array<{ sql: string; params: unknown[] }> = [];
     const db = {

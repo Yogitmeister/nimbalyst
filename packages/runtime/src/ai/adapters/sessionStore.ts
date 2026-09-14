@@ -168,6 +168,11 @@ export interface SessionStore {
   listSyncPublicationObligations?(
     limit: number,
   ): Promise<SessionSyncPublicationObligation[]>;
+  /** Compares one durable fact without advancing rotating scan state. */
+  hasSyncPublicationObligation?(
+    sessionId: string,
+    obligationId: string,
+  ): Promise<boolean>;
   /** Compare-and-clear only after the corresponding index frame was accepted. */
   clearSyncPublicationObligation?(
     sessionId: string,

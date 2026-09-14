@@ -681,6 +681,25 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
       });
     },
 
+    async hasSyncPublicationObligation(
+      sessionId: string,
+      obligationId: string,
+    ): Promise<boolean> {
+      await ensureReady();
+      const sql = isSQLiteStoreAdapter(db)
+        ? `SELECT id FROM ai_sessions
+           WHERE id = $1
+             AND json_valid(metadata)
+             AND json_extract(metadata, '$.${SYNC_PUBLICATION_OBLIGATION_KEY}.obligationId') = $2
+           LIMIT 1`
+        : `SELECT id FROM ai_sessions
+           WHERE id = $1
+             AND metadata -> '${SYNC_PUBLICATION_OBLIGATION_KEY}' ->> 'obligationId' = $2
+           LIMIT 1`;
+      const { rows } = await db.query<{ id: string }>(sql, [sessionId, obligationId]);
+      return rows.length === 1;
+    },
+
     async clearSyncPublicationObligation(sessionId: string, obligationId: string): Promise<boolean> {
       await ensureReady();
       const sql = isSQLiteStoreAdapter(db)
