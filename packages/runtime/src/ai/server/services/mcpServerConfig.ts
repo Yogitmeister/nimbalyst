@@ -33,6 +33,7 @@ export type SharedMcpServerConfig = Pick<
   | 'trackersAgentToolsDisabledLoader'
   | 'extensionMcpServerNamesLoader'
   | 'mcpAuthToken'
+  | 'mcpSessionCredentialIssuer'
 >;
 
 /** Provider-owned deps merged on top of the shared config per `getMcpConfigService`. */
@@ -49,6 +50,7 @@ const shared: SharedMcpServerConfig = {
   trackersAgentToolsDisabledLoader: null,
   extensionMcpServerNamesLoader: null,
   mcpAuthToken: null,
+  mcpSessionCredentialIssuer: null,
 };
 
 /** Set/update the shared MCP-enablement deps. Called once from electron main. */

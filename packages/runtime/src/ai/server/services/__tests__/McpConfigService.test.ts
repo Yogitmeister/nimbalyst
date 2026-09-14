@@ -288,6 +288,26 @@ describe('McpConfigService', () => {
         });
       });
 
+      it('uses one actor/workspace-scoped credential ahead of the process bearer', async () => {
+        mockDeps.mcpAuthToken = 'process-token';
+        mockDeps.mcpSessionCredentialIssuer = vi.fn(() => 'scoped-session-token');
+
+        service = new McpConfigService(mockDeps);
+        const config = await service.getMcpServersConfig({
+          sessionId: 'session123', workspacePath: '/test/workspace',
+        });
+
+        expect(mockDeps.mcpSessionCredentialIssuer).toHaveBeenCalledWith({
+          actorSessionId: 'session123', workspacePath: '/test/workspace',
+        });
+        expect(config['nimbalyst-host'].headers).toEqual({
+          Authorization: 'Bearer scoped-session-token',
+        });
+        expect(config['nimbalyst-extension-dev'].headers).toEqual({
+          Authorization: 'Bearer scoped-session-token',
+        });
+      });
+
       it('emits no Authorization header when mcpAuthToken is unset (legacy/test compatibility)', async () => {
         // mcpAuthToken intentionally omitted
 
