@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import path from 'node:path';
 import {
   createPGLiteSessionStore,
   getAllSessionsForSync,
@@ -520,5 +521,93 @@ describe('PGLiteSessionStore.updateMetadata nullable column clears', () => {
     );
     expect(updateCall).toBeDefined();
     expect(updateCall![0]).not.toContain('provider_session_id =');
+  });
+});
+
+describe('PGLiteSessionStore visibility mutation CAS', () => {
+  const mutation = {
+    mutationId: 'mutation-a',
+    workspacePath: '/Workspace',
+    workspaceComparisonPath: process.platform === 'win32'
+      ? path.resolve('/workspace').replace(/\\/g, '/').toLowerCase()
+      : path.resolve('/workspace'),
+    operation: 'session_set_pinned' as const,
+    expected: { isPinned: false },
+    after: { isPinned: true },
+  };
+
+  it('updates the visible field and opaque mutation receipt in one CAS statement', async () => {
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    const db = {
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        calls.push({ sql, params });
+        if (/SELECT metadata, is_pinned/i.test(sql)) {
+          return { rows: [{ metadata: '{}', is_pinned: false, parent_session_id: null, title: 'Old', has_been_named: false, workspace_id: '/workspace' }] };
+        }
+        return { rows: [{ applied: 1 }] };
+      }),
+    };
+    const store = createPGLiteSessionStore(db as any);
+
+    await expect(store.applyVisibilityMutation?.('session-a', mutation)).resolves.toBe(true);
+
+    const update = calls.find((call) => /UPDATE ai_sessions SET/i.test(call.sql));
+    expect(update?.sql).toContain('is_pinned =');
+    expect(update?.sql).toContain('metadata =');
+    expect(update?.sql).toContain('is_pinned IS NOT DISTINCT FROM');
+    const metadata = update?.params.find((value) => typeof value === 'string' && value.includes('__nimbalystVisibilityMutationIds'));
+    expect(metadata).toContain('mutation-a');
+  });
+
+  it('refuses a workspace mismatch without attempting an update', async () => {
+    const db = {
+      query: vi.fn(async () => ({
+        rows: [{ metadata: '{}', is_pinned: false, parent_session_id: null, title: 'Old', has_been_named: false, workspace_id: '/other' }],
+      })),
+    };
+    const store = createPGLiteSessionStore(db as any);
+
+    await expect(store.applyVisibilityMutation?.('session-a', mutation)).resolves.toBe(false);
+    expect(db.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not expose the host mutation ledger through a session read', async () => {
+    const db = {
+      query: vi.fn(async () => ({
+        rows: [{
+          id: 'session-a', workspace_id: '/workspace', metadata: JSON.stringify({
+            visible: 'value',
+            __nimbalystVisibilityMutationIds: { 'mutation-a': 'opaque-fingerprint' },
+          }),
+        }],
+      })),
+    };
+    const store = createPGLiteSessionStore(db as any);
+
+    const session = await store.get('session-a');
+
+    expect(session?.metadata).toEqual({ visible: 'value' });
+  });
+
+  it('includes the database owner nonce in the same linearized update', async () => {
+    const calls: string[] = [];
+    const db = {
+      query: vi.fn(async (sql: string) => {
+        calls.push(sql);
+        if (/SELECT metadata, is_pinned/i.test(sql)) {
+          return { rows: [{ metadata: '{}', is_pinned: false, parent_session_id: null, title: 'Old', has_been_named: false, workspace_id: '/workspace' }] };
+        }
+        return { rows: [] };
+      }),
+    };
+    const store = createPGLiteSessionStore(db as any);
+    const fenced = { ...mutation } as Record<PropertyKey, unknown>;
+    Object.defineProperty(fenced, Symbol.for('nimbalyst.visibility-storage-fence'), {
+      enumerable: false,
+      value: { rootIdentity: 'root-a', ownerId: 'owner-a' },
+    });
+
+    await expect(store.applyVisibilityMutation?.('session-a', fenced as any)).resolves.toBe(false);
+    expect(calls.find((sql) => /UPDATE ai_sessions SET/i.test(sql))).toContain('session_visibility_storage_fence');
   });
 });

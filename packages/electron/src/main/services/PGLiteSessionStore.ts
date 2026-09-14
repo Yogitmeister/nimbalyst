@@ -3,6 +3,8 @@
  */
 
 import { toMillis } from '../utils/timestampUtils';
+import { createHash } from 'node:crypto';
+import path from 'node:path';
 import { parseJsonObjectColumn } from '../utils/jsonColumn';
 import {
   computeSessionPhaseTransition,
@@ -20,9 +22,13 @@ import type {
   AgentMessage
 } from '@nimbalyst/runtime';
 import { filterSessionsForPersonalSync } from '@nimbalyst/runtime/sync';
+import type { SessionVisibilityStoreMutation } from '@nimbalyst/runtime/ai/adapters/sessionStore';
 
 type PGliteLike = {
   query<T = any>(sql: string, params?: any[]): Promise<{ rows: T[] }>;
+  getEngine?(): 'pglite' | 'sqlite';
+  /** Present on the production SQLite adapter; used only for dialect selection. */
+  searchAgentMessages?: (...args: any[]) => unknown;
   searchTranscriptEventSessions?(
     query: string,
     opts?: {
@@ -53,6 +59,64 @@ function buildSessionArchiveFilter(includeArchived: boolean, sessionAlias = 's',
 // Shared with other JSON-typed column readers; see ../utils/jsonColumn.ts
 // for the metadata-corruption postmortem.
 const normalizeJsonObject = parseJsonObjectColumn;
+const VISIBILITY_MUTATION_LEDGER_KEY = '__nimbalystVisibilityMutationIds';
+
+function isSQLiteStoreAdapter(db: PGliteLike): boolean {
+  return db.getEngine?.() === 'sqlite' || typeof db.searchAgentMessages === 'function';
+}
+
+function publicSessionMetadata(value: unknown): Record<string, any> {
+  const metadata = { ...normalizeJsonObject(value) };
+  delete metadata[VISIBILITY_MUTATION_LEDGER_KEY];
+  return metadata;
+}
+
+function visibilityMutationRecords(value: unknown): Record<string, string> {
+  const ledger = normalizeJsonObject(value)[VISIBILITY_MUTATION_LEDGER_KEY];
+  if (!ledger || typeof ledger !== 'object' || Array.isArray(ledger)) return {};
+  return Object.fromEntries(
+    Object.entries(ledger).filter((entry): entry is [string, string] => (
+      typeof entry[0] === 'string' && typeof entry[1] === 'string'
+    )),
+  );
+}
+
+function normalizeWorkspaceComparisonPath(value: string): string {
+  const resolved = path.resolve(value.trim()).replace(/\\/g, '/').replace(/\/+$/, '');
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function visibilityMutationFingerprint(
+  sessionId: string,
+  mutation: SessionVisibilityStoreMutation,
+): string {
+  return createHash('sha256').update(JSON.stringify({
+    sessionId,
+    operation: mutation.operation,
+    workspaceComparisonPath: mutation.workspaceComparisonPath,
+    expected: mutation.expected,
+    after: mutation.after,
+    destinationSessionId: mutation.destinationSessionId ?? null,
+  })).digest('hex');
+}
+
+/** Installs the database-resident owner used by protected visibility writes. */
+export async function claimVisibilityStorageDatabaseFence(
+  db: Pick<PGliteLike, 'query'>,
+  rootIdentity: string,
+  ownerId: string,
+): Promise<void> {
+  await db.query(`CREATE TABLE IF NOT EXISTS session_visibility_storage_fence (
+    root_identity TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL
+  )`);
+  await db.query(
+    `INSERT INTO session_visibility_storage_fence (root_identity, owner_id)
+     VALUES ($1, $2)
+     ON CONFLICT (root_identity) DO UPDATE SET owner_id = EXCLUDED.owner_id`,
+    [rootIdentity, ownerId],
+  );
+}
 
 /**
  * Parse a TEXT column that's supposed to hold JSON back into the value the
@@ -634,6 +698,116 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
       }
     },
 
+    async applyVisibilityMutation(
+      sessionId: string,
+      mutation: SessionVisibilityStoreMutation,
+    ): Promise<boolean> {
+      await ensureReady();
+      const { rows } = await db.query<any>(
+        `SELECT metadata, is_pinned, parent_session_id, title, has_been_named, workspace_id
+         FROM ai_sessions WHERE id = $1`,
+        [sessionId],
+      );
+      const current = rows[0];
+      if (!current || normalizeWorkspaceComparisonPath(current.workspace_id) !== mutation.workspaceComparisonPath) {
+        return false;
+      }
+      const existingMetadata = normalizeJsonObject(current.metadata);
+      const records = visibilityMutationRecords(existingMetadata);
+      const fingerprint = visibilityMutationFingerprint(sessionId, mutation);
+      if (Object.prototype.hasOwnProperty.call(records, mutation.mutationId)) {
+        return records[mutation.mutationId] === fingerprint;
+      }
+
+      const sqlite = isSQLiteStoreAdapter(db);
+      const updates: string[] = [];
+      const predicates: string[] = ['id = $1', 'workspace_id = $2'];
+      const values: unknown[] = [sessionId, current.workspace_id];
+      const addValue = (value: unknown): string => {
+        values.push(value);
+        return `$${values.length}`;
+      };
+      const same = (column: string, value: unknown) => {
+        const parameter = addValue(value);
+        predicates.push(sqlite ? `${column} IS ${parameter}` : `${column} IS NOT DISTINCT FROM ${parameter}`);
+      };
+
+      if (mutation.expected.isPinned !== undefined) same('is_pinned', mutation.expected.isPinned);
+      if (mutation.expected.parentSessionId !== undefined) same('parent_session_id', mutation.expected.parentSessionId);
+      if (mutation.expected.title !== undefined) same('title', mutation.expected.title);
+      if (mutation.expected.hasBeenNamed !== undefined) same('has_been_named', mutation.expected.hasBeenNamed);
+      if (mutation.after.isPinned !== undefined) updates.push(`is_pinned = ${addValue(mutation.after.isPinned)}`);
+      if (mutation.after.parentSessionId !== undefined) updates.push(`parent_session_id = ${addValue(mutation.after.parentSessionId)}`);
+      if (mutation.after.title !== undefined) updates.push(`title = ${addValue(mutation.after.title)}`);
+      if (mutation.after.hasBeenNamed !== undefined) updates.push(`has_been_named = ${addValue(mutation.after.hasBeenNamed)}`);
+
+      const rawMetadata = current.metadata;
+      const oldMetadata = rawMetadata === null || rawMetadata === undefined
+        ? null
+        : sqlite && typeof rawMetadata === 'string' ? rawMetadata : JSON.stringify(existingMetadata);
+      const oldParameter = addValue(oldMetadata);
+      predicates.push(sqlite
+        ? `metadata IS ${oldParameter}`
+        : `metadata IS NOT DISTINCT FROM ${oldParameter}::jsonb`);
+      const nextMetadata = {
+        ...existingMetadata,
+        [VISIBILITY_MUTATION_LEDGER_KEY]: { ...records, [mutation.mutationId]: fingerprint },
+      };
+      const nextParameter = addValue(JSON.stringify(nextMetadata));
+      updates.push(sqlite ? `metadata = ${nextParameter}` : `metadata = ${nextParameter}::jsonb`);
+
+      if (mutation.destinationSessionId) {
+        const destinationId = addValue(mutation.destinationSessionId);
+        const destinationWorkspace = addValue(mutation.workspaceComparisonPath);
+        const comparison = process.platform === 'win32'
+          ? `LOWER(REPLACE(RTRIM(destination.workspace_id, '/\\'), '\\', '/'))`
+          : `RTRIM(destination.workspace_id, '/')`;
+        predicates.push(`EXISTS (
+          SELECT 1 FROM ai_sessions destination
+          WHERE destination.id = ${destinationId}
+            AND ${comparison} = ${destinationWorkspace}
+            AND destination.session_type = 'workstream'
+            AND destination.parent_session_id IS NULL
+            AND destination.worktree_id IS NULL
+            AND (destination.is_archived = FALSE OR destination.is_archived IS NULL)
+        )`);
+      }
+
+      const storageFence = (mutation as unknown as Record<PropertyKey, unknown>)[
+        Symbol.for('nimbalyst.visibility-storage-fence')
+      ] as { rootIdentity: string; ownerId: string } | undefined;
+      if (storageFence) {
+        const root = addValue(storageFence.rootIdentity);
+        const owner = addValue(storageFence.ownerId);
+        predicates.push(`EXISTS (
+          SELECT 1 FROM session_visibility_storage_fence storage_fence
+          WHERE storage_fence.root_identity = ${root}
+            AND storage_fence.owner_id = ${owner}
+        )`);
+      }
+      const result = await db.query<{ applied: number }>(
+        `UPDATE ai_sessions SET ${updates.join(', ')}
+         WHERE ${predicates.join(' AND ')}
+         RETURNING 1 AS applied`,
+        values,
+      );
+      return result.rows.length === 1;
+    },
+
+    async hasVisibilityMutation(
+      sessionId: string,
+      mutationId: string,
+      mutationIdentity?: string,
+    ): Promise<boolean> {
+      await ensureReady();
+      const { rows } = await db.query<{ metadata: unknown }>(
+        'SELECT metadata FROM ai_sessions WHERE id = $1', [sessionId],
+      );
+      const records = visibilityMutationRecords(rows[0]?.metadata);
+      return Object.prototype.hasOwnProperty.call(records, mutationId) &&
+        (mutationIdentity === undefined || records[mutationId] === mutationIdentity);
+    },
+
     async get(sessionId: string): Promise<ChatSession | null> {
       await ensureReady();
       const { rows } = await db.query<any>(
@@ -656,7 +830,7 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
       // Parse JSON columns at the boundary so downstream callers (e.g.
       // SessionManager.updateSessionTokenUsage) can safely spread them.
       // See `parseJsonColumn` for the SQLite-vs-PGLite read-shape mismatch.
-      const metadata = normalizeJsonObject(row.metadata);
+      const metadata = publicSessionMetadata(row.metadata);
 
       return {
         id: row.id,
@@ -717,7 +891,7 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
 
       return rows.map((row: any) => {
         // Parse JSON columns at the boundary -- see `parseJsonColumn`.
-        const metadata = normalizeJsonObject(row.metadata);
+        const metadata = publicSessionMetadata(row.metadata);
         return {
           id: row.id,
           provider: row.provider,
@@ -803,7 +977,7 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
         // etc. all read as undefined under the SQLite backend (because
         // `metadata` is a raw JSON string), so kanban tags/phase disappear
         // from the session list view.
-        const metadata = normalizeJsonObject(row.metadata);
+        const metadata = publicSessionMetadata(row.metadata);
         return {
           id: row.id,
           provider: row.provider,
