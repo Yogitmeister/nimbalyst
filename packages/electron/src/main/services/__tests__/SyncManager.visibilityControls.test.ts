@@ -115,7 +115,12 @@ vi.mock("../attachments/attachmentStagingRoot", () => ({
   resolveWorkspaceAttachmentStagingDirectory: vi.fn(),
 }));
 
-import { initializeSync, shutdownSync } from "../SyncManager";
+import {
+  getSyncProvider,
+  initializeSync,
+  reinitializeSync,
+  shutdownSync,
+} from "../SyncManager";
 
 const baseStore = () =>
   ({
@@ -169,5 +174,98 @@ describe("SyncManager host-visibility lifetime", () => {
     await expect(stale).resolves.toBe(base);
     expect(mocks.createCollabV3Sync).toHaveBeenCalledTimes(1);
     expect(mocks.createSyncedSessionStore).toHaveBeenCalledTimes(1);
+  });
+
+  it("retires a never-settling reinitialize request before the newest owner publishes", async () => {
+    const base = baseStore();
+    let resolveFirst!: (value: string) => void;
+    const stalledFirst = new Promise<string>((resolve) => {
+      resolveFirst = resolve;
+    });
+    mocks.resolvePersonalUserId
+      .mockImplementationOnce(() => stalledFirst)
+      .mockResolvedValueOnce("personal-user");
+    const currentProvider = provider();
+    const currentStore = { ...base, name: "current" };
+    mocks.createCollabV3Sync.mockReturnValue(currentProvider);
+    mocks.createSyncedSessionStore.mockReturnValue(currentStore);
+
+    const retiring = reinitializeSync(base);
+    await Promise.resolve();
+    const current = reinitializeSync(base);
+    await expect(retiring).resolves.toBe(base);
+    await expect(current).resolves.toBe(currentStore);
+    resolveFirst("personal-user");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mocks.createCollabV3Sync).toHaveBeenCalledTimes(1);
+    expect(getSyncProvider()).toBe(currentProvider);
+    expect(currentProvider.disconnectAll).not.toHaveBeenCalled();
+  });
+
+  it("lets production shutdown retire a never-settling reinitialize request", async () => {
+    const base = baseStore();
+    mocks.resolvePersonalUserId.mockImplementationOnce(
+      () => new Promise<string>(() => undefined)
+    );
+
+    const retiring = reinitializeSync(base);
+    await Promise.resolve();
+    expect(() => shutdownSync()).not.toThrow();
+    await expect(retiring).resolves.toBe(base);
+    expect(mocks.createCollabV3Sync).not.toHaveBeenCalled();
+    expect(getSyncProvider()).toBeNull();
+  });
+
+  it("contains a retired initializer rejection after a replacement owns sync", async () => {
+    const base = baseStore();
+    let rejectFirst!: (error: Error) => void;
+    const rejectedFirst = new Promise<string>((_resolve, reject) => {
+      rejectFirst = reject;
+    });
+    mocks.resolvePersonalUserId
+      .mockImplementationOnce(() => rejectedFirst)
+      .mockResolvedValueOnce("personal-user");
+    const currentProvider = provider();
+    const currentStore = { ...base, name: "current" };
+    mocks.createCollabV3Sync.mockReturnValue(currentProvider);
+    mocks.createSyncedSessionStore.mockReturnValue(currentStore);
+
+    const retiring = reinitializeSync(base);
+    await Promise.resolve();
+    const current = reinitializeSync(base);
+    await expect(retiring).resolves.toBe(base);
+    await expect(current).resolves.toBe(currentStore);
+    rejectFirst(new Error("late retired identity failure"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mocks.createCollabV3Sync).toHaveBeenCalledTimes(1);
+    expect(getSyncProvider()).toBe(currentProvider);
+    expect(currentProvider.disconnectAll).not.toHaveBeenCalled();
+  });
+
+  it("does not head-of-line block a new owner on a non-settling decorator retirement", async () => {
+    const base = baseStore();
+    const oldProvider = provider();
+    const currentProvider = provider();
+    const oldStore = {
+      ...base,
+      dispose: vi.fn(() => new Promise<void>(() => undefined)),
+    };
+    const currentStore = { ...base, name: "current" };
+    mocks.createCollabV3Sync
+      .mockReturnValueOnce(oldProvider)
+      .mockReturnValueOnce(currentProvider);
+    mocks.createSyncedSessionStore
+      .mockReturnValueOnce(oldStore)
+      .mockReturnValueOnce(currentStore);
+
+    await expect(initializeSync(base)).resolves.toBe(oldStore);
+    await expect(reinitializeSync(base)).resolves.toBe(currentStore);
+    await Promise.resolve();
+    expect(oldStore.dispose).toHaveBeenCalledTimes(1);
+    expect(oldProvider.disconnectAll).toHaveBeenCalledTimes(1);
+    expect(getSyncProvider()).toBe(currentProvider);
+    expect(currentProvider.disconnectAll).not.toHaveBeenCalled();
   });
 });

@@ -87,6 +87,7 @@ interface SyncManagerState {
   syncing: boolean;
   error: string | null;
   sessionKeepAliveInterval: ReturnType<typeof setInterval> | null;
+  syncedSessionStore: SessionStore | null;
 }
 
 const state: SyncManagerState = {
@@ -98,12 +99,28 @@ const state: SyncManagerState = {
   syncing: false,
   error: null,
   sessionKeepAliveInterval: null,
+  syncedSessionStore: null,
 };
 
 // Every initialization owns a monotonically increasing lease. A later
 // initialization or shutdown invalidates older asynchronous work before it can
 // replace the active provider, even when the caller is still awaiting it.
 let syncInitializationGeneration = 0;
+let reinitializeRequestGeneration = 0;
+let activeReinitializeGeneration: number | null = null;
+let activeReinitializeCancellation: (() => void) | null = null;
+
+type DisposableSessionStore = SessionStore & {
+  dispose?: () => void | Promise<void>;
+};
+
+function retireSyncedSessionStore(store: SessionStore | null): void {
+  const dispose = (store as DisposableSessionStore | null)?.dispose;
+  if (!dispose) return;
+  void Promise.resolve()
+    .then(() => dispose.call(store))
+    .catch((error) => logger.main.warn('[SyncManager] Failed to retire synced session store:', error));
+}
 
 // Guard against overlapping incremental syncs (initial + triggered) and enforce minimum interval
 let incrementalSyncInFlight = false;
@@ -662,9 +679,11 @@ export async function initializeSync(
       autoConnect: true,
     });
     if (!isInitializationCurrent()) {
+      retireSyncedSessionStore(syncedStore);
       provider.disconnectAll();
       return baseStore;
     }
+    state.syncedSessionStore = syncedStore;
 
     // Sync existing sessions and projects to index using delta sync
     // logger.main.info('[SyncManager] Setting up incremental sync...');
@@ -1033,8 +1052,17 @@ export function getPersonalDocSyncConfig(): {
 /**
  * Shutdown sync and disconnect all sessions.
  */
-export function shutdownSync(): void {
+export function shutdownSync(owningReinitializeGeneration?: number): void {
+  if (
+    activeReinitializeGeneration !== null &&
+    activeReinitializeGeneration !== owningReinitializeGeneration
+  ) {
+    activeReinitializeCancellation?.();
+  }
   syncInitializationGeneration += 1;
+  const activeStore = state.syncedSessionStore;
+  state.syncedSessionStore = null;
+  retireSyncedSessionStore(activeStore);
   remoteSessions.setProvider(null);
   shutdownSleepPrevention();
 
@@ -1074,9 +1102,45 @@ export async function reinitializeSync(
   baseStore: SessionStore,
   lifetimeStillCurrent: () => boolean = () => true,
 ): Promise<SessionStore> {
-  await shutdownSync();
-  if (!lifetimeStillCurrent()) return baseStore;
-  return initializeSync(baseStore, lifetimeStillCurrent);
+  const requestGeneration = ++reinitializeRequestGeneration;
+  activeReinitializeCancellation?.();
+  let cancelled = false;
+  let cancel!: () => void;
+  const cancellation = new Promise<void>((resolve) => {
+    cancel = () => {
+      cancelled = true;
+      resolve();
+    };
+  });
+  activeReinitializeGeneration = requestGeneration;
+  activeReinitializeCancellation = cancel;
+  const requestStillCurrent = () => (
+    !cancelled &&
+    activeReinitializeGeneration === requestGeneration &&
+    lifetimeStillCurrent()
+  );
+  const operation = (async () => {
+    shutdownSync(requestGeneration);
+    if (!requestStillCurrent()) return baseStore;
+    return initializeSync(baseStore, requestStillCurrent);
+  })();
+  try {
+    const outcome = await Promise.race([
+      operation.then(
+        (store) => ({ kind: 'store' as const, store }),
+        (error) => ({ kind: 'error' as const, error }),
+      ),
+      cancellation.then(() => ({ kind: 'cancelled' as const })),
+    ]);
+    if (outcome.kind === 'cancelled') return baseStore;
+    if (outcome.kind === 'error') throw outcome.error;
+    return outcome.store;
+  } finally {
+    if (activeReinitializeGeneration === requestGeneration) {
+      activeReinitializeGeneration = null;
+      activeReinitializeCancellation = null;
+    }
+  }
 }
 
 /**
