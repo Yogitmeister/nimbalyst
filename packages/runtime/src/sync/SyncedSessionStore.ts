@@ -97,6 +97,29 @@ export function createSyncedSessionStore(
 ): SessionStore {
   const opts = { ...DEFAULT_OPTIONS, ...options };
   const connectedSessions = new Set<string>();
+  let disposed = false;
+  let cancelGeneration!: () => void;
+  const generationCancelled = new Promise<void>((resolve) => {
+    cancelGeneration = resolve;
+  });
+
+  function assertActive(): void {
+    if (disposed) throw new Error('SYNCED_SESSION_STORE_DISPOSED');
+  }
+
+  async function settleWhileActive<T>(operation: PromiseLike<T> | T): Promise<T> {
+    const outcome = await Promise.race([
+      Promise.resolve(operation).then(
+        (value) => ({ kind: 'value' as const, value }),
+        (error) => ({ kind: 'error' as const, error }),
+      ),
+      generationCancelled.then(() => ({ kind: 'disposed' as const })),
+    ]);
+    if (outcome.kind === 'disposed') throw new Error('SYNCED_SESSION_STORE_DISPOSED');
+    if (outcome.kind === 'error') throw outcome.error;
+    assertActive();
+    return outcome.value;
+  }
 
   // Track which sessions should be synced
   function shouldSync(sessionId: string, workspaceId?: string): boolean {
@@ -108,12 +131,14 @@ export function createSyncedSessionStore(
 
   // Connect to sync for a session if not already connected
   async function ensureSyncConnected(sessionId: string): Promise<void> {
+    if (disposed) return;
     if (!opts.autoConnect) return;
     if (connectedSessions.has(sessionId)) return;
     if (!shouldSync(sessionId)) return;
 
     try {
-      await syncProvider.connect(sessionId);
+      await settleWhileActive(syncProvider.connect(sessionId));
+      if (disposed) return;
       connectedSessions.add(sessionId);
     } catch (error) {
       // Sync is optional - log but don't fail
@@ -125,6 +150,7 @@ export function createSyncedSessionStore(
   // metadata_updated changes can flow via the index channel even without a session room connection,
   // so we allow them through regardless of connectedSessions state.
   function pushToSync(sessionId: string, change: SessionChange): void {
+    if (disposed) return;
     if (!connectedSessions.has(sessionId) && change.type !== 'metadata_updated') return;
 
     try {
@@ -134,7 +160,20 @@ export function createSyncedSessionStore(
     }
   }
 
+  async function publishWhileActive(sessionId: string, change: SessionChange): Promise<void> {
+    assertActive();
+    if (!connectedSessions.has(sessionId) && change.type !== 'metadata_updated') return;
+    await settleWhileActive(syncProvider.pushChange(sessionId, change));
+  }
+
   return {
+    async dispose(): Promise<void> {
+      if (disposed) return;
+      disposed = true;
+      cancelGeneration();
+      connectedSessions.clear();
+    },
+
     async ensureReady(): Promise<void> {
       return baseStore.ensureReady();
     },
@@ -200,6 +239,52 @@ export function createSyncedSessionStore(
         type: 'metadata_updated',
         metadata: syncMetadata as unknown as SyncedSessionMetadata,
       });
+    },
+
+    async applyVisibilityMutation(sessionId, mutation): Promise<boolean> {
+      assertActive();
+      if (!baseStore.applyVisibilityMutation) {
+        throw new Error('SESSION_VISIBILITY_STORE_UNAVAILABLE');
+      }
+
+      const applied = await settleWhileActive(
+        baseStore.applyVisibilityMutation(sessionId, mutation),
+      );
+      if (!applied) return false;
+
+      const metadata = {} as UpdateSessionMetadataPayload & {
+        isPinned?: boolean;
+        hasBeenNamed?: boolean;
+      };
+      if (mutation.after.isPinned !== undefined) {
+        metadata.isPinned = mutation.after.isPinned;
+      }
+      if (mutation.after.parentSessionId !== undefined) {
+        metadata.parentSessionId = mutation.after.parentSessionId;
+      }
+      if (mutation.after.title !== undefined) metadata.title = mutation.after.title;
+      if (mutation.after.hasBeenNamed !== undefined) {
+        metadata.hasBeenNamed = mutation.after.hasBeenNamed;
+      }
+
+      const syncMetadata = buildSyncPayload(metadata as unknown as Record<string, unknown>);
+      if (Object.keys(syncMetadata).length > 0) {
+        await publishWhileActive(sessionId, {
+          type: 'metadata_updated',
+          metadata: syncMetadata as SyncedSessionMetadata,
+        });
+      }
+      return true;
+    },
+
+    async hasVisibilityMutation(sessionId, mutationId, mutationIdentity): Promise<boolean> {
+      assertActive();
+      if (!baseStore.hasVisibilityMutation) {
+        throw new Error('SESSION_VISIBILITY_STORE_UNAVAILABLE');
+      }
+      return mutationIdentity === undefined
+        ? baseStore.hasVisibilityMutation(sessionId, mutationId)
+        : baseStore.hasVisibilityMutation(sessionId, mutationId, mutationIdentity);
     },
 
     async get(sessionId: string): Promise<ChatSession | null> {

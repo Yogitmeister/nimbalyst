@@ -148,6 +148,8 @@ export interface SessionVisibilityStoreMutation {
 
 export interface SessionStore {
   ensureReady(): Promise<void>;
+  /** Stop decorator-owned async work before replacing the active store. */
+  dispose?(): Promise<void>;
   create(payload: CreateSessionPayload): Promise<void>;
   updateMetadata(sessionId: string, metadata: UpdateSessionMetadataPayload): Promise<void>;
   /** Atomically applies the exact visibility write and its recovery identity. */

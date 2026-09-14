@@ -17,6 +17,8 @@ describe('SyncedSessionStore', () => {
       ensureReady: vi.fn().mockResolvedValue(undefined),
       create: vi.fn().mockResolvedValue(undefined),
       updateMetadata: vi.fn().mockResolvedValue(undefined),
+      applyVisibilityMutation: vi.fn().mockResolvedValue(true),
+      hasVisibilityMutation: vi.fn().mockResolvedValue(true),
       get: vi.fn().mockResolvedValue(null),
       list: vi.fn().mockResolvedValue([]),
       search: vi.fn().mockResolvedValue([]),
@@ -36,6 +38,62 @@ describe('SyncedSessionStore', () => {
         capturedChanges.push({ sessionId, change });
       }),
     };
+  });
+
+  it('forwards atomic visibility mutations and publishes only public fields', async () => {
+    const syncedStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    const mutation = {
+      mutationId: 'host-only-mutation-id',
+      workspacePath: 'C:\\repo',
+      workspaceComparisonPath: 'c:/repo',
+      operation: 'session_set_pinned' as const,
+      expected: { isPinned: false },
+      after: { isPinned: true },
+    };
+
+    await expect(syncedStore.applyVisibilityMutation?.('target', mutation)).resolves.toBe(true);
+    expect(mockBaseStore.applyVisibilityMutation).toHaveBeenCalledWith('target', mutation);
+    expect(capturedChanges).toEqual([{
+      sessionId: 'target',
+      change: { type: 'metadata_updated', metadata: { isPinned: true } },
+    }]);
+    expect(JSON.stringify(capturedChanges)).not.toContain('host-only-mutation-id');
+
+    await expect(syncedStore.hasVisibilityMutation?.(
+      'target', mutation.mutationId, 'exact-fingerprint',
+    )).resolves.toBe(true);
+    expect(mockBaseStore.hasVisibilityMutation).toHaveBeenCalledWith(
+      'target', mutation.mutationId, 'exact-fingerprint',
+    );
+  });
+
+  it('retires a stalled visibility write without publishing stale output', async () => {
+    let releaseMutation!: (value: boolean) => void;
+    const mutationGate = new Promise<boolean>((resolve) => { releaseMutation = resolve; });
+    mockBaseStore.applyVisibilityMutation = vi.fn(() => mutationGate);
+    const staleStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    const mutation = {
+      mutationId: 'stale-mutation',
+      workspacePath: 'C:\\repo',
+      workspaceComparisonPath: 'c:/repo',
+      operation: 'session_set_pinned' as const,
+      expected: { isPinned: false },
+      after: { isPinned: true },
+    };
+
+    const staleWrite = staleStore.applyVisibilityMutation?.('target', mutation);
+    await Promise.resolve();
+    await staleStore.dispose?.();
+    releaseMutation(true);
+    await expect(staleWrite).rejects.toThrow('SYNCED_SESSION_STORE_DISPOSED');
+    expect(mockSyncProvider.pushChange).not.toHaveBeenCalled();
+
+    mockBaseStore.applyVisibilityMutation = vi.fn().mockResolvedValue(true);
+    const currentStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    await expect(currentStore.applyVisibilityMutation?.('target', {
+      ...mutation,
+      mutationId: 'current-mutation',
+    })).resolves.toBe(true);
   });
 
   it('should pass title and provider when creating a session', async () => {
