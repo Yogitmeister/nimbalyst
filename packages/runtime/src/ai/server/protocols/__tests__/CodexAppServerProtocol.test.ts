@@ -427,6 +427,8 @@ describe('CodexAppServerProtocol', () => {
     const compactReq = await nextWrittenMatching(child, 'thread/compact/start');
     expect(compactReq.params).toEqual({ threadId: 'thread-abc' });
     child.emitLine({ id: compactReq.id, result: {} });
+    child.emitLine({ method: 'item/completed', params: { threadId: 'thread-abc', item: { type: 'contextCompaction' } } });
+    child.emitLine({ method: 'turn/completed', params: { threadId: 'thread-abc', turn: { status: 'completed' } } });
 
     await expect(compactPromise).resolves.toBeUndefined();
     expect(child.writtenLines.some((l) => (l as { method?: string }).method === 'turn/start')).toBe(false);
@@ -448,6 +450,22 @@ describe('CodexAppServerProtocol', () => {
     child.emitLine({ id: compactReq.id, error: { code: -32600, message: 'nothing to compact' } });
 
     await expect(compactPromise).rejects.toThrow(/compact/i);
+
+    protocol.cleanupSession(session);
+  });
+
+  it('refuses compaction while a model turn owns the thread task slot', async () => {
+    const protocol = new CodexAppServerProtocol();
+    const sessionPromise = protocol.createSession({ workspacePath: '/tmp/ws' });
+    const initReq = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: initReq.id, result: { codexHome: '/fake', platformFamily: 'unix', platformOs: 'macos', userAgent: 'fake/0' } });
+    const startReq = await nextWrittenMatching(child, 'thread/start');
+    child.emitLine({ id: startReq.id, result: { thread: { id: 'thread-abc' } } });
+    const session = await sessionPromise;
+
+    (session.raw as { turnInProgress: boolean }).turnInProgress = true;
+    await expect(protocol.compactSession(session)).rejects.toThrow(/active turn/i);
+    expect(child.writtenLines.some((line) => (line as { method?: string }).method === 'thread/compact/start')).toBe(false);
 
     protocol.cleanupSession(session);
   });

@@ -130,6 +130,9 @@ interface AppServerSessionRaw {
   dynamicTools: DynamicToolSpec[];
   /** Snapshot of any uncompleted turn for abort handling. */
   activeTurnId: string | null;
+  /** A model turn and native compaction both own Codex's one core task slot. */
+  turnInProgress: boolean;
+  compactionInProgress: boolean;
   /** stderr buffer for diagnostic surface on failure. */
   stderrTail: string[];
   /** Prevent duplicate cleanup from re-targeting a PID after it exits. */
@@ -251,6 +254,11 @@ export class CodexAppServerProtocol implements AgentProtocol {
       ?? (raw.options as unknown as { abortSignal?: AbortSignal })?.abortSignal
       ?? (session.raw as { options?: { abortSignal?: AbortSignal } })?.options?.abortSignal;
 
+    if (raw.turnInProgress || raw.compactionInProgress) {
+      yield { type: 'error', error: '[CodexAppServer] thread already has an active turn or compaction' };
+      return;
+    }
+
     // Drain queue: notifications and one terminating turn event are pushed by
     // the JsonRpcClient handler; the generator below awaits them.
     const queue: Array<{ kind: 'event'; event: ProtocolEvent } | { kind: 'end' } | { kind: 'fail'; error: Error } | { kind: 'abort' }> = [];
@@ -351,9 +359,10 @@ export class CodexAppServerProtocol implements AgentProtocol {
     }
 
     // Start the turn. Errors from the request itself are surfaced as fail.
-    const turnInput = await this.buildInput(message);
     let turnStartResultId: string | null = null;
+    raw.turnInProgress = true;
     try {
+      const turnInput = await this.buildInput(message);
       const turnStart = await raw.client.request<{ turn?: { id?: string } }>('turn/start', {
         threadId: raw.threadId,
         input: turnInput,
@@ -365,6 +374,7 @@ export class CodexAppServerProtocol implements AgentProtocol {
         dispatchOwnedNotification(pending.method, pending.params);
       }
     } catch (err) {
+      raw.turnInProgress = false;
       const baseMsg = err instanceof Error ? err.message : String(err);
       yield {
         type: 'error',
@@ -414,6 +424,7 @@ export class CodexAppServerProtocol implements AgentProtocol {
         try { unsub(); } catch { /* noop */ }
       }
       raw.activeTurnId = null;
+      raw.turnInProgress = false;
       raw.shellTracking?.endTurn();
     }
   }
@@ -428,16 +439,54 @@ export class CodexAppServerProtocol implements AgentProtocol {
    * finished". The follow-up `thread/tokenUsage/updated` is what reports the
    * reduced fill.
    */
+  isSessionActive(session: ProtocolSession): boolean {
+    const raw = this.assertRaw(session);
+    return raw.turnInProgress || raw.compactionInProgress;
+  }
+
   async compactSession(session: ProtocolSession): Promise<void> {
     const raw = this.assertRaw(session);
-    if (!raw.threadId) {
+    const threadId = raw.threadId;
+    if (!threadId) {
       throw new Error('[CodexAppServer] cannot compact: no active thread');
     }
+    if (this.isSessionActive(session)) {
+      throw new Error('[CodexAppServer] cannot compact a thread with an active turn');
+    }
+    raw.compactionInProgress = true;
+    let unsubscribe = () => {};
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      await raw.client.request('thread/compact/start', { threadId: raw.threadId });
+      let resolve!: () => void;
+      let reject!: (error: Error) => void;
+      let sawItem = false;
+      let sawTerminal = false;
+      const completion = new Promise<void>((ok, fail) => { resolve = ok; reject = fail; });
+      const settle = () => { if (sawItem && sawTerminal) resolve(); };
+      timeout = setTimeout(() => reject(new Error('[CodexAppServer] compaction timed out')), 60_000);
+      unsubscribe = raw.client.onNotification((method, paramsUnknown) => {
+        const params = paramsUnknown as Record<string, any> | undefined;
+        if (params?.threadId !== threadId) return;
+        if (method === 'thread/compacted' ||
+          (method === 'item/completed' && ['contextCompaction', 'context_compaction'].includes(params?.item?.type))) {
+          sawItem = true; settle(); return;
+        }
+        if (method === 'turn/completed') {
+          if (params?.turn?.status === 'failed') reject(new Error(params?.turn?.error?.message ?? '[CodexAppServer] compaction failed'));
+          else { sawTerminal = true; settle(); }
+        } else if (method === 'turn/failed' || method === 'error') {
+          reject(new Error(params?.error?.message ?? '[CodexAppServer] compaction failed'));
+        }
+      });
+      await raw.client.request('thread/compact/start', { threadId });
+      await completion;
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       throw new Error(`[CodexAppServer] thread/compact/start failed: ${detail}`);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      unsubscribe();
+      raw.compactionInProgress = false;
     }
   }
 
@@ -544,6 +593,8 @@ export class CodexAppServerProtocol implements AgentProtocol {
       initResponse,
       dynamicTools: this.extractDynamicTools(options),
       activeTurnId: null,
+      turnInProgress: false,
+      compactionInProgress: false,
       stderrTail,
       cleanupStarted: false,
       shellTracking: tracking?.registration,
