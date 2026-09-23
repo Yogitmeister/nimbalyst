@@ -15,6 +15,7 @@ import {
   isWindowsRenameLockError,
 } from './autoUpdaterUtils';
 import { installAtomFeedFilter } from './electronUpdaterPatch';
+import electronPackage from '../../../package.json';
 
 // Install the atom-feed filter before any AutoUpdaterService is constructed
 // (which is the first thing that triggers electron-updater to read the feed).
@@ -40,6 +41,9 @@ const GITHUB_UPDATE_PROVIDER = {
 const getDurationCategory = categorizeDownloadDuration;
 
 export class AutoUpdaterService {
+  // Build-time identity works on Windows, macOS and Linux, without user settings
+  // or a Windows-only runtime AUMID. Yogi packaging must set this before bundling.
+  private readonly updatesDisabled = electronPackage.build.appId === 'com.nimbalyst.electron.yogi';
   private updateCheckInterval: NodeJS.Timeout | null = null;
   private isCheckingForUpdate = false;
   private isManualCheck = false; // Track if this is a user-initiated check (for showing up-to-date toast)
@@ -65,14 +69,12 @@ export class AutoUpdaterService {
     // official app, wrong for a patched build -- it would silently replace this build with
     // stock Nimbalyst and take every local patch with it.
     //
-    // autoDownload=false keeps the hourly check and still emits 'update-available', so
-    // UpdateAvailableToast still tells Yogev a newer upstream version exists. Nothing is
-    // fetched or installed unless downloadUpdate() is called explicitly.
+    // Yogi builds additionally disable the feed, checks and update actions below.
+    // The official build's existing updater behavior is unchanged.
     // autoInstallOnAppQuit=false additionally neutralises anything already staged in the
     // shared updater cache (%LOCALAPPDATA%\@nimbalystelectron-updater\pending).
     //
-    // Yogev, 2026-07-31: "debang the updater. Have them just show the pop-up or disable it
-    // completely but I prefer it shows the pop."
+    // Yogev, 2026-09-23: disable the checker in Yogi builds; repeated checks error.
     autoUpdater.autoDownload = false;
     autoUpdater.autoInstallOnAppQuit = false;
 
@@ -87,6 +89,7 @@ export class AutoUpdaterService {
   }
 
   private configureFeedURL() {
+    if (this.updatesDisabled) return;
     const channel = getReleaseChannel();
 
     if (channel === 'alpha') {
@@ -103,6 +106,7 @@ export class AutoUpdaterService {
   }
 
   private setupEventHandlers() {
+    if (this.updatesDisabled) return;
     autoUpdater.on('checking-for-update', () => {
       log.info('Checking for update...');
       this.isCheckingForUpdate = true;
@@ -364,6 +368,7 @@ export class AutoUpdaterService {
   }
 
   private performQuitAndInstall() {
+    if (this.updatesDisabled) return;
     setImmediate(async () => {
       try {
         log.info('Performing quit and install...');
@@ -411,6 +416,7 @@ export class AutoUpdaterService {
 
   private setupIpcHandlers() {
     safeHandle('check-for-updates', async () => {
+      if (this.updatesDisabled) return { disabled: true };
       if (this.isCheckingForUpdate) {
         return { checking: true };
       }
@@ -425,6 +431,7 @@ export class AutoUpdaterService {
     });
 
     safeHandle('download-update', async () => {
+      if (this.updatesDisabled) return { success: false, disabled: true };
       try {
         await autoUpdater.downloadUpdate();
         return { success: true };
@@ -445,6 +452,7 @@ export class AutoUpdaterService {
 
     // Toast-based update IPC handlers
     safeOn('update-toast:download', async () => {
+      if (this.updatesDisabled) return;
       try {
         log.info('Update toast: Starting download...');
 
@@ -485,6 +493,7 @@ export class AutoUpdaterService {
     });
 
     safeOn('update-toast:install', () => {
+      if (this.updatesDisabled) return;
       log.info('Update toast: Installing update...');
 
       // Track install initiated
@@ -502,6 +511,7 @@ export class AutoUpdaterService {
 
     // Deferred install: wait for all AI sessions to finish, then install
     safeOn('update-toast:install-when-idle', () => {
+      if (this.updatesDisabled) return;
       log.info('Update toast: Deferring install until AI sessions finish...');
 
       AnalyticsService.getInstance().sendEvent('update_install_deferred', {
@@ -567,6 +577,7 @@ export class AutoUpdaterService {
   }
 
   public startAutoUpdateCheck(intervalMinutes = 60) {
+    if (this.updatesDisabled) return;
     // Initial check after 30 seconds
     setTimeout(() => {
       this.checkForUpdates();
@@ -590,6 +601,7 @@ export class AutoUpdaterService {
   }
 
   public async checkForUpdates() {
+    if (this.updatesDisabled) return;
     if (this.isCheckingForUpdate) {
       log.info('Already checking for updates, skipping...');
       return;
@@ -604,6 +616,7 @@ export class AutoUpdaterService {
   }
 
   public async checkForUpdatesWithUI() {
+    if (this.updatesDisabled) return;
     if (this.isCheckingForUpdate) {
       // Already checking, don't show anything - the checking toast is already visible
       return;
@@ -643,6 +656,7 @@ export class AutoUpdaterService {
   }
 
   private async checkAndDownloadLatest() {
+    if (this.updatesDisabled) return;
     try {
       // Previously this method called `autoUpdater.checkForUpdates()` immediately
       // before `downloadUpdate()` to "get the absolute latest version" - but on

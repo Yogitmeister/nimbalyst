@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Changes to existing functionality go here -->
 
 ### Fixed
+- Disabled update checks and update actions in Yogi builds to prevent recurring updater errors.
 <!-- Bug fixes go here -->
 - Queued chat messages now continue through a replacement project window after the original window reloads or closes.
 - Windows and Linux get the File/Edit/View menus back, now drawn in the project window's title bar.
