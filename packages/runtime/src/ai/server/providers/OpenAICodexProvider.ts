@@ -1887,6 +1887,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     this.evictLiveProtocolSession(sessionId);
     this.sessions.deleteSession(sessionId);
     this.appServerNotificationDeduper.delete(sessionId);
+    this.emit('session:recovery-disposed', { sessionId });
   }
 
   destroy(): void {
