@@ -386,6 +386,12 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       );
     }
 
+    if (this.protocol instanceof CodexAppServerProtocol) {
+      this.protocol.setCancellationRecoveryErrorListener((sessionId, message) => {
+        this.emit('session:recovery-error', { sessionId, message });
+      });
+    }
+
     // Initialize permission service (or use injected for testing)
     if (deps?.permissionService) {
       this.permissionService = deps.permissionService;
@@ -1839,6 +1845,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
 
     for await (const reminderEvent of this.protocol.sendMessage(session, {
       content: OpenAICodexProvider.SESSION_NAMING_REMINDER_PROMPT,
+      sessionId,
     })) {
       // Tag this reminder turn's persisted output rows as a system reminder so
       // the metadata-based transcript hide covers them. Without the tag they
@@ -1883,6 +1890,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   }
 
   destroy(): void {
+    if (this.protocol instanceof CodexAppServerProtocol) this.protocol.setCancellationRecoveryErrorListener();
     for (const timer of this.protocolSessionIdleTimers.values()) {
       this.idleProtocolSessionScheduler.clearTimeout(timer);
     }
