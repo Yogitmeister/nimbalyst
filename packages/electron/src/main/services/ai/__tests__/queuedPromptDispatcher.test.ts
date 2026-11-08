@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mergeClaimedRun, selectCoalescibleRun } from '../coalesceQueuedPrompts';
 import {
   SessionProcessingGuard,
   dispatchClaimedQueuedPrompt,
@@ -17,7 +18,8 @@ describe('queuedPromptDispatcher', () => {
     vi.useFakeTimers();
     let pending: ClaimedQueuedPrompt[] = [
       { id: 'agent', prompt: 'agent follow-up' },
-      { id: 'human', prompt: 'human follow-up' },
+      // A slash command always opens its own turn, so this row stays a second dispatch.
+      { id: 'human', prompt: '/compact' },
     ];
     let releaseClaim!: () => void;
     let claimStarted!: () => void;
@@ -141,22 +143,32 @@ describe('queuedPromptDispatcher', () => {
     expect(processingSet.has('session-1')).toBe(false);
   });
 
-  describe('agent-authored coalescing', () => {
-    const agentPrompt = (id: string, prompt: string): ClaimedQueuedPrompt => ({
+  describe('queue coalescing', () => {
+    const agentPrompt = (
+      id: string,
+      prompt: string,
+      provenance: Record<string, unknown> = {},
+    ): ClaimedQueuedPrompt => ({
       id,
       prompt,
       attachments: null,
       documentContext: {
-        promptProvenance: { actor: 'agent', origin: 'child-session-update' },
+        promptProvenance: { actor: 'agent', origin: 'child-session-update', ...provenance },
       } as any,
     });
 
-    const humanPrompt = (id: string, prompt: string): ClaimedQueuedPrompt => ({
+    // Composer rows carry the composer's mode; agent rows carry none.
+    const humanPrompt = (
+      id: string,
+      prompt: string,
+      mode?: 'planning' | 'agent' | 'auto',
+    ): ClaimedQueuedPrompt => ({
       id,
       prompt,
       attachments: null,
       documentContext: {
         promptProvenance: { actor: 'human', origin: 'composer' },
+        ...(mode && { mode }),
       } as any,
     });
 
@@ -164,6 +176,7 @@ describe('queuedPromptDispatcher', () => {
       vi.useFakeTimers();
       const completed: string[] = [];
       const sent: string[] = [];
+      const contexts: any[] = [];
 
       const queueStore: QueuedPromptStoreLike = {
         listPending: vi.fn(async () => pending),
@@ -186,8 +199,9 @@ describe('queuedPromptDispatcher', () => {
         onPromptClaimed: () => {},
         processingSet: new SessionProcessingGuard(),
         queueStore,
-        sendMessageHandler: vi.fn(async (_e, message: string) => {
+        sendMessageHandler: vi.fn(async (_e, message: string, documentContext: unknown) => {
           sent.push(message);
+          contexts.push(documentContext);
           return { content: 'ok' };
         }),
         sessionId: 'session-1',
@@ -198,7 +212,7 @@ describe('queuedPromptDispatcher', () => {
       });
 
       await vi.runAllTimersAsync();
-      return { completed, sent };
+      return { completed, sent, contexts };
     }
 
     // The orchestration bottleneck: N children reporting cost the parent N
@@ -217,29 +231,214 @@ describe('queuedPromptDispatcher', () => {
       expect([...completed].sort()).toEqual(['a', 'b', 'c']);
     });
 
-    // A human message is a hard boundary: it must never be silently folded in
-    // with agent chatter, and nothing behind it may be pulled forward.
-    it('stops the run at a human-authored prompt', async () => {
+    // Yogev's queued follow-ups used to cost one turn (and one "send now" press)
+    // each, with agent reports in between costing more.
+    it('merges user and agent rows into one turn, oldest first', async () => {
       const { completed, sent } = await drain([
         agentPrompt('a', 'agent one'),
-        humanPrompt('h', 'stop and do this instead'),
+        humanPrompt('h', 'user follow-up'),
         agentPrompt('c', 'agent two'),
       ]);
 
       expect(sent).toHaveLength(1);
-      expect(sent[0]).toBe('agent one');
-      expect(sent[0]).not.toContain('stop and do this instead');
-      expect(completed).toEqual(['a']);
+      const order = ['agent one', 'user follow-up', 'agent two'].map((text) => sent[0].indexOf(text));
+      expect(order.every((index) => index >= 0)).toBe(true);
+      expect(order).toEqual([...order].sort((x, y) => x - y));
+      expect([...completed].sort()).toEqual(['a', 'c', 'h']);
     });
 
-    it('leaves a human-authored head as its own turn', async () => {
+    it('merges a user-authored head with the agent rows behind it', async () => {
       const { completed, sent } = await drain([
         humanPrompt('h', 'do the thing'),
         agentPrompt('a', 'agent report'),
       ]);
 
-      expect(sent).toEqual(['do the thing']);
-      expect(completed).toEqual(['h']);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toContain('do the thing');
+      expect(sent[0]).toContain('agent report');
+      expect([...completed].sort()).toEqual(['a', 'h']);
+    });
+
+    it('labels each message with its author so a report is not read as the user', async () => {
+      const { sent } = await drain([
+        humanPrompt('h', 'user note'),
+        agentPrompt('a', 'child report', { originSessionId: 'child-session-7' }),
+        agentPrompt('b', 'no id on this one'),
+        {
+          id: 's',
+          prompt: 'wake up',
+          attachments: null,
+          documentContext: { promptProvenance: { actor: 'system', origin: 'automation' } } as any,
+        },
+      ]);
+
+      expect(sent[0]).toContain('Later messages may correct or supersede earlier ones');
+      expect(sent[0]).toContain('--- message 1 of 4 (user) ---\nuser note');
+      expect(sent[0]).toContain('--- message 2 of 4 (agent: child-session-7) ---\nchild report');
+      expect(sent[0]).toContain('--- message 3 of 4 (agent: child-session-update) ---\nno id on this one');
+      expect(sent[0]).toContain('--- message 4 of 4 (system) ---\nwake up');
+    });
+
+    it('labels a row with no provenance as the user', async () => {
+      const { sent } = await drain([
+        { id: 'p', prompt: 'plain row', attachments: null, documentContext: null },
+        agentPrompt('a', 'agent report'),
+      ]);
+
+      expect(sent[0]).toContain('--- message 1 of 2 (user) ---\nplain row');
+    });
+
+    it('runs a slash command at the head on its own and leaves the rest pending', async () => {
+      const { completed, sent } = await drain([
+        humanPrompt('c', '/compact'),
+        humanPrompt('h', 'then continue'),
+        agentPrompt('a', 'agent report'),
+      ]);
+
+      expect(sent).toEqual(['/compact']);
+      expect(completed).toEqual(['c']);
+    });
+
+    it('ends the run before a slash command in the middle of the queue', async () => {
+      const { completed, sent } = await drain([
+        agentPrompt('a', 'agent report'),
+        humanPrompt('h', 'user note'),
+        humanPrompt('c', '  /clear'),
+        humanPrompt('d', 'after the command'),
+      ]);
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toContain('agent report');
+      expect(sent[0]).toContain('user note');
+      expect(sent[0]).not.toContain('/clear');
+      expect([...completed].sort()).toEqual(['a', 'h']);
+    });
+
+    it('ends the run at a row that declares a different mode', async () => {
+      const { completed, sent, contexts } = await drain([
+        humanPrompt('a', 'plan this', 'planning'),
+        humanPrompt('b', 'also plan this', 'planning'),
+        humanPrompt('c', 'now edit', 'agent'),
+        humanPrompt('d', 'after the edit', 'agent'),
+      ]);
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toContain('also plan this');
+      expect(sent[0]).not.toContain('now edit');
+      expect([...completed].sort()).toEqual(['a', 'b']);
+      expect(contexts[0].mode).toBe('planning');
+    });
+
+    // Agent, mobile and automation rows declare no mode: they inherit the
+    // session's, so they must not split a user's run, and a later declared mode
+    // must still apply to the merged turn.
+    it('merges rows that declare no mode and applies a later declared mode to the turn', async () => {
+      const { sent, contexts } = await drain([
+        agentPrompt('a', 'agent report'),
+        humanPrompt('h', 'plan only please', 'planning'),
+        agentPrompt('b', 'another report'),
+      ]);
+
+      expect(sent).toHaveLength(1);
+      expect(contexts[0].mode).toBe('planning');
+    });
+
+    it('keeps the head mode when later rows declare none', async () => {
+      const { sent, contexts } = await drain([
+        humanPrompt('h', 'edit this', 'agent'),
+        agentPrompt('a', 'agent report'),
+      ]);
+
+      expect(sent).toHaveLength(1);
+      expect(contexts[0].mode).toBe('agent');
+    });
+
+    // supersedeOpenQuestions only closes questions for a human turn, and the
+    // turn takes the head row's provenance.
+    it('counts a merged turn as human when any row in it is human, even behind an agent head', async () => {
+      const { contexts } = await drain([
+        agentPrompt('a', 'agent report', { originSessionId: 'child-1' }),
+        humanPrompt('h', 'user answer'),
+      ]);
+
+      expect(contexts[0].promptProvenance).toMatchObject({
+        actor: 'human',
+        origin: 'composer',
+        queuedPromptId: 'a',
+      });
+      expect(contexts[0].queuedPromptId).toBe('a');
+    });
+
+    it('keeps agent provenance when the merged run has no human row', async () => {
+      const { contexts } = await drain([
+        agentPrompt('a', 'one', { originSessionId: 'child-1' }),
+        agentPrompt('b', 'two', { originSessionId: 'child-2' }),
+      ]);
+
+      expect(contexts[0].promptProvenance).toMatchObject({ actor: 'agent', originSessionId: 'child-1' });
+    });
+
+    it('caps a merged turn at 20 rows and leaves the rest pending', async () => {
+      const rows = Array.from({ length: 25 }, (_, index) =>
+        index % 2 === 0 ? humanPrompt(`r${index}`, `row ${index}`) : agentPrompt(`r${index}`, `row ${index}`),
+      );
+      const { completed, sent } = await drain(rows);
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toContain('[20 messages arrived while you were working');
+      expect(sent[0]).toContain('row 19');
+      expect(sent[0]).not.toContain('row 20');
+      expect(completed).toHaveLength(20);
+    });
+
+    it('sends a single row unchanged, without a header or label', async () => {
+      const { sent } = await drain([humanPrompt('h', 'just this')]);
+
+      expect(sent).toEqual(['just this']);
+    });
+
+    it('delivers the attachments of every merged row with the turn', async () => {
+      const { sent, contexts } = await drain([
+        { ...humanPrompt('h', 'see image'), attachments: [{ id: 'img-1' }] },
+        { ...agentPrompt('a', 'see log'), attachments: [{ id: 'log-1' }] },
+      ]);
+
+      expect(sent).toHaveLength(1);
+      expect(contexts[0].attachments).toEqual([{ id: 'img-1' }, { id: 'log-1' }]);
+    });
+  });
+
+  describe('selectCoalescibleRun', () => {
+    const row = (id: string, prompt: string, documentContext: any = null) => ({ id, prompt, documentContext });
+
+    it('returns an empty run for an empty queue', () => {
+      expect(selectCoalescibleRun([])).toEqual([]);
+    });
+
+    it('treats a slash command after whitespace as a slash command', () => {
+      expect(selectCoalescibleRun([row('a', ' \n/compact'), row('b', 'next')]).map((r) => r.id)).toEqual(['a']);
+    });
+
+    it('honours an explicit batch size', () => {
+      const pending = ['a', 'b', 'c'].map((id) => row(id, id));
+      expect(selectCoalescibleRun(pending, 2).map((r) => r.id)).toEqual(['a', 'b']);
+    });
+  });
+
+  describe('mergeClaimedRun', () => {
+    it('returns a single row untouched', () => {
+      const only = { id: 'a', prompt: 'solo', attachments: null, documentContext: null };
+      expect(mergeClaimedRun([only])).toBe(only);
+    });
+
+    it('concatenates attachments from every row in order', () => {
+      const merged = mergeClaimedRun([
+        { id: 'a', prompt: 'one', attachments: [{ id: 'x' }], documentContext: null },
+        { id: 'b', prompt: 'two', attachments: null, documentContext: null },
+        { id: 'c', prompt: 'three', attachments: [{ id: 'y' }], documentContext: null },
+      ]);
+
+      expect(merged.attachments).toEqual([{ id: 'x' }, { id: 'y' }]);
     });
   });
 

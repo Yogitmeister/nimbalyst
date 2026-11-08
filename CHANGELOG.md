@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 <!-- Changes to existing functionality go here -->
+- Queued prompts now go out together in one turn, oldest first, each labelled with who wrote it (you or an agent), so "Interrupt and send now" delivers everything waiting instead of one message per press; slash commands still get their own turn
 
 ### Fixed
 <!-- Bug fixes go here -->
